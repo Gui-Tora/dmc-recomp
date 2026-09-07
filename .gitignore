@@ -1,0 +1,15 @@
+/vendor/
+/build/
+/logs/
+/original/*
+!/original/README.md
+/analysis/ghidra/
+/analysis/local/
+/recomp/generated/
+/recomp/config.toml
+__pycache__/
+*.iso
+*.ISO
+*.bin
+*.elf
+*.ELF

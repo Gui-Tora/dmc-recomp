@@ -1,0 +1,17 @@
+# Plantilla de referencia, NO ejecutable. prepare crea config.toml desde Ghidra.
+[general]
+input = "ELF_PENDIENTE"
+ghidra_output = "CSV_PENDIENTE"
+output = "SALIDA_PENDIENTE"
+single_file_output = false
+low_memory_mode = true
+output_worker_threads = 1
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+stubs = []
+untracked_stubs = []
+skip = []
+
+[patches]
+instructions = []
