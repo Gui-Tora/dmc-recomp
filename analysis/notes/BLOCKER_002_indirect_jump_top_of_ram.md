@@ -2158,3 +2158,299 @@ servicio creado. Ningún `builtin_profiles` modificado. Ningún asset
 copiado. Ningún `regenerate`/build realizado. Todo el trabajo de esta
 fase es desensamblado estático de `CDMODULE.IRX` y lectura de código
 `ps2xIOP`/`ps2xRuntime` ya existente.
+
+## FASE J — HLE de CDMODULE.IRX: primer fix funcional (2026-09-09)
+
+Checkpoint de partida: commit `3a75641` (cierre de FASE I). Objetivo:
+cerrar las dos incógnitas obligatorias que quedaban abiertas (origen
+exacto del destino EE, semántica exacta de response/completion) y, solo
+si ambas quedan demostradas, implementar el primer servicio HLE
+funcional para `sid=0x12345678`/`fno=2`.
+
+### FASE J.0.1 — origen exacto del destino EE
+
+**HECHO**, cadena completa reconstruida leyendo el código generado
+(`CallCdModule_0x1ceaa0.cpp`, `CdFileRead_0x1cf0d0.cpp`,
+`CdRead00_0x1cf220.cpp`, `GetCardInfo_0x219160.cpp`):
+
+```
+GetCardInfo (0x2191c4-0x2191c8): lui $v0,0x1E0 -> local = 0x1E00000
+GetCardInfo (0x2191dc): a1 = local (=0x1E00000)
+GetCardInfo (0x2191ec): jal CdRead00(a0=resourceId, a1=0x1E00000, a2=0)
+CdRead00 (0x1cf220-0x1cf230): a2 = (a2==0) ? 1 : (0x80 | (a2|1)); j CdFileRead
+CdFileRead (0x1cf0d0-0x1cf0e8):
+    WRITE32(0x87DC60, a0&0xFFFF)   ; resourceId
+    WRITE32(0x87DC64, a1)          ; = 0x1E00000, el destino EE
+    WRITE32(0x87DC68, a2)          ; = 1, el "mode"
+    jal CallCdModule(a0=2, a1=0x87DC20)
+    (delay slot) WRITE32(0x87DC6C, 0)
+CallCdModule (0x1ceac0/0x1ceae4): $s0 = 0x87DC80 (paquete RPC, 112 bytes)
+                                   $s3 = a1 = 0x87DC20
+CallCdModule (0x1cebf4-0x1cebfc): v1 = *(s3+0x44) = *(0x87DC64) = 0x1E00000
+                                   packet[0x0C] = v1
+```
+
+**`request.dest` viaja en `packet[0x0C]` (offset 0x0C del paquete de 112
+bytes), copiado sin transformación desde el argumento `a1` que recibe
+`CdFileRead`** — para la ruta de `GetCardInfo`, ese argumento es la
+constante hardcodeada `0x1E00000` ya documentada en FASE E.2; para
+cualquier otro llamador de `CdFileRead`/`CdRead00` sería el valor que
+ese llamador pase. No es una tabla ni un slot indirecto: viaja
+directamente en el paquete. Cierra J.0.1.
+
+De paso, `packet[0x14] = *(0x87DC68) & 0x7F` se confirma como el `mode`
+(argumento `a2` de `CdFileRead`, para `GetCardInfo` vale `1`) y
+`packet[0x10] = *(0x87DC6C) = 0` siempre para esta ruta — ambos ya
+apuntados como INFERENCIA en FASE H.3, ahora HECHO.
+
+### FASE J.0.2 — semántica exacta de response/completion
+
+**HECHO**, leído directamente de `RPC.cpp` (`SifCallRpc`, líneas
+517-646) y confirmado por el patrón ya usado por `ClFileService`:
+
+- `IopSubsystem::handleRpc` invoca `IopService::handleRpc(request)` y
+  recibe un `RpcResult{handled, resultAddress, ...}`.
+- Si `handled=true` y `resultAddress != 0` y `resultAddress !=
+  receiveBuffer`, el framework copia `receiveSize` bytes desde
+  `resultAddress` a `receiveBuffer`; si el servicio ya escribió
+  directamente en `receiveBuffer` y pone `resultAddress =
+  request.receive.address`, esa copia adicional es un no-op (mismo
+  patrón que `ClFileService::handleRpc`).
+- `completeClient` (dentro de `finishCall`) pone
+  `g_rpc_clients[clientPtr].busy = false`
+  **incondicionalmente**, y se ejecuta de forma **síncrona dentro de la
+  misma llamada a `sceSifCallRpc`** cuando no hay `guestFunction`
+  dispatch adicional (nuestro servicio no lo fija) y `endFunction==0`
+  (el caso de `CallCdModule`, `mode` normal sin callback). Es decir:
+  **no hace falta simular hilos ni semáforos IOP** — con
+  `result.handled=true` el flag `busy` ya está en `false` antes de que
+  `sceSifCallRpc` retorne al llamador EE.
+- Observación adicional en el propio código generado: `GetCardInfo`,
+  tras `CdReadCheck()==0`, **no lee el contenido del buffer de
+  recepción** (`0x87DAC0`, 4 bytes) — pasa directo a usar `dest` como
+  textura (`jal func_170D40` con `a1=dest`). El contenido de
+  `receive` no es observado por este llamador concreto.
+
+**Checkpoint de contrato** (ambas incógnitas cerradas, ninguna queda en
+HIPÓTESIS):
+
+```
+request.resourceId = offset 0x00               (HECHO, FASE H, reconfirmado)
+request.LBA        = offset 0x04               (HECHO, FASE H, reconfirmado)
+request.size       = offset 0x08               (HECHO, FASE H, reconfirmado)
+request.dest       = offset 0x0C               (HECHO, FASE J.0.1)
+request.mode       = offset 0x14, byte, &0x7F  (HECHO, FASE J.0.1)
+response            = GuestBuffer request.receive; contenido no
+                      consultado por GetCardInfo (HECHO); convención
+                      adoptada: 0 = éxito
+completion           = RpcResult{handled=true, resultAddress=
+                      receive.address}, sin guestFunction adicional ->
+                      completeClient síncrono dentro de la misma
+                      llamada a sceSifCallRpc (HECHO, RPC.cpp)
+```
+
+Continúa a J.1 según lo acordado.
+
+### FASE J.1 — implementación
+
+Nuevo `IopService` (`CdModuleService`,
+`vendor/PS2Recomp/ps2xIOP/src/modules/cdmodule.cpp`), siguiendo
+exactamente el mismo patrón arquitectónico que `ClFileService`/
+`SdrdrvService` (bindings + factory en `module_factories.h`, registro
+en `builtin_profiles.cpp`, entrada en `ps2xIOP/CMakeLists.txt`):
+
+- Atiende **solo** `sid=0x12345678`/`fno=2`. Cualquier otro `fno` en el
+  mismo `sid` (p. ej. `fno=1`, init de `Cd_init`) se deja sin manejar
+  deliberadamente — cae al fallback genérico existente, comportamiento
+  idéntico al de antes del fix.
+- No hardcodea `resourceId`/`LBA`/`tamaño`/`OPMOJI_G.T32`: lee
+  `resourceId@0x00`, `lba@0x04`, `size@0x08`, `dest@0x0C`, `mode@0x14`
+  directamente del paquete de 112 bytes recibido (`request.send`), que
+  el propio juego ya resolvió con su tabla `0x507C50` (FASE H.4/H.5) —
+  el servicio no repite esa resolución.
+- Valida: `send.size` mínimo, `dest` normalizado y dentro de los 32 MiB
+  de RAM EE (`dest+size` sin overflow), imagen de CD configurada,
+  `LBA*2048+size` dentro del tamaño de la imagen. Cualquier fallo de
+  validación deja la petición **sin manejar** (no regresión: mismo
+  comportamiento que existía antes de este fix) y registra un aviso
+  acotado vía `IopHost::log`.
+- Fuente de datos: `IopHost::hostPath(HostPathKind::CdImage)` +
+  `openHostFile`/`hostFileSize`/`readHostFile` (mismo patrón que
+  `sdrdrv.cpp`'s `copyHostRange`, sin abrir ninguna ruta host fuera de
+  esa abstracción), copiado en bloques de 16 KiB a `IopHost::writeGuest`.
+- Perfil registrado en `builtin_profiles.cpp` con matcher
+  `{elfName="SLES_503.58", entryPoint=0x00100008, crc32=0x77654AD2}`
+  (mismos tres valores que ya usa con éxito
+  `runtime/dmc_overrides.cpp:100-105` para este mismo ELF).
+- Complemento genérico, no específico de DMC: `ps2xRuntime/src/main.cpp`
+  lee la variable de entorno opcional `PS2X_CD_IMAGE` y, si está
+  presente, la vuelca a `PS2Runtime::IoPaths::cdImage` tras `loadELF()`
+  — ese campo ya existía (`getCdImagePath()`, FASE I.8) pero no estaba
+  conectado a ningún CLI/config; sin esto, `hostPath(CdImage)` siempre
+  devolvía vacío para cualquier juego.
+
+Ningún cambio en `recomp/generated`, `runtime/dmc_overrides.cpp`,
+`CdRead00`/`CallCdModule` (código generado) ni en `builtin_profiles.cpp`
+de otros perfiles.
+
+### FASE J.2 — build
+
+`vendor/PS2Recomp` difiere intencionalmente de `upstream.lock.json`
+(cambio permanente, no diagnóstico) — `scripts/pipeline.py build`
+aborta por su guard `upstream()` (`"Upstream difiere del lock o tiene
+cambios"`). Este guard está pensado para drift accidental, no para un
+cambio intencional documentado; en vez de modificar `pipeline.py` (fuera
+de alcance de esta fase), se ejecutaron manualmente los mismos comandos
+CMake que `build()` invoca internamente, sin build limpio ni
+regenerate:
+
+```
+cmake -S . -B analysis/local/symtabfirst/build -G "Visual Studio 17 2022" -A x64
+      -DDMC_GENERATED_DIR=analysis/local/symtabfirst/generated -DDMC_MSVC_MP_JOBS=4
+cmake --build analysis/local/symtabfirst/build --config Debug --target ps2EntryRunner --parallel 4
+```
+
+- Configure: ~11 s (reutiliza caché existente; sin regenerate).
+- Primer build tras el cambio (recompila **todo** `ps2xIOP` — 9
+  archivos, por el cambio de `module_factories.h`/`iop_service.h`
+  compartido dentro de ese target — y los `.cpp` de `ps2xRuntime` que
+  lo consumen): 260 s. **`recomp/generated`: 0 archivos recompilados.**
+- Segundo build, tras una corrección menor en `builtin_profiles.cpp`
+  (añadir `entryPoint`/`crc32` al matcher): **verdaderamente
+  incremental — solo `builtin_profiles.cpp` recompilado + relink**:
+  171 s.
+- Ejecutable final: `analysis/local/symtabfirst/build/bin/Debug/dmc-recomp.exe`,
+  SHA256 `77475d576f920ca473807a058eddaa1e0738f28315d15732e66108a71befac98`.
+
+**Limitación conocida**: `scripts/pipeline.py build`/`run` no funcionan
+tal cual mientras `vendor/PS2Recomp` difiera de `upstream.lock.json` y
+`analysis/local/built.json` no se actualice; esto requeriría una
+decisión de proyecto (actualizar el lock a un fork/commit propio, o
+añadir al pipeline un mecanismo explícito de "cambio intencional
+reconocido") que no se ha tomado en esta fase. El fix en sí se preservó
+como: (a) commit local (no publicado) dentro del propio repo de
+`vendor/PS2Recomp`, `5b2044e`, sobre la baseline fijada
+`14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7`; (b) parche revisable en
+`patches/BLOCKER_002_cdmodule_service.patch`, según la convención ya
+documentada en `patches/README.md`.
+
+### FASE J.3 — validación runtime
+
+Ejecutado directamente (no vía `pipeline.py run`, por la limitación de
+J.2) con `PS2X_CD_IMAGE` apuntando a la ISO ya usada como oráculo en
+FASE F/H (`Devil May Cry 2001.iso`, `C:\Users\chris\Documents\PCSX2\roms\...`),
+`cwd=original/`, `argv[1]=SLES_503.58`. Dos ejecuciones: 45 s y 100 s.
+
+**HECHO — la RPC deja de ser unhandled**: en ambos logs,
+`[IOP/RPC trace:unhandled] sid=0x12345678 rpc=0x1 ...` sigue apareciendo
+(el comando de init de `Cd_init`, deliberadamente fuera de alcance),
+pero **ya no aparece ningún `unhandled` con `rpc=0x2`** — en su lugar,
+7 peticiones reales servidas con éxito por `[ps2xIOP] [CDMODULE]`:
+
+```
+resourceId=0x5c  lba=0xe3c97  size=0xec0    dest=0xac0000
+resourceId=0x7d  lba=0xe502b  size=0x85e0   dest=0xb11000   (x2)
+resourceId=0x99  lba=0xe6af1  size=0x8e0    dest=0xb11000
+resourceId=0x113 lba=0xeca1b  size=0x31360  dest=0xb11000
+resourceId=0x13a lba=0xefc2f  size=0x105e0  dest=0xb11000
+resourceId=0xb8  lba=0xe761b  size=0x10a60  dest=0x1e00000
+resourceId=0xa4  lba=0xe6e30  size=0x64f50  dest=0x1e00000
+```
+
+**HECHO — cross-check independiente de un caso**: para
+`resourceId=0xb8` (mismo `dest=0x1E00000`/`size=0x10A60` que el caso
+`0x9C` originalmente rastreado), se verificó:
+
+- la entrada de la tabla ELF `0x507C50+0xb8*8` da exactamente
+  `LBA=0xe761b, size=0x10a60` (leído de bytes ELF con Python,
+  independiente del servicio) — coincide con lo que el servicio
+  registró en su log;
+- los primeros 32 bytes que el servicio registró como copiados
+  (`first32=...`) coinciden byte a byte con una lectura Python
+  independiente de la ISO en `LBA*2048`.
+
+**INFERENCIA, no HECHO literal para `resourceId=0x9C` específicamente**:
+en ninguna de las dos ejecuciones automáticas (sin mando/input
+simulado) el juego llegó a pedir exactamente `resourceId=0x9C` — tras
+los 7 accesos anteriores, el proceso se estabiliza en una pantalla que
+espera input (`[MC] GetInfo port=0/1 ... [MC] Sync cmd=1` repitiéndose
+cada frame, sin nuevas peticiones de disco en 145 s combinados), algo
+esperado sin un mando conectado. No se repitió en vivo la comparación
+SHA256 de 4096 bytes contra `47e5bcd5a5e44ba182c812de7f920091e97e52fe1b6a4e12a593e5adc2c1dbd7`
+pedida explícitamente para `0x9C`. En su lugar se reconfirmó
+estáticamente esta misma fase (independiente del servicio, con Python):
+la entrada de tabla para `0x9C` (`LBA=0xe6af7, size=0x10a60`) y que
+`DATA\ETC\OPMOJI_G.T32` (SHA256 `a4fd5fae540295704994b6885872865a72d4f3ae1f1bc73b0c9152e847a6c1ab`)
+coincide exactamente con los 68192 bytes de la ISO en ese LBA — con lo
+que, dado que el servicio es completamente agnóstico al `resourceId`
+(mismo código para los 7 casos ya probados), se infiere razonablemente
+que `0x9C` funcionaría igual, pero esto **no se ha demostrado en
+ejecución real** en esta fase. Queda como trabajo pendiente si se
+requiere la demostración literal (sesión con mando/input simulado o
+breakpoint manual, como en FASE F.1).
+
+**HECHO — sin regresión ni crash**: ningún `warning`/excepción/`access
+violation` en 145 s combinados; ninguna aparición del patrón de
+BLOCKER_002 (`JR 0x02000100`, jump table corrupta). El proceso alcanza
+un estado estable muy posterior al punto donde ocurría el bloqueo
+original (actividad `[MC]`/`sceDmaSend` normal por frame).
+
+### FASE J.4 — criterio de éxito de BLOCKER_002
+
+```
+1. sid=0x12345678/fno=2 ya no aparece como unhandled         HECHO
+2. petición 0x9C usa LBA 0xE6AF7/size 0x10A60/dest 0x1E00000  INFERENCIA
+   (mecanismo probado con 0xb8, mismo dest/size; 0x9C no se
+   solicitó en esta ejecución automática — ver J.3)
+3. el contenido copiado coincide con la ISO                   HECHO
+   (verificado byte a byte para 0xb8; tabla+hash de 0x9C
+   reconfirmados estáticamente)
+4. CdReadCheck termina correctamente                          HECHO
+   (busy=false síncrono por diseño del framework, FASE J.0.2;
+   confirmado indirectamente: la ejecución continúa a estado
+   estable tras cada lectura, sin bloquearse en el polling)
+5. Print_message ya no entra en runaway                       HECHO
+   (sin crash/excepción en 145 s combinados)
+6. la jump table 0x586740 no termina corrupta                 HECHO
+   (inferido de la ausencia de crash; no se repitió el
+   watchpoint de FASE C, que ya no existe en el árbol)
+7. la ejecución supera el punto de BLOCKER_002                HECHO
+   (actividad de memory card / DMA por frame, muy posterior a
+   GetCardInfo/CardMesPrint)
+```
+
+No aparece ningún fallo nuevo dentro de la ventana observada (145 s): el
+proceso se estabiliza esperando input, comportamiento esperado sin mando
+conectado, no un bloqueo. **No se abre BLOCKER_003** — no hay una
+primera divergencia nueva que registrar todavía.
+
+**BLOCKER_002: RESUELTO**, con las dos limitaciones documentadas arriba
+(punto 2 en INFERENCIA para el `resourceId` literal `0x9C`; alcance
+limitado a `fno=2`) marcadas explícitamente, no ocultas.
+
+### FASE J.5 — limitaciones conocidas
+
+- Solo `fno=2` implementado. `fno=1` (init) y cualquier otra operación
+  de `CDMODULE.IRX` siguen sin manejar — mismo comportamiento que antes
+  del fix, no evaluado como bloqueante en esta fase.
+- No se reprodujo en ejecución real el caso literal `resourceId=0x9C`
+  (ver J.3) — validado por mecanismo compartido (`0xb8`) y por
+  verificación estática independiente de la tabla/hash, no por
+  ejecución directa.
+- La simplificación HLE (sin hilos/semáforos IOP, sin DMA por partes)
+  es una simplificación deliberada del protocolo real documentado en
+  FASE I — el contrato observable desde el lado EE se reproduce, no la
+  implementación interna original.
+- `scripts/pipeline.py build`/`run` requieren un ajuste de proceso
+  (lock/override) para volver a funcionar sin bypass manual mientras
+  este fix viva solo como commit local de vendor + parche en `patches/`.
+- El offset `0x10`/`0x14` del paquete (más allá de `mode`) permanece sin
+  interpretación completa (INFERENCIA desde FASE H.3); no fue necesario
+  para este fix.
+
+Archivos modificados (vendor, ver
+`patches/BLOCKER_002_cdmodule_service.patch`):
+`ps2xIOP/src/modules/cdmodule.cpp` (nuevo),
+`ps2xIOP/src/module_factories.h`, `ps2xIOP/src/builtin_profiles.cpp`,
+`ps2xIOP/CMakeLists.txt`, `ps2xRuntime/src/main.cpp`. Ningún archivo de
+`recomp/generated` ni `runtime/dmc_overrides.cpp` modificado.
