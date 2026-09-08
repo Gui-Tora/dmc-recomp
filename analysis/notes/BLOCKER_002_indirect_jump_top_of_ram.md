@@ -1175,8 +1175,13 @@ independientes**:
 1. Búsqueda del bloque completo de 4096 bytes como substring exacto en la
    ISO cruda completa (4.698.767.360 bytes, leída en chunks de 64MB con
    solape): **una única coincidencia**, en el offset absoluto
-   `0x7357b800` (944.840 × 2048 — exactamente alineado a sector CD-ROM de
-   2048 bytes, confirmado `LogicalSectorSize=2048` al montar la ISO).
+   `0x7357b800`. **[CORRECCIÓN 2026-09-08, FASE H]**: la nota original
+   decía "944.840 × 2048"; la aritmética correcta es
+   `0x7357B800 / 0x800 = 0xE6AF7 = 944887` (verificado:
+   `944887 × 2048 = 0x7357B800` exacto, resto 0) — exactamente alineado a
+   sector CD-ROM de 2048 bytes, confirmado `LogicalSectorSize=2048` al
+   montar la ISO. El valor original (944.840) era un error aritmético, no
+   una medición distinta.
 2. Búsqueda independiente archivo por archivo (545 archivos no-`MOVIE`,
    1.346.403.265 bytes en total, escaneados en ~4.5s) montando la ISO y
    leyendo cada archivo: **coincidencia exacta en un único archivo**,
@@ -1197,15 +1202,31 @@ resourceId  = 0x9C (156)
 selector    = 4          (byte en 0x742209, ver FASE F.2)
 archivo     = DATA\ETC\OPMOJI_G.T32
 offset      = 0x0 (inicio del archivo)
-tamaño match = 4096 bytes (0x1000) exactos, SHA256 idéntico
-tamaño total del archivo en ISO = 68192 bytes
+tamaño match DEMOSTRADO = 4096 bytes (0x1000) exactos, SHA256 idéntico
+tamaño total del archivo en ISO = 68192 bytes (0x10A60) — esto es el
+    tamaño del ARCHIVO en la ISO, NO el tamaño demostrado de la operación
+    CdRead. Ver corrección FASE H más abajo.
 ```
 
-**INFERENCIA**: `resourceId 0x9C` con selector `4` resuelve a
-`OPMOJI_G.T32`, no a `CARDT_U.DAT` como se había hipotetizado en FASE F.0
-por coincidencia de nombre. La hipótesis original queda **refutada con
-evidencia directa**, no simplemente sin confirmar. El sufijo `_G` en el
-nombre podría seguir el mismo patrón de variante-por-selector visto en
+**[CORRECCIÓN 2026-09-08, FASE H]** — la formulación original de esta
+sección decía, en efecto, "RECOMP resuelve correctamente resourceId
+0x9C". Eso sobreclaima: lo demostrado es que **RECOMP transporta
+correctamente el `resourceId` lógico `0x9C` hasta la RPC** (mismo valor,
+mismos argumentos que PCSX2, ver FASE G). La resolución física
+`resourceId → archivo/LBA/tamaño` nunca llega a producirse en la ruta
+actual de RECOMP — no hay ningún servicio IOP que la ejecute. Que
+`0x9C` "sea" `OPMOJI_G.T32` es una relación establecida del lado PCSX2
+(match binario 4096/4096 en RAM), no algo que el RECOMP demuestre
+resolver.
+
+**INFERENCIA**: dado el match binario exacto del lado PCSX2,
+`resourceId 0x9C` con selector `4` se corresponde con `OPMOJI_G.T32`
+(no `CARDT_U.DAT`, hipótesis refutada en FASE F.0 por coincidencia de
+nombre). **No demostrado**: que la operación de PCSX2 haya cargado los
+68192 bytes completos del archivo — solo se verificaron los primeros
+4096 (0x1000), que es exactamente el tamaño de dump solicitado, no un
+límite natural de la operación observada. El sufijo `_G` en el nombre
+podría seguir el mismo patrón de variante-por-selector visto en
 `CARDT_*` (`U/G/F/S/I`), pero **no se ha verificado** qué selector
 produce qué sufijo de archivo en este caso concreto (`OPMOJI_G` con
 selector `4` no encaja obviamente con el orden `U,G,F,S,I` visto en
@@ -1341,10 +1362,18 @@ transferencia real de los ~68KB del archivo sería responsabilidad del
 módulo IOP real, vía una DMA/SIF posterior que nunca llega a
 dispararse porque el propio RPC nunca se maneja).
 
-`sid=0x12345678` es un valor demasiado específico para ser un
-"no vinculado" genérico (que normalmente sería `0`) — es casi con toda
-seguridad el ID de servicio SIF real y fijo que el juego original usa
-para su módulo de lectura de CD, tal cual está hardcodeado en el binario.
+**[CORRECCIÓN 2026-09-08, FASE H]**: la frase original aquí afirmaba que
+`sid=0x12345678` "es casi con toda seguridad el ID de servicio SIF real"
+del módulo de CD — eso es una HIPÓTESIS, no un HECHO, y quedó mal
+etiquetada. `0x12345678` es también un patrón clásico de valor
+sentinel/magic/debug (`0x12345678` es una secuencia de dígitos
+ascendente, extremadamente común como placeholder en código de
+inicialización o como marcador de "no vinculado todavía" en vez de `0`).
+Lo único demostrado (HECHO) es que **el runtime OBSERVA ese valor como
+`sid` en la llamada a la RPC** — no se ha demostrado todavía su origen
+(¿lo escribe el propio ELF de DMC como constante real? ¿lo generan
+`sceSifBindRpc`/el propio runtime como valor por defecto cuando el bind
+real no se resuelve?). Investigación del origen: ver FASE H.1 más abajo.
 
 ### FASE G.2 — tabla comparativa
 
@@ -1379,8 +1408,10 @@ runtime/HLE (`SifCallRpc` se ejecuta con los parámetros correctos), pero
 **no hay ningún servicio IOP que resuelva `sid=0x12345678`** (CASO 3), y
 el runtime **marca la operación como completada (`busy=false`)
 incondicionalmente**, sin haber copiado datos reales (CASO 4). Descartados
-con evidencia directa: CASO 1 (sí llega al runtime), CASO 2 (`resourceId`
-se resuelve correctamente, ver FASE F.2/F.3), CASO 5/6 (no hay copia en
+con evidencia directa: CASO 1 (sí llega al runtime), CASO 2 (la
+aritmética EE que produce `resourceId=0x9C` es correcta e idéntica a
+PCSX2, ver FASE F.2 — la resolución física `0x9C→archivo` es un asunto
+aparte, no ocurre en RECOMP, ver corrección arriba y FASE H), CASO 5/6 (no hay copia en
 absoluto, ni de origen ni destino incorrectos — simplemente no hay copia
 real), CASO 7 (parcialmente cierto pero la causa raíz es CASO 3, no un
 bug de `CdReadCheck` en sí — `CdReadCheck` refleja fielmente lo que
@@ -1418,3 +1449,276 @@ No se ha implementado ningún fix. No se ha copiado ningún archivo. No se
 ha modificado `CdRead00`/`CallCdModule`/`SifCallRpc`. No se ha falsificado
 ninguna respuesta. No se ha hecho ningún build (se usó el ejecutable ya
 existente, sin recompilar, tal como se indicó explícitamente).
+
+## FASE H — protocolo real del módulo de lectura (2026-09-08)
+
+Todo lo que sigue es análisis estático puro (bytes ELF, `.symtab`,
+código generado, y el `.IRX` extraído de la ISO ya verificada en FASE
+F.0/F.3) — cero build, cero ejecución, cero cambio de comportamiento.
+
+### FASE H.1 — origen real de `sid=0x12345678`
+
+**HECHO**: `Cd_init` (`0x1ce940-0x1cea50`, nombre real del `.symtab`)
+construye el SID como constante inmediata, literal en el código máquina
+del juego:
+
+```
+0x1ce970: lui  $v0, 0x1234
+0x1ce974: ori  $a1, $v0, 0x5678      ; a1 = 0x12345678
+0x1ce978: jal  sceSifBindRpc(a0=0x87DBF0, a1=0x12345678)
+```
+
+`a0=0x87DBF0` es el **mismo `clientPtr`** que `CallCdModule` usa después
+para `sceSifCallRpc` (FASE G) — confirma que este bind y esa llamada
+corresponden al mismo cliente RPC. Justo antes de esto, `Cd_init` ejecuta
+en bucle:
+
+```
+sceSifLoadModule(path="cdrom0:\DATA\MODULES\CDMODULE.IRX", args=0, argsBuf=...)
+```
+
+(cadena leída directamente del ELF en `0x584C70`) hasta que el load
+tiene éxito. Si el `sceSifBindRpc` posterior falla (`v0 < 0`), el juego
+imprime un mensaje de error leído también del ELF en `0x584CA0`:
+
+```
+"cdmodule: Error!! sceSifBindRpc \n"
+```
+
+**La propia cadena de error del juego, con la palabra "cdmodule"
+incrustada, confirma sin ambigüedad que `sid=0x12345678` es el
+identificador que el juego espera que registre `CDMODULE.IRX`.** Esto
+cierra FASE H.1: `0x12345678` **no** es un sentinel/valor por defecto del
+runtime ni del propio ELF sin usar — es una constante deliberada del
+juego original, para un propósito documentado por su propio mensaje de
+error.
+
+`Cd_init` hace un segundo bind similar para un cliente distinto
+(`clientPtr=0x87DBC0`, `sid=0x87654321`, mismo patrón `lui 0x8765; ori
+0x4321`) — no investigado más a fondo por no ser el cliente que usa
+`CallCdModule`/nuestra ruta de `GetCardInfo`. Tras ambos binds, `Cd_init`
+espera (poll con `Task_sleep`-style, mismo patrón que `CdReadCheck`) a que
+`*(0x87DC14)` y `*(0x87DBE4)` (flags de "servidor listo", presumiblemente
+escritos por el propio `CDMODULE.IRX` una vez arrancado) se vuelvan no
+cero, y finalmente llama `CallCdModule(a0=1, a1=0, a2=0x80)` — un comando
+de inicialización (cmd=1, distinto del cmd=2 que usa `CdFileRead`) al
+propio módulo recién vinculado.
+
+### FASE H.2 — módulo IOP responsable
+
+**HECHO**: `CDMODULE.IRX` (`cdrom0:\DATA\MODULES\CDMODULE.IRX`, cargado
+por `Cd_init` inmediatamente antes del bind de `0x12345678`) es el módulo
+responsable — confirmado tanto por la ruta de carga como por la cadena de
+error "cdmodule: ..." asociada al fallo del bind de ese mismo cliente.
+
+Extraído de la ISO ya verificada (`analysis/local/blocker002_pcsx2/CDMODULE.IRX`,
+33.815 bytes) y volcadas sus cadenas de texto: **`CdRead_Module`** (nombre
+propio del módulo), dependencias declaradas (`cdvdman`, `sifcmd`,
+`sifman`, `sysclib`, `thbase`/`thevent`/`thsemap` — primitivas de threads
+IOP), y mensajes de depuración que confirman su función real: `"cdmodule:
+File Open Error!!! %s"`, `"cdmodule: Get Size Error!!!"`, `"cdmodule: Seek
+Faild"`, `"CD Read Retry..."`, nombres de símbolos internos
+`CdReadProc`/`CdReadProcess`/`CdSeekProc`/`CdSeekProcess`/`CdInit`/
+`trans_mem_to_iop`/`trans_mem_to_spu`/`trans_mem_to_ee`. Es un driver de
+lectura de CD multihilo real (hilos dedicados de lectura/seek/movimiento
+de memoria), consistente con el patrón asíncrono
+`CallCdModule`→`sceSifCallRpc`→(`CdReadCheck` polling) ya documentado en
+FASE G.
+
+Búsqueda del patrón little-endian `78 56 34 12` (0x12345678) y `21 43 65
+87` (0x87654321) dentro del `.IRX`: **sin coincidencias**. No se ha
+determinado por qué (relocations IOP, tabla de importación/exportación
+distinta, u otro mecanismo de registro no basado en una constante literal
+en el binario) — **HIPÓTESIS abierta**, no bloqueante para el resto de
+FASE H.
+
+### FASE H.4/H.5 — resolución física de `resourceId` y tamaño solicitado
+
+**HECHO — hallazgo central de esta fase**, con evidencia primaria pura
+(bytes ELF, sin interpretación): dentro de `CallCdModule`, para `cmd=2`
+(la ruta de `CdFileRead`), en `0x1cebac-0x1cebe8`:
+
+```
+0x1cebac: lui  $v0, 0x50
+0x1cebb0: addiu $a0, $v0, 0x7C50      ; a0 = 0x507C50  (tabla, campo A)
+0x1cebb4: lui  $v0, 0x50
+0x1cebb8: addiu $v1, $v0, 0x7C54      ; v1 = 0x507C54  (misma tabla, campo B)
+0x1cebbc-1cebc4: a2 = *(0x87DC60+0)   ; = resourceId (0x9C en nuestro caso)
+0x1cebc8: a2 = a2 << 3                ; resourceId * 8  (stride de 8 bytes/entrada)
+0x1cebcc: a0 = a0 + a2
+0x1cebd0: a0 = *(a0 + 0)              ; campo A de la entrada
+0x1cebd4: packet[4] = a0
+0x1cebd8-1cebe0: (mismo índice) v1 = v1 + resourceId*8
+0x1cebe4: v1 = *(v1 + 0)              ; campo B de la entrada
+0x1cebe8: packet[8] = v1
+```
+
+Es decir: `packet[4] = *(0x507C50 + resourceId*8)`,
+`packet[8] = *(0x507C54 + resourceId*8)` — **una tabla real de entradas de
+8 bytes, indexada directamente por `resourceId`**, leída del propio ELF
+(dirección file-backed, estática).
+
+Entrada para `resourceId=0x9C` (dirección `0x508130`), leída directamente
+de bytes ELF:
+
+```
+campo A = 0x0000E6AF7 = 944887
+campo B = 0x00010A60  = 68192
+```
+
+**Estos dos valores coinciden EXACTOS, byte a byte, con mediciones
+completamente independientes de FASE F.3/H**:
+
+- campo A (`944887` = `0xE6AF7`) == LBA calculado a partir del offset ISO
+  donde se encontró el bloque de RAM de PCSX2
+  (`0x7357B800 / 0x800 = 0xE6AF7`, corrección aritmética de esta misma
+  fase).
+- campo B (`68192` = `0x10A60`) == tamaño exacto del archivo
+  `DATA\ETC\OPMOJI_G.T32` en la ISO (medido por listado de directorio,
+  FASE F.0/F.3).
+
+Esto **demuestra, con evidencia primaria triangulada de dos fuentes
+independientes (tabla ELF estática + medición ISO/PCSX2), que
+`packet[4]` es el LBA de inicio y `packet[8]` es el tamaño en bytes del
+recurso**, y que la tabla en `0x507C50` es la resolución física real de
+`resourceId → {LBA, tamaño}` que el juego original usa. Cierra FASE H.4 y
+H.5: el tamaño que la petición **pretende** solicitar es efectivamente
+**68192 bytes, el archivo completo** — no un fragmento arbitrario. (Sigue
+sin demostrarse si la operación observada en PCSX2, limitada a los
+primeros 4096 bytes por ser lo único volcado, transfiere realmente los
+68192 completos de una vez o por partes — la tabla demuestra la
+*intención*/parámetro solicitado, no el comportamiento runtime completo
+de PCSX2 más allá de los 4096 bytes ya verificados.)
+
+Entradas vecinas leídas para contexto/verificación de coherencia (sin
+verificación cruzada externa para estas, solo consistencia interna):
+
+```
+resourceId=0x9a: LBA=0xe6af3 (944883)  size=0x910   (2320)
+resourceId=0x9b: LBA=0xe6af5 (944885)  size=0x990   (2448)
+resourceId=0x9c: LBA=0xe6af7 (944887)  size=0x10a60 (68192)  <- nuestro caso
+resourceId=0x9d: LBA=0xe6b19 (944921)  size=0x385e0 (230880)
+resourceId=0x9e: LBA=0xe6b8a (945034)  size=0x385e0 (230880)
+resourceId=0x9f: LBA=0xe6bfb (945147)  size=0x385e0 (230880)
+```
+
+Los LBA son crecientes/consecutivos entre entradas — consistente con
+recursos empaquetados secuencialmente en el disco, un patrón normal de
+tabla de recursos de un juego (no verificado contra más archivos de la
+ISO; **INFERENCIA**, no se ha comprobado si `0x9d/0x9e/0x9f` corresponden
+a otros archivos reales de `DATA/ETC/`).
+
+### FASE H.3 — estructura del paquete de 112 bytes (parcial)
+
+**HECHO** (offsets confirmados con evidencia de código):
+
+```
+packet[0x00] = resourceId          (u32, escrito por CdFileRead)
+packet[0x04] = LBA físico          (u32, resuelto por la tabla 0x507C50, campo A)
+packet[0x08] = tamaño en bytes     (u32, resuelto por la tabla 0x507C50, campo B)
+```
+
+(`dest`/EE destination y `mode` viajan por otras vías ya documentadas en
+FASE G — `dest` se lee de `0x87DC64` según `CdFileRead`, `mode` se
+construye en `CdRead00`.)
+
+**INFERENCIA, no confirmada con precisión**: los offsets `0xC`, `0x10`,
+`0x14` del paquete también se escriben (vistos en el código: `0xC` recibe
+una dirección fija `0x743640`, posiblemente un puntero a
+función/callback; `0x10` recibe `*(s3+0x4C)`, posiblemente una
+fecha/versión del recurso; `0x14` recibe un byte con máscara `0x7F`,
+posiblemente flags/modo) — no se ha determinado su semántica exacta con
+la misma certeza que los tres primeros campos. No bloqueante para el
+resultado de esta fase.
+
+### FASE H.6 — mecanismo IOP→EE
+
+**HIPÓTESIS, no demostrada** (requeriría desensamblar `CDMODULE.IRX`,
+código IOP MIPS-I sin `.symtab`, fuera del alcance abordado en esta
+fase): dado que `CDMODULE.IRX` depende de `sifman`/`sifcmd` y tiene hilos
+dedicados de lectura, la transferencia final IOP→EE de los datos leídos
+del disco casi con toda seguridad usa **SIF DMA** (el único mecanismo
+real por el que el IOP puede escribir en RAM EE) — consistente con el
+patrón arquitectónico estándar de PS2 y con `notifyIopSifTransfer`/
+`SifTransfer` ya existentes en nuestro runtime (`ps2_iop_transport.h`,
+FASE G). No se ha localizado la instrucción/rutina concreta dentro del
+`.IRX` que dispara esa DMA — **no confirmado**.
+
+### FASE H.7 — precedentes en PS2Recomp/ps2xIOP
+
+**HECHO**: existe un servicio ya implementado con la arquitectura
+correcta para este tipo de problema: `createClFileService`
+(`ps2xIOP/src/modules/clfile.cpp`, perfil built-in para otro juego,
+"LOTR" — `lotrClFileBindings()`). Patrón observado (solo como precedente
+arquitectónico, **no copiado, no usado todavía**):
+
+```
+IopService::handleRpc(request)
+  -> resolver ruta/host desde el request (m_host.translateGuestPath)
+  -> m_host.openHostFile(hostPath)
+  -> m_host.readHostFile(handle, buffer, size)
+  -> m_host.writeGuest(destinationAddress, buffer, bytesRead)
+```
+
+Usa una capa de abstracción `m_host` (`openHostFile`/`readHostFile`/
+`writeGuest`/`readGuest`/`translateGuestPath`) — ni acceso directo a
+punteros de memoria guest ni a rutas de host sin traducir. **No existe
+ningún perfil ni servicio para `SLES_503.58`/Devil May Cry** en el
+catálogo actual (`builtin_profiles.cpp`) — confirmado explícitamente,
+mismo resultado que en FASE G.
+
+Ningún resultado para búsquedas literales de `0x12345678`, `CDMODULE`,
+`CallCdModule`, `CdFileRead` dentro de `ps2xIOP/` — no hay ningún
+precedente que ya trate específicamente esta ruta de Devil May Cry.
+
+### Resultado de FASE H
+
+```
+SID real               = 0x12345678 (HECHO — constante literal del juego,
+                          en Cd_init, para bind con CDMODULE.IRX)
+módulo IOP propietario  = CDMODULE.IRX ("CdRead_Module", HECHO)
+RPC read command        = cmd=2 (a través de CallCdModule; cmd=1 visto
+                          como comando de inicialización, no investigado)
+resourceId              = 0x9C
+archivo                 = DATA\ETC\OPMOJI_G.T32 (HECHO, match binario FASE F.3)
+LBA                     = 0xE6AF7 / 944887 (HECHO, tabla ELF 0x507C50 +
+                          confirmación cruzada con offset ISO real)
+offset                  = 0 (el recurso empieza al inicio del LBA resuelto)
+tamaño solicitado       = 0x10A60 / 68192 bytes, el archivo completo
+                          (HECHO, mismo campo de la tabla)
+mecanismo IOP->EE       = SIF DMA (HIPÓTESIS arquitectónica, no localizada
+                          en el binario IOP)
+completion              = sceSifCallRpc + polling CdReadCheck (HECHO,
+                          FASE G) — depende de que el servicio IOP real
+                          señalice el semáforo/complete correctamente,
+                          mecanismo interno no verificado
+```
+
+**Arquitectura de un futuro fix** (boceto, NO implementado):
+
+```
+Servicio IOP HLE nuevo, sid=0x12345678, perfil específico de DMC:
+  handleRpc(request):
+    parsear packet de 112 bytes en request.send
+      -> resourceId = packet[0]
+      -> lba        = packet[4]   (ya resuelto por el propio juego,
+                                    no hace falta que el servicio repita
+                                    la tabla 0x507C50 — puede confiar en
+                                    el valor recibido, o validarlo)
+      -> size        = packet[8]
+      -> dest EE      = (según FASE G, viaja por 0x87DC64/receiveBuffer,
+                          confirmar mecanismo exacto antes de implementar)
+    resolver el archivo/bytes reales (host file abierto desde la ISO
+      montada, o extracción previa — decisión pendiente, ver
+      AGENTS.md/UPSTREAM.md sobre no montar la ISO dentro del runtime
+      salvo que se decida explícitamente)
+    leer `size` bytes desde el offset correspondiente
+    escribir a `dest` en RAM EE vía la capa de abstracción existente
+      (mismo patrón que ClFileService, no acceso directo a punteros)
+    marcar completion / limpiar busy de forma que CdReadCheck lo vea
+      correctamente
+```
+
+Ningún fix implementado. Ningún archivo copiado. Ningún perfil creado.
+Ningún build realizado — todo el trabajo de esta fase es lectura de
+bytes ELF/ISO/IRX y código generado ya existente.
