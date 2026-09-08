@@ -1,7 +1,14 @@
 # Devil May Cry (2001) — PS2 static recompilation bring-up
 
 Investigación para PC con PS2Recomp y Ghidra. Objetivo inmediato: M0–M2.
-Todavía no se ha analizado un ELF de DMC ni demostrado que el juego arranque.
+ELF identificado y analizado (`SLES_503.58`, SHA-256
+`d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`), baseline
+symtab-first promovido (ver `analysis/notes/SYMTAB_BASELINE_PROMOTION.md`).
+BLOCKER_001 (arranque del entry) resuelto. En investigación activa
+BLOCKER_002 (`analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md`):
+el juego arranca, carga módulos IOP y llega hasta la ruta de lectura de
+memory card antes de bloquearse; causa raíz localizada (FASE G) en un
+servicio IOP/SIF RPC sin implementar, sin fix aplicado todavía.
 
 ## Organización
 
@@ -67,9 +74,9 @@ M3 requerirá comprobar la resolución real de archivos y el contenido del disco
 
 | Hito | Criterio | Estado |
 | --- | --- | --- |
-| M0 | ELF real → C++ generado, enlazado con tabla no vacía | Pendiente ELF/export |
-| M1 | Evidencia de ejecución del entry del ELF | Pendiente |
-| M2 | Inicialización básica identificada y completada | Pendiente |
+| M0 | ELF real → C++ generado, enlazado con tabla no vacía | Cumplido (baseline symtab-first) |
+| M1 | Evidencia de ejecución del entry del ELF | Cumplido (BLOCKER_001 resuelto) |
+| M2 | Inicialización básica identificada y completada | En progreso — BLOCKER_002 activo (FASE G) |
 | M3–M4 | Lectura de datos y primera imagen | Fuera del objetivo inmediato |
 | M5–M10 | Intro, menú, Mission 1, control, combate, juego completo | Sin evaluar |
 
