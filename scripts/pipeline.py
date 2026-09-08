@@ -65,11 +65,109 @@ def run(args, label, timeout=None, cwd=ROOT):
     return log
 
 
+def effective_commit():
+    # With no patches[], vendor must sit exactly at the pinned upstream commit
+    # (original behavior). With patches[], vendor must sit exactly at
+    # patched_commit: a synthetic, deterministic commit derived from `commit` +
+    # patches[] applied in order (see apply_patchset). `commit` itself always
+    # stays the real, remote-recoverable upstream baseline; it is never
+    # replaced by a local/synthetic hash.
+    patches = LOCK.get('patches', [])
+    if not patches:
+        return LOCK['commit']
+    if 'patched_commit' not in LOCK:
+        raise ValueError('upstream.lock.json declara patches[] pero no patched_commit.')
+    return LOCK['patched_commit']
+
+
 def upstream():
     actual = subprocess.check_output(['git', '-C', str(VENDOR), 'rev-parse', 'HEAD'], text=True).strip()
     dirty = subprocess.check_output(['git', '-C', str(VENDOR), 'status', '--porcelain'], text=True).strip()
-    if actual != LOCK['commit'] or dirty:
+    if actual != effective_commit() or dirty:
         raise ValueError('Upstream difiere del lock o tiene cambios; revisar antes de continuar.')
+
+
+def verify_patchset_hashes():
+    # Preflight: check every patch file exists and matches its recorded SHA256
+    # BEFORE touching the working tree. Returns the resolved absolute paths in
+    # LOCK['patches'] order (patches[].path is relative to ROOT, not to
+    # vendor's cwd, so callers must use these resolved paths with `git apply`,
+    # never the raw relative string).
+    resolved = []
+    for entry in LOCK.get('patches', []):
+        patch_path = (ROOT / entry['path']).resolve()
+        if not patch_path.is_file():
+            raise ValueError(f"Patch declarado en upstream.lock.json no existe: {entry['path']}")
+        actual_sha = digest(patch_path)
+        if actual_sha != entry['sha256']:
+            raise ValueError(
+                f"SHA256 de {entry['path']} no coincide con upstream.lock.json "
+                f"(esperado {entry['sha256']}, actual {actual_sha}); revisar antes de aplicar nada.")
+        resolved.append(patch_path)
+    return resolved
+
+
+def apply_patchset(dest):
+    # Applies LOCK['patches'] (in order) on top of the just-checked-out
+    # baseline commit, then folds the result into one deterministic commit
+    # (patched_commit) via commit-tree — never `git commit`, so this never
+    # depends on user.name/user.email, commit hooks, commit.gpgsign, or any
+    # local branch. Any failure resets vendor back to the clean baseline and
+    # aborts explicitly; never leaves baseline + a partial subset of patches
+    # applied.
+    resolved_patches = verify_patchset_hashes()
+    if not resolved_patches:
+        return
+    baseline = LOCK['commit']
+    print(f'apply-patchset: {len(resolved_patches)} patch(es) sobre {baseline}', flush=True)
+
+    def abort_and_reset(reason):
+        subprocess.run(['git', '-C', str(dest), 'reset', '--hard', baseline],
+                        capture_output=True, text=True)
+        subprocess.run(['git', '-C', str(dest), 'clean', '-fd'],
+                        capture_output=True, text=True)
+        raise RuntimeError(reason)
+
+    for patch_path in resolved_patches:
+        print(f'  apply: {patch_path.relative_to(ROOT)}', flush=True)
+        check = subprocess.run(['git', '-C', str(dest), 'apply', '--check', str(patch_path)],
+                                capture_output=True, text=True)
+        if check.returncode != 0:
+            abort_and_reset(f'git apply --check fallo para {patch_path}:\n{check.stderr}')
+        applied = subprocess.run(['git', '-C', str(dest), 'apply', str(patch_path)],
+                                 capture_output=True, text=True)
+        if applied.returncode != 0:
+            abort_and_reset(f'git apply fallo para {patch_path}:\n{applied.stderr}')
+
+    add = subprocess.run(['git', '-C', str(dest), 'add', '-A'], capture_output=True, text=True)
+    if add.returncode != 0:
+        abort_and_reset(f'git add -A fallo tras aplicar patches:\n{add.stderr}')
+
+    tree = subprocess.check_output(['git', '-C', str(dest), 'write-tree'], text=True).strip()
+
+    identity = LOCK['patch_identity']
+    env = os.environ.copy()
+    env.update(GIT_AUTHOR_NAME=identity['author_name'], GIT_AUTHOR_EMAIL=identity['author_email'],
+               GIT_AUTHOR_DATE=identity['timestamp'], GIT_COMMITTER_NAME=identity['author_name'],
+               GIT_COMMITTER_EMAIL=identity['author_email'], GIT_COMMITTER_DATE=identity['timestamp'])
+    commit_tree = subprocess.run(
+        ['git', '-C', str(dest), 'commit-tree', tree, '-p', baseline, '-m', identity['message']],
+        capture_output=True, text=True, env=env)
+    if commit_tree.returncode != 0:
+        abort_and_reset(f'git commit-tree fallo:\n{commit_tree.stderr}')
+    patched_commit = commit_tree.stdout.strip()
+
+    if patched_commit != LOCK['patched_commit']:
+        abort_and_reset(
+            f"El patchset no reproduce patched_commit: esperado {LOCK['patched_commit']}, "
+            f"obtenido {patched_commit}. Revisar patches[]/patch_identity/patched_commit en "
+            f"upstream.lock.json (probable desincronizacion tras editar un patch).")
+
+    checkout = subprocess.run(['git', '-C', str(dest), 'checkout', '--detach', patched_commit],
+                              capture_output=True, text=True)
+    if checkout.returncode != 0:
+        abort_and_reset(f'git checkout --detach {patched_commit} fallo:\n{checkout.stderr}')
+    print(f'apply-patchset: HEAD ahora en {patched_commit} (detached)', flush=True)
 
 
 def cmake():
@@ -96,9 +194,20 @@ def bootstrap(_):
     for dest, url, commit in [(VENDOR, LOCK['repository'], LOCK['commit']),
                               (ROOT / 'vendor/PS2Recomp.wiki', LOCK['wiki_repository'], LOCK['wiki_commit'])]:
         if not dest.exists():
-            run(['git', 'clone', '--recurse-submodules', url, dest], 'clone')
+            # --no-checkout: no working tree is materialized yet, so
+            # core.autocrlf can be fixed to a known value BEFORE any file
+            # touches disk. Doing checkout first and configuring autocrlf
+            # after is not equivalent: this repo inherits core.autocrlf=true
+            # from a machine-wide gitconfig on at least one bring-up machine,
+            # which silently rewrites line endings on checkout and makes
+            # `git apply` fail against the LF-only patches in patches/.
+            run(['git', 'clone', '--no-checkout', url, dest], 'clone')
+            if dest == VENDOR:
+                run(['git', '-C', dest, 'config', 'core.autocrlf', 'false'], 'configure-autocrlf')
             run(['git', '-C', dest, 'checkout', '--detach', commit], 'pin')
             run(['git', '-C', dest, 'submodule', 'update', '--init', '--recursive'], 'submodules')
+            if dest == VENDOR:
+                apply_patchset(dest)
     upstream()
 
 

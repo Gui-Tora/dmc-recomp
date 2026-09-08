@@ -74,6 +74,21 @@ Registrar semántica de completado RPC, callbacks, semáforos y transferencias.
 No crear un plugin de éxito ficticio para ocultar SIDs desconocidos.
 El ejemplo completo está en `vendor/PS2Recomp/ps2xIOP/PluginExample.md`.
 
+**Nota (FASE J/K, BLOCKER_002)**: el servicio HLE de lectura de CD para
+DMC (`CdModuleService`) se implementó directamente dentro de vendor
+(`builtin_profiles.cpp`/`module_factories.h`/`modules/cdmodule.cpp`),
+no como plugin nativo — se desvía de la ruta prevista arriba. Motivo:
+alcance de la tarea era cerrar el bloqueo con la modificación mínima
+posible sobre la arquitectura ya existente en `ps2xIOP` (mismo patrón
+que `ClFileService`/`SdrdrvService`, ya dentro de vendor), no diseñar
+el plugin. Para mantener esto reproducible sin vendor dirty permanente,
+el cambio vive como parche versionado (`patches/`) que
+`scripts/pipeline.py bootstrap` aplica automáticamente sobre la
+baseline fijada — ver `patches/README.md` y
+`analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md` FASE K. Migrar
+esto a un plugin nativo sigue siendo una opción futura si se prefiere
+mantener vendor sin ningún diff.
+
 ## Fuentes
 
 - https://github.com/ran-j/PS2Recomp (README y código del commit fijado).

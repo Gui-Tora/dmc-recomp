@@ -2,5 +2,18 @@
   "repository": "https://github.com/ran-j/PS2Recomp.git",
   "commit": "14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7",
   "wiki_repository": "https://github.com/ran-j/PS2Recomp.wiki.git",
-  "wiki_commit": "19913d78ba89adec620d6571856a76c8c9a8aa14"
+  "wiki_commit": "19913d78ba89adec620d6571856a76c8c9a8aa14",
+  "patches": [
+    {
+      "path": "patches/BLOCKER_002_cdmodule_service.patch",
+      "sha256": "92ed7f8dd918a979014d59071a7340bf934e68d5caec3294a36848b1ca0c4778"
+    }
+  ],
+  "patch_identity": {
+    "author_name": "dmc-recomp pipeline",
+    "author_email": "pipeline@dmc-recomp.invalid",
+    "timestamp": "1700000000 +0000",
+    "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
+  },
+  "patched_commit": "3b0ce90ce06314a2b6c66a6fe1f6bf2460ebd1cd"
 }

@@ -2428,6 +2428,49 @@ primera divergencia nueva que registrar todavía.
 (punto 2 en INFERENCIA para el `resourceId` literal `0x9C`; alcance
 limitado a `fno=2`) marcadas explícitamente, no ocultas.
 
+**[CORRECCIÓN 2026-09-09, FASE K.0]** Dos precisiones sobre la tabla de
+J.4, sin borrar el texto original de arriba:
+
+**Punto 6 (jump table `0x586740`)**: la etiqueta `HECHO` era
+conceptualmente incorrecta. Durante FASE J no se volvió a inspeccionar
+directamente los 64 bytes de la tabla en `0x586740` ni se reactivó el
+watchpoint de FASE C (que ya no existe en el árbol, revertido en FASE
+E). Lo demostrado directamente en FASE J.3 es únicamente: (a) no
+reaparece el patrón `JR 0x02000100`; (b) no reaparece el runaway de
+`Print_message`; (c) ejecución estable durante 145 s. De estos tres
+hechos se **infiere fuertemente** que el mecanismo de corrupción de
+FASE C/D (el cursor `$s1` de `Print_message` desbordando y aterrizando
+sobre su propia tabla) ya no ocurre — pero eso es una inferencia sobre
+la ausencia de sus síntomas, no una observación directa de la tabla.
+Corrección: **INFERENCIA FUERTE**, no HECHO.
+
+**Punto 2 (`resourceId=0x9C`)**: etiquetarlo como una única
+`INFERENCIA` global mezclaba evidencia de procedencia muy distinta.
+Separado correctamente:
+
+```
+HECHO ESTÁTICO (FASE H.4/H.5, re-confirmado en FASE J.0.1/J.3):
+    resourceId 0x9C -> tabla ELF 0x507C50 -> LBA=0xE6AF7, size=0x10A60
+    (para la ruta GetCardInfo: dest=0x01E00000, constante hardcodeada)
+
+HECHO PCSX2 previo (FASE F.3, oráculo real):
+    los primeros 4096 bytes cargados en 0x01E00000 durante una sesión
+    manual de PCSX2 coinciden exactamente (SHA256) con DATA/ETC/OPMOJI_G.T32
+
+NO OBSERVADO EN FASE J RUNTIME:
+    ninguna de las dos ejecuciones automáticas del nuevo CdModuleService
+    solicitó literalmente resourceId=0x9C (el juego se estabiliza
+    esperando input antes de llegar a esa pantalla concreta sin mando).
+    El servicio SÍ fue validado en runtime con otras 7 peticiones reales
+    servidas correctamente, incluyendo resourceId=0xB8 (mismo
+    dest=0x01E00000/size=0x10A60 que 0x9C, LBA distinto), con lectura
+    verificada byte a byte contra la ISO.
+```
+
+La conclusión de FASE J.4 no cambia (BLOCKER_002 sigue resuelto), pero
+la naturaleza de la evidencia para estos dos puntos queda precisada, no
+inflada.
+
 ### FASE J.5 — limitaciones conocidas
 
 - Solo `fno=2` implementado. `fno=1` (init) y cualquier otra operación
@@ -2454,3 +2497,282 @@ Archivos modificados (vendor, ver
 `ps2xIOP/src/module_factories.h`, `ps2xIOP/src/builtin_profiles.cpp`,
 `ps2xIOP/CMakeLists.txt`, `ps2xRuntime/src/main.cpp`. Ningún archivo de
 `recomp/generated` ni `runtime/dmc_overrides.cpp` modificado.
+
+## FASE K — integración reproducible del fix en el pipeline (2026-09-09)
+
+Objetivo: que `python scripts/pipeline.py build`/`run` vuelvan a ser el
+camino normal sin invocar CMake manualmente ni saltarse el guard
+`upstream()`. No se investiga BLOCKER_003 en esta fase.
+
+### FASE K.0 — correcciones documentales de FASE J
+
+Aplicadas directamente en el bloque de corrección de FASE J.4 (arriba,
+marcado `**[CORRECCIÓN 2026-09-09, FASE K.0]**`): el punto 6 (jump
+table `0x586740`) pasa de `HECHO` a **INFERENCIA FUERTE** (no se
+reinspeccionó la tabla ni se reactivó el watchpoint; lo demostrado es
+solo la ausencia de los tres síntomas conocidos); el punto 2
+(`resourceId=0x9C`) se separa en HECHO ESTÁTICO / HECHO PCSX2 previo /
+NO OBSERVADO EN FASE J RUNTIME, en vez de una única `INFERENCIA` global
+que mezclaba evidencia de procedencia distinta.
+
+### FASE K.1 — auditoría del mecanismo real de upstream/patches
+
+Lectura completa de `AGENTS.md`, `README.md`, `analysis/UPSTREAM.md`,
+`patches/README.md` y `scripts/pipeline.py`. Hallazgos (HECHO, lectura
+directa de código):
+
+1. `upstream.lock.json` era un pin estricto: `{repository, commit,
+   wiki_repository, wiki_commit}`.
+2. **No existía ningún mecanismo de aplicación de patches.**
+   `patches/README.md` era puramente documental ("no hay parches
+   aplicados inicialmente").
+3. `patches/` era solo documental — ningún script lo leía.
+4. `upstream()` verificaba exactamente dos condiciones: `HEAD ==
+   LOCK['commit']` y `git status --porcelain` vacío. Se invoca desde
+   `bootstrap`, `tools_build`, `prepare`, y transitivamente desde
+   `generated()` — por lo que tanto `build` como `run` la disparan.
+5. `analysis/local/built.json` guarda `{generated, exe, exe_sha256}` —
+   **ninguna identidad de `vendor/PS2Recomp`**. La verificación de
+   "vendor correcto" recaía enteramente en `upstream()`.
+6. `pipeline.py run` (`launch()`) exige `generated()` válido (que ya
+   exige `upstream()` limpio) y `gen == built['generated']` +
+   `digest(exe) == built['exe_sha256']`.
+
+Hallazgo adicional no pedido explícitamente: `analysis/UPSTREAM.md`
+documentaba como ruta **prevista** para código específico de un juego
+un **plugin nativo IOP** (`PS2X_IOP_ENABLE_PLUGINS=ON`, biblioteca
+`SHARED` externa), no un cambio directo en `builtin_profiles.cpp`
+dentro de vendor. El fix de FASE J se desvía de ese plan (documentado
+como nota en `UPSTREAM.md`, no revertido — rehacerlo como plugin sería
+un cambio de alcance mucho mayor que "integración reproducible").
+
+### FASE K.2 — modelo elegido: A (baseline + patchset + `patched_commit` determinista)
+
+Se descartó Modelo B puro (el usuario señaló explícitamente: un lock
+reproducible no puede depender de un commit local efímero como
+`5b2044e`, que no existe en ningún remoto). Se adoptó una variante de
+Modelo A/C: `commit` (baseline real, recuperable del remoto) y
+`patched_commit` (commit sintético, determinista, derivado de
+`commit` + `patches[]`) quedan como identidades **separadas** en
+`upstream.lock.json` — nunca se sustituye la una por la otra.
+
+**Verificación empírica antes de implementar** (worktrees temporales
+sobre `vendor/PS2Recomp`, sin tocar el vendor real):
+
+- `core.autocrlf=true` está fijado a **nivel de sistema**
+  (`C:/Program Files/Git/etc/gitconfig`) y se hereda en
+  `vendor/PS2Recomp` (sin `.gitattributes` propio). Con eso activo, el
+  checkout usa CRLF y `git apply` de un patch LF falla
+  (`patch does not apply`) en los 4 archivos — confirmado
+  reproduciendo el fallo exacto antes de la corrección.
+- Fijando `core.autocrlf=false` **localmente en el repo vendor, antes
+  del checkout** (no depende de la config del host), el checkout usa
+  LF y `git apply --check` pasa limpio.
+- Generado el commit determinista (autor/committer/fecha/mensaje
+  fijos) **dos veces**, en worktrees independientes: mismo hash exacto
+  ambas veces (`3b0ce90ce06314a2b6c66a6fe1f6bf2460ebd1cd`).
+- El **tree hash** de ese commit (`a944d581b82e731f392b09fd60eb2fb2d57e5073`)
+  es **idéntico** al tree hash del commit real de FASE J (`5b2044e`) —
+  confirma que el patch reproduce exactamente el contenido ya validado
+  en runtime.
+
+**Correcciones aplicadas a la propuesta inicial** (pedidas
+explícitamente antes de implementar, todas incorporadas):
+
+- `core.autocrlf=false` se fija **antes** del checkout que materializa
+  la baseline (`git clone --no-checkout` → `config core.autocrlf
+  false` → `checkout --detach` → `submodule update`), no después.
+- Verificación de existencia+SHA256 de **todos** los patches antes de
+  tocar el árbol; aplicación con `git apply --check` + `git apply` por
+  patch, y `git reset --hard <baseline>` + `git clean -fd` ante
+  cualquier fallo (nunca queda baseline + subconjunto aplicado).
+- `patched_commit` se genera con `git commit-tree` (no `git commit`):
+  `git add -A` → `git write-tree` → `git commit-tree <tree> -p
+  <baseline> -m <mensaje>` con `GIT_AUTHOR_*`/`GIT_COMMITTER_*` fijos —
+  evita depender de `user.name`/`user.email`/hooks/`commit.gpgsign`/
+  rama local.
+- Estado final: `HEAD` **detached** en `patched_commit`, sin rama local
+  (igual que el modelo de bootstrap ya existente para la baseline
+  pura) — no se "mueve" ninguna rama `main`.
+- `patches[].path` (relativo a la raíz del proyecto) se resuelve a ruta
+  absoluta (`ROOT / path`) antes de pasarlo a `git apply` — nunca se
+  asume relativo al cwd de vendor.
+- `commit` y `patched_commit` quedan como campos separados en el lock;
+  `commit` nunca se reemplaza.
+
+### FASE K.3 — implementación
+
+`scripts/pipeline.py`:
+
+- `bootstrap()`: reordenado a `clone --no-checkout` → `config
+  core.autocrlf false` (solo para `VENDOR`) → `checkout --detach
+  <commit>` → `submodule update --init --recursive` → `apply_patchset(dest)`
+  (solo para `VENDOR`) → `upstream()`.
+- `effective_commit()` (nueva): devuelve `LOCK['patched_commit']` si
+  `LOCK['patches']` no está vacío, si no `LOCK['commit']`.
+- `upstream()`: ahora compara contra `effective_commit()` en vez de
+  `LOCK['commit']` directamente — sigue siendo una comparación O(1)
+  (`HEAD` + `status --porcelain`), sin recalcular ni reaplicar nada en
+  cada `build`/`run`.
+- `verify_patchset_hashes()` (nueva): preflight — existencia + SHA256
+  de cada patch antes de tocar el árbol.
+- `apply_patchset(dest)` (nueva): implementa el algoritmo descrito en
+  K.2 (check+apply por patch con reset+abort ante fallo,
+  `add`+`write-tree`+`commit-tree` con identidad fija, verificación de
+  que el hash resultante coincide con `LOCK['patched_commit']`,
+  `checkout --detach` final).
+
+`upstream.lock.json`: añadidos `patches` (lista de `{path, sha256}`),
+`patch_identity` (`author_name`, `author_email`, `timestamp` fijo
+`"1700000000 +0000"`, `message` fijo) y `patched_commit`
+(`3b0ce90ce06314a2b6c66a6fe1f6bf2460ebd1cd`). `commit` (baseline) sin
+cambios.
+
+`patches/BLOCKER_002_cdmodule_service.patch`: reescrito para ser diff
+puro (sin el encabezado `#` que llevaba desde FASE J — ese encabezado
+rompe `git apply`, confirmado). Documentación movida a
+`patches/BLOCKER_002_cdmodule_service.md` (causa/reproducción/fix/
+validación, sin duplicar lo ya escrito en las notas de FASE J).
+`patches/README.md` actualizado con la convención de dos archivos y el
+algoritmo de `bootstrap`/`upstream()` (ver ese archivo para el detalle,
+no duplicado aquí).
+
+### FASE K.4 — prueba fuerte de reproducibilidad
+
+Ejecutada usando las funciones **reales** de `pipeline.py` (importado
+como módulo, no un script ad hoc), con **clonado real desde GitHub**
+(red disponible, verificado con `git ls-remote`) en un directorio de
+scratch, **dos veces** de forma independiente:
+
+```
+run 1: HEAD=3b0ce90c...  parent=14b1e5cb...  dirty=""  detached=True  cdmodule.cpp=presente
+run 2: HEAD=3b0ce90c...  parent=14b1e5cb...  dirty=""  detached=True  cdmodule.cpp=presente
+head match: True
+parent match: True
+parent == baseline: True
+head == patched_commit: True
+ambos dirty vacío: True
+ambos detached: True
+ambos con cdmodule.cpp: True
+upstream() (real, vía effective_commit()): OK en ambas, sin excepción
+```
+
+**HECHO**: reproducibilidad confirmada de extremo a extremo, con el
+código real, desde un clon real, dos veces.
+
+### FASE K.5 — `pipeline.py build` (sin bypass)
+
+Vendor real migrado: `git checkout --detach 3b0ce90c...` +
+`git branch -D main` (la rama local `main`, apuntando al commit humano
+`5b2044e` de FASE J, se elimina — el commit sigue existiendo por hash
+hasta un eventual `gc`; su árbol es idéntico al de `patched_commit`,
+confirmado en K.2). Estado final antes de compilar: `HEAD` detached en
+`3b0ce90c...`, sin rama, working tree limpio.
+
+```
+python scripts/pipeline.py build
+exit: 0   elapsed: 163s
+```
+
+Log de compilación: **cero archivos recompilados** (ni en
+`recomp/generated` ni en `ps2xIOP`/`ps2xRuntime` — solo relink de
+`ps2_iop.lib`/`ps2_runtime.lib`/`dmc-recomp.exe`, porque el contenido
+de archivo no cambió respecto al último build de FASE J). SHA256 del
+exe resultante: `77475d576f920ca473807a058eddaa1e0738f28315d15732e66108a71befac98`
+— **idéntico** al exe ya validado en runtime en FASE J.3. `built.json`
+actualizado automáticamente por el propio `pipeline.py build`.
+
+### FASE K.6 — `pipeline.py run` (sin bypass)
+
+```
+PS2X_CD_IMAGE=<ISO real> python scripts/pipeline.py run --seconds 60
+exit: 1 ("ERROR: Tiempo agotado")
+```
+
+Un timeout tras 60 s **no es un fallo** (README: "un timeout no
+equivale a un bloqueo confirmado"; mismo comportamiento ya documentado
+en FASE F/J para este mismo binario). Log real inspeccionado: mismo
+resultado que FASE J.3 — 8 líneas `[ps2xIOP] [CDMODULE]` (7
+`resourceId` distintos servidos correctamente), `unhandled] sid=0x12345678`
+únicamente con `rpc=0x1` (init, fuera de alcance deliberadamente), cero
+`warning`/excepción/crash, proceso estabilizado en el mismo polling de
+memory card que FASE J. **Confirma que el camino normal del pipeline
+reproduce exactamente el comportamiento ya validado**, sin necesidad de
+repetir toda la validación de FASE J desde cero.
+
+### FASE K.7 — `built.json` / identidad de build
+
+**No se modifica `built.json`.** Razonamiento (documentado, no
+implementado nada nuevo): `built.json` nunca verificó la identidad de
+`vendor/PS2Recomp` — esa verificación siempre recayó en `upstream()`,
+que ahora exige `HEAD == patched_commit` exacto (cuando hay patches
+declarados) antes de que `build`/`run` puedan proceder en absoluto.
+Como `upstream()` se invoca en **toda** llamada a `generated()` (que
+`build()` y `launch()`/`run` llaman primero), no existe ningún camino
+por el que `pipeline.py run` acepte silenciosamente un exe enlazado
+contra un vendor distinto del que el árbol actual representa — el
+guard aborta antes de llegar a comparar nada de `built.json`. Añadir
+una identidad de vendor a `built.json` sería redundante con lo que
+`upstream()` ya garantiza en cada invocación.
+
+### FASE K.8 — estado final de vendor
+
+```
+upstream.lock.json:
+    commit          = 14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7  (baseline oficial recuperable)
+    patches         = [{BLOCKER_002_cdmodule_service.patch, sha256 92ed7f8d...}]
+    patched_commit  = 3b0ce90ce06314a2b6c66a6fe1f6bf2460ebd1cd  (sintético, reproducible)
+
+vendor/PS2Recomp:
+    HEAD            = 3b0ce90c... (detached, sin rama)
+    parent(HEAD)    = 14b1e5cb... (== commit baseline)
+    working tree    = limpio
+    cdmodule.cpp    = presente, contenido verificado (tree hash == FASE J)
+
+pipeline.py:
+    bootstrap()     -> aplica el patchset automáticamente en un clon nuevo
+    upstream()      -> exige HEAD == patched_commit + limpio (mismo guard, O(1))
+    build/run       -> funcionan sin CMake manual ni bypass
+```
+
+No queda ningún "para compilar hay que saltarse `upstream()`" como
+procedimiento — ese bypass, usado en FASE J únicamente para validar el
+fix antes de que existiera este mecanismo, ya no es necesario ni se
+menciona como camino recomendado en ningún documento actualizado.
+
+### FASE K.9 — documentación
+
+Actualizados (sin duplicar el algoritmo, que vive completo en
+`patches/README.md` y aquí en K.2-K.3): `README.md` (organización de
+`vendor`/`patches`, variable `PS2X_CD_IMAGE`, estado de M2),
+`analysis/UPSTREAM.md` (nota sobre la desviación respecto al plugin
+nativo previsto), `patches/README.md` (convención `.patch`+`.md`,
+algoritmo completo de `bootstrap`/`upstream`, lista de patches
+activos). Ninguna ruta personal incluida en ningún archivo versionado
+(`PS2X_CD_IMAGE` documentado como variable de entorno a definir por
+quien ejecute, sin valor de ejemplo con ruta real).
+
+### Resultado de FASE K
+
+```
+Modelo de integración   = A (baseline + patchset + patched_commit determinista)
+Archivos modificados     = scripts/pipeline.py, upstream.lock.json,
+                            patches/BLOCKER_002_cdmodule_service.patch (reescrito, diff puro),
+                            patches/BLOCKER_002_cdmodule_service.md (nuevo),
+                            patches/README.md, README.md, analysis/UPSTREAM.md,
+                            analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md
+Bootstrap                = clona, fija autocrlf=false, hace checkout de la baseline,
+                            aplica el patchset, verifica patched_commit, deja HEAD detached
+Guard upstream()          = sigue siendo O(1); ahora compara contra patched_commit
+pipeline build            = HECHO, sin bypass, 0 archivos recompilados, exe idéntico a FASE J
+pipeline run               = HECHO, sin bypass, mismo comportamiento validado en FASE J
+Estado final de vendor    = HEAD detached en patched_commit, sin rama, limpio
+Commit principal           = (ver git log tras el commit de esta fase)
+Limitaciones restantes     = las ya documentadas en FASE J.5 (alcance fno=2,
+                            resourceId=0x9C no reproducido en runtime automático,
+                            simplificación HLE sin hilos/DMA por partes); adicional
+                            de esta fase: el servicio vive dentro de vendor
+                            (patch), no como plugin nativo (ver nota en UPSTREAM.md)
+```
+
+BLOCKER_002 sigue resuelto. No se investiga BLOCKER_003 en esta fase.

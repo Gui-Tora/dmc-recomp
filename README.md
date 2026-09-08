@@ -10,6 +10,9 @@ FASE J: servicio IOP HLE mínimo (`CdModuleService`, perfil
 `SLES_503.58`) para el RPC de lectura de CD (`sid=0x12345678`, `fno=2`)
 que antes quedaba sin manejar; validado con la ISO real, con
 limitaciones documentadas (alcance limitado a `fno=2`; ver FASE J.5).
+El fix vive como parche reproducible (`patches/`) que `bootstrap`
+aplica automáticamente sobre la baseline fijada (FASE K) — `pipeline.py
+build`/`run` funcionan sin pasos manuales.
 
 ## Organización
 
@@ -18,8 +21,10 @@ limitaciones documentadas (alcance limitado a `fno=2`; ver FASE J.5).
 - `analysis/notes/`: evidencia de bloqueos por SHA-256.
 - `recomp/config.toml`: configuración local preparada desde el export de Ghidra.
 - `recomp/generated/<sha256>/<run>/`: C++ generado, sin ediciones manuales.
-- `runtime/`: overrides DMC; `patches/`: cambios generales al runtime upstream.
-- `vendor/`: upstream y wiki fijados en `upstream.lock.json`, clones locales ignorados.
+- `runtime/`: overrides DMC; `patches/`: cambios generales al runtime upstream,
+  reproducibles (`upstream.lock.json` los aplica automáticamente en `bootstrap`).
+- `vendor/`: upstream fijado en `upstream.lock.json` (baseline real + patchset
+  reconocido, ver `patches/README.md`), clones locales ignorados.
 - `build/` y `logs/`: compilaciones y diagnósticos locales.
 
 ## Flujo en Windows
@@ -66,6 +71,12 @@ Un timeout no equivale a un bloqueo confirmado: también puede ser ejecución
 normal; investigar el log y el PC. Los procesos de configuración/compilación
 guardan su salida completa en `logs/`. El runtime abre su ventana al ejecutar.
 Ejecutar con el ELF equivocado debe fallar antes de arrancar.
+
+Para ejercitar lecturas reales de CD (`CdModuleService`, BLOCKER_002)
+definir `PS2X_CD_IMAGE` con la ruta a una imagen de disco real antes de
+`pipeline.py run`; sin esa variable, cualquier RPC de lectura que la
+necesite queda sin manejar (mismo comportamiento que antes del fix, no
+un error nuevo). No versionar ninguna ruta ni imagen personal.
 
 El runtime inicial desactiva debug UI y FFmpeg para M0–M2; FFmpeg desactivado
 impide validar vídeo real. La ruta de datos parte de la carpeta del ELF.
