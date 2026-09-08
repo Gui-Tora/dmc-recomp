@@ -1722,3 +1722,439 @@ Servicio IOP HLE nuevo, sid=0x12345678, perfil específico de DMC:
 Ningún fix implementado. Ningún archivo copiado. Ningún perfil creado.
 Ningún build realizado — todo el trabajo de esta fase es lectura de
 bytes ELF/ISO/IRX y código generado ya existente.
+
+## FASE I — contrato real de CDMODULE.IRX (2026-09-08)
+
+Todo lo que sigue es análisis estático puro del propio binario
+`CDMODULE.IRX` (extraído en FASE H.2, `analysis/local/blocker002_pcsx2/CDMODULE.IRX`,
+33.815 bytes, `.symtab`/`.strtab` completos, 182 símbolos con nombre) —
+cero build, cero ejecución, cero cambio de comportamiento. No existía
+ninguna herramienta de desensamblado MIPS en este entorno (`capstone` no
+instalado, sin `pip`, `objdump.exe` de `w64devkit` sin soporte MIPS,
+`mips-linux-gnu-objdump` inexistente) — se escribió un desensamblador
+MIPS-I mínimo ad hoc en Python para este propósito.
+
+### FASE I.1 — origen real de `sid=0x12345678` en el lado IOP
+
+**HECHO**: localizados por escaneo directo de `.text` los dos únicos
+`jal` cuyo objetivo (desplazado ×4) coincide con la dirección del stub
+de importación `sceSifRegisterRpc` (símbolo `.symtab`, valor 9144).
+Ningún `.rel.text`/`.rel.data`/`.rel.rodata` referencia ese símbolo (490
+relocations en `.rel.text`, ninguna con `r_sym` = índice de
+`sceSifRegisterRpc`) — consistente con que el módulo está enlazado con
+`.text` fijado en base 0 y estas llamadas internas no necesitan
+reubicación.
+
+Primer sitio (offset de texto `0x1974`, código reconstruido hacia atrás
+desde ese punto):
+
+```
+0x1950: lui  $a1, 0x1234
+0x1954: ori  $a1, $a1, 0x5678      ; a1 = fno = 0x12345678
+...
+0x1974: jal  sceSifRegisterRpc(sd=$sp+56, fno=$a1=0x12345678,
+                                func=cdfunc@6184, buff=RpcArg@412624,
+                                cfunc=0, cbuff=0, qd=$sp+32)
+```
+
+Segundo sitio (offset `0x1a30`), patrón idéntico:
+
+```
+lui $a1,0x8765; ori $a1,$a1,0x4321   ; fno = 0x87654321
+jal sceSifRegisterRpc(sd=$sp+56, fno=0x87654321, func=cdfunc2@6548,
+                       buff=RpcArg@412624, cfunc=0, cbuff=0, qd=$sp+32)
+```
+
+**Esto confirma, con evidencia primaria IOP (no solo EE), que
+`sid=0x12345678` es literalmente el valor `fno` con el que
+`CDMODULE.IRX` se registra a sí mismo ante `sceSifRegisterRpc`,
+exactamente el mismo valor y la misma construcción (`lui 0x1234; ori
+0x5678`) que `Cd_init` usa del lado EE para `sceSifBindRpc` (FASE H.1).**
+Cierra FASE I.1 con doble confirmación independiente (EE + IOP).
+
+**Explicación del patrón `78 56 34 12` no encontrado como bytes literales
+(FASE H.2, HIPÓTESIS abierta)**: ya no es una incógnita. Tanto en el ELF
+EE como en este `.IRX` el valor `0x12345678` **nunca aparece como
+literal de datos** — se construye siempre en código, en dos
+instrucciones (`lui`+`ori`), porque `0x5678` cabe en el campo inmediato
+de 16 bits pero `0x1234` no cabe en una sola instrucción de 32 bits con
+signo (`0x12345678` no es representable como `addiu` con signo desde
+`$zero`). Es el patrón de carga de constante de 32 bits estándar del
+compilador para este valor concreto, no una ofuscación ni un mecanismo
+de registro alternativo. Esto también resuelve la advertencia inicial
+de I.1: la ausencia del patrón de bytes no refutaba `sid=0x12345678`,
+y ahora hay prueba directa de que sí es ese valor.
+
+### FASE I.2 — reconstrucción del dispatch RPC real
+
+**HECHO**: `cdfunc` (símbolo real, dirección 6184, 264 bytes) es el
+`func` registrado para `sid=0x12345678`. Desensamblado completo:
+valida `1 <= fno <= 13` (`fno-1 < 13` sin signo) y salta a una tabla de
+13 punteros en `.rodata`, dirección 10136, indexada por `(fno-1)*4`
+(instrucción `sll $v0,$v1,2`, corregido durante esta fase un bug del
+desensamblador que extraía el campo `shamt` desde el bit equivocado —
+ver nota metodológica más abajo).
+
+Tabla completa (13 entradas, leídas directamente de bytes `.rodata`):
+
+```
+fno= 1 -> 0x1894      fno= 6 -> 0x1918      fno=11 -> 0x1918
+fno= 2 -> 0x18b4 (*)  fno= 7 -> 0x18b4      fno=12 -> 0x18fc
+fno= 3 -> 0x18a4      fno= 8 -> 0x18cc      fno=13 -> 0x190c
+fno= 4 -> 0x1918      fno= 9 -> 0x18d8
+fno= 5 -> 0x1880      fno=10 -> 0x18ec
+```
+
+`fno=2` (nuestro caso, el mismo valor numérico que `CallCdModule`
+manda como `cmd=2`/`rpc` a `sceSifCallRpc` del lado EE — FASE G) salta a
+`0x18b4`, cuyo cuerpo llama a la dirección `0xbe8` con
+`a0=fno(2), a1=buff(puntero al paquete de 112 bytes recibido), a2=0`.
+`0xbe8` = 3048 decimal, **coincide exacto con el símbolo real
+`CdReadProcess`** (188 bytes) del `.symtab`.
+
+**Sobre la distinción pedida explícitamente ("no asumir que son la
+misma cosa")**: quedan demostradas tres magnitudes relacionadas pero
+lógicamente distintas:
+
+1. `cmd` de `CallCdModule` (lado EE, switch de 14 casos en
+   `0x584D10`) — un valor que el juego decide localmente antes de
+   llamar a `sceSifCallRpc`.
+2. `rpc`/`fno` de `sceSifCallRpc`/`sceSifRegisterRpc` (lado IOP) — el
+   número que indexa la tabla de `cdfunc`.
+3. El campo `resourceId` dentro del propio paquete de 112 bytes
+   (`packet[0]`, FASE H.3) — un dato que viaja *dentro* del payload,
+   no como número de operación RPC.
+
+**HECHO**: (1) y (2) son, para esta ruta, el mismo valor numérico
+(`2`), porque `CallCdModule` pasa su `cmd` directamente como argumento
+`rpc`/`fno` de `sceSifCallRpc` sin transformación — confirmado por
+ambos lados (FASE G para el lado EE, esta fase para el lado IOP: la
+tabla de `cdfunc` indexa exactamente por ese mismo valor). No es una
+coincidencia estructural del protocolo (no hay ninguna razón semántica
+para que "cmd" e "fno" compartan numeración salvo que el juego los
+transporte igual) pero está demostrado, no asumido. (3) sigue siendo un
+valor totalmente independiente (`0x9C`), que solo comparte el mismo
+paquete de transporte.
+
+`CdReadProcess` (`0xbe8`-`0xca4`, desensamblado completo) resultó ser
+una función de **inicialización/señalización**, no la que hace la
+lectura física:
+
+- Lee/escribe un conjunto de globales `$gp`-relativas que, al resolver
+  su dirección real (`_gp = 47792`, símbolo del `.symtab`) coinciden
+  exactamente con: `Sema_cd` (15076), `RoutineNo` (15048, byte),
+  `Thread_cd` (15052), `Sema_main` (15084), `EE_TransSize` (15136).
+- En la rama de "ya inicializado" hace `sceSifCheckStatRpc`-adyacente
+  (`0x22e8`) y llama dos veces a una dirección que, junto con el
+  patrón de dos literales de cadena distintos (offsets 9840 y 9964) y
+  el contexto de `printf` ya confirmado en otras funciones de este
+  mismo módulo (ver FASE I.4), es casi con toda seguridad
+  `printf`/logging de depuración — **INFERENCIA**, no se resolvió
+  contra el símbolo exacto en esta fase (no bloqueante).
+- Termina señalizando el estado y devolviendo un valor leído de
+  `EE_TransSize` (15136) — **INFERENCIA**: el detalle exacto de qué
+  campo del paquete escribe en `buff+22` no quedó resuelto con
+  certeza suficiente para documentarlo como HECHO (ambigüedad en qué
+  registro callee-saved corresponde a qué argumento original en el
+  tramo leído); se deja pendiente, no bloqueante para el resultado de
+  esta fase.
+
+**HECHO**: el trabajo real de lectura ocurre en un hilo separado,
+`CdReadProc` (símbolo real, dirección 2016, 1032 bytes), despertado por
+el semáforo `Sema_cd`. Escaneo de todos los `jal` dentro de su rango
+(sin desensamblado instrucción a instrucción completo, solo mapeo de
+llamadas contra `.symtab`) da la secuencia real:
+
+```
+CDFileOpen -> CDFileSeekL (LBA) -> CDFileRead -> [reintento:
+  CDFileSeekL, CDFileRead otra vez] -> CDFileClose ->
+  SignalSema / SetEventFlag / ExitThread
+```
+
+(`WaitSema`/`SignalSema`/`DeleteSema`/`ReferSemaStatus` para
+sincronización de hilos IOP; `TsndPortInit` aparece una vez, sin
+investigar — **HIPÓTESIS**, posiblemente inicialización de un puerto
+no relacionado con la ruta de lectura de este recurso concreto, no
+bloqueante).
+
+`CDFileRead` (símbolo real, 8352, 400 bytes) es, a su vez, la que llama
+a la **API real de CDVDMAN de ps2sdk**, confirmada por nombre exacto de
+símbolo:
+
+```
+sceCdBreak -> WaitSema -> sceCdDiskReady -> sceCdSync -> PollSema ->
+sceCdCallback -> sceCdRead(lba, sectors, buf, mode) -> [reintento con
+  printf("CD Read Retry...") + DelayThread si falla] -> SignalSema
+```
+
+Esto **cierra I.2**: la ruta de lectura real usa la misma API de
+CDVDMAN estándar de PS2 (`sceCdRead`/`sceCdSync`/`sceCdCallback`) que
+cualquier driver de CD real de PS2, no un mecanismo propietario de
+Capcom — el LBA resuelto en FASE H.4 (`0x507C50`) es exactamente el
+`lba` que llega a esta llamada real.
+
+### FASE I.3 — paquete exacto de la petición (resourceId=0x9C)
+
+**No se capturó un paquete en vivo en esta fase** (ninguna instrumentación
+nueva ni build, por restricción explícita). Sí se resolvió la
+discrepancia señalada sobre el log antiguo:
+
+**HECHO** (aritmética directa, sin ambigüedad): el log antiguo
+`sendBytes = 5C 00 00 00 97 3C 0E 00 C0 0E 00 00 ...` tiene como primeros
+4 bytes (little-endian) `0x0000005C` = **92 decimal = `0x5C`**, que
+**no es** `0x9C` (156 decimal). Es decir, el primer campo del paquete
+(`packet[0]` = `resourceId`, FASE H.3) de ese log corresponde a un
+recurso distinto (`0x5C`), no al nuestro. **Queda demostrado, no
+asumido, que ese log no es la petición de `OPMOJI_G.T32`** — es
+probablemente el log de otra petición de lectura (otro asset) capturada
+en algún momento de la sesión de depuración anterior. No se ha
+identificado a qué recurso corresponde `0x5C` (fuera de alcance de esta
+fase).
+
+La captura del paquete real de 112 bytes para `resourceId=0x9C`
+específicamente **queda pendiente para una fase futura** (requeriría
+una captura runtime acotada, p. ej. extender temporalmente el
+`[IOP/RPC trace:unhandled]` ya existente para volcar más bytes de
+`sendBytes`, o profundizar la reconstrucción estática de
+`CallCdModule` en los offsets `0xC`/`0x10`/`0x14` todavía en
+INFERENCIA, FASE H.3).
+
+### FASE I.4 — mecanismo real IOP→EE (`trans_mem_to_ee`)
+
+**HECHO — cierra la HIPÓTESIS abierta en FASE H.6.** `trans_mem_to_ee`
+(símbolo real, dirección 1680, 280 bytes) fue desensamblado por
+completo:
+
+- Lee `*(a1+8)` (campo del `buff` que recibe) y aborta a una rama de
+  salida si vale `-1` (INFERENCIA: probablemente una señal de "sin más
+  datos que transferir" para uso en transferencias por partes; el
+  significado exacto de ese `-1` en relación con el `packet[8]`
+  =tamaño de FASE H.3 no se ha reconciliado del todo — **la
+  correspondencia entre el `buff` que ve `trans_mem_to_ee` y el
+  `RpcArg` original de 112 bytes queda como INFERENCIA, no HECHO**,
+  ya que no se ha probado si es el mismo puntero sin modificar o una
+  estructura intermedia construida por `CdReadProcess`/`CdReadProc`).
+- Construye un descriptor de 16 bytes en la dirección de un símbolo
+  real llamado **`dma`** (`.symtab`, valor 15216, tamaño 16) con el
+  layout exacto de `SifDmaTransfer_t` de ps2sdk (`src`, `dest`, `size`,
+  `attr`):
+
+  ```
+  dma.src  = a2            (puntero al buffer IOP de origen, arg. de
+                             trans_mem_to_ee)
+  dma.dest = EE_TransAddr[slot]   (símbolo real, dirección 15144, leído
+                             ANTES de actualizarlo — dirección EE actual)
+  dma.size = round_up(a3, 16)     (tamaño en bytes, redondeado a múltiplo
+                             de 16 — unidad de quadword de la DMA)
+  dma.attr = 0
+  ```
+
+- Llama, en este orden exacto, a tres direcciones que coinciden **cada
+  una exacta** con un símbolo real de importación del `.symtab`:
+
+  ```
+  CpuDisableIntr()                          (0x2348 = 9032)
+  sceSifSetDma(&dma, count=1)  -> id        (0x23fc = 9212)
+  CpuEnableIntr()                           (0x2350 = 9040)
+  ... bucle de espera ...
+  sceSifDmaStat(id)                         (0x2404 = 9220)
+  DelayThread(...)                          (0x24b0 = 9392)
+  ```
+
+  con reintento del `sceSifDmaStat` hasta que la transferencia se
+  reporta completa, y al salir del bucle **acumula**
+  `EE_TransAddr[slot] += tamaño_transferido` y
+  `EE_TransSize += tamaño_transferido` (soporta transferencias
+  encadenadas/por partes reutilizando el mismo `slot`, indexado por el
+  primer argumento `a0` de `trans_mem_to_ee`).
+
+**Esto reemplaza literalmente la HIPÓTESIS de FASE H.6
+("mecanismo IOP→EE = SIF DMA, no localizada en el binario") por un
+HECHO con nombre de rutina, dirección y estructura exactos**:
+`trans_mem_to_ee` usa `sceSifSetDma`/`sceSifDmaStat` (import stubs
+reales de `sifman`) sobre un descriptor `SifDmaTransfer_t` real llamado
+`dma`, con `CpuDisableIntr`/`CpuEnableIntr` como sección crítica
+alrededor del `sceSifSetDma`.
+
+**Hallazgo adicional, no buscado explícitamente pero relevante**: un
+escaneo exhaustivo de **todo** `.text` (490 relocations de
+`.rel.text` revisadas, más escaneo directo de todos los `jal`) confirma
+que **no existe ningún `jal` directo a `trans_mem_to_ee` en ningún
+punto del módulo** — ni en `CdReadProcess` ni en `CdReadProc` ni en
+`CDFileRead`. Su dirección (`0x690` = 1680) aparece, en cambio, dos
+veces como literal de 4 bytes crudo dentro de `.data` (direcciones
+`0x3aa8` y `0x3ab4`). **INFERENCIA**: esto es consistente con que
+`trans_mem_to_ee` se invoca de forma indirecta (`jalr` a través de un
+puntero a función almacenado en una estructura de datos, probablemente
+un "slot de transferencia" inicializado en `.data`, coherente con el
+patrón de `EE_TransAddr[slot]` ya encontrado). **No se localizó el
+sitio de llamada indirecta concreto en esta fase** — queda como trabajo
+pendiente si se necesitara más precisión (p. ej. para saber en qué
+momento exacto del ciclo `CDFileRead`/`CdReadProc` se invoca por
+puntero).
+
+**Nota metodológica (bug de desensamblador, corregido)**: la primera
+versión del desensamblador ad hoc extraía el campo `shamt` de `SLL`
+desde los bits de `rs` (que da 0 para instrucciones de desplazamiento)
+en vez de los bits 10-6 correctos, produciendo `sll $v0,$v1,0` para la
+palabra `0x00031080` cuando la instrucción real es `sll $v0,$v1,2`
+(escalado ×4 para indexar la tabla de saltos de `cdfunc`). Detectado
+por rederivación manual del layout de bits antes de que afectara la
+reconstrucción de la tabla; corregido para todo el desensamblado
+posterior de esta fase.
+
+### FASE I.5 — secuencia completa reconstruida
+
+**HECHO** (con los nombres reales de función establecidos en esta fase
+y en FASE G/H):
+
+```
+EE:  CallCdModule(cmd=2)
+      -> resuelve packet[4]=LBA, packet[8]=size vía tabla 0x507C50 (FASE H.4/H.5)
+      -> sceSifCallRpc(clientPtr=0x87DBF0, rpc=2, send=packet[112B], ...)
+
+IOP: sceSifCallRpc entra al servidor bound a sid=0x12345678
+      -> cdfunc(fno=2, buff, ...) [tabla de saltos, FASE I.2]
+      -> CdReadProcess(fno=2, buff, 0)  [inicializa estado, señaliza Sema_cd]
+      -> (hilo) CdReadProc despierta
+           -> CDFileOpen -> CDFileSeekL(LBA) -> CDFileRead
+                -> sceCdRead(lba, sectors, iopBuf, mode) [API CDVDMAN real]
+                -> sceCdSync / sceCdCallback (con reintento si falla)
+           -> CDFileClose
+      -> en algún punto (sitio de llamada indirecto no localizado,
+         FASE I.4) -> trans_mem_to_ee(slot, buff, iopBuf, size)
+                -> sceSifSetDma(&dma{src=iopBuf, dest=EE_TransAddr[slot],
+                                      size, attr=0}, 1)
+                -> poll sceSifDmaStat(id) hasta completar
+      -> señalización de fin (SignalSema/SetEventFlag/ExitThread del hilo,
+         mecanismo exacto de cómo esto se traduce en la respuesta RPC que
+         ve el lado EE: NO trazado en esta fase — INFERENCIA/pendiente)
+
+EE:  CdReadCheck = sceSifCheckStatRpc(clientPtr) -> 0 cuando termina
+```
+
+**Lo que un HLE real tendría que reproducir, sin decidir todavía cómo
+simplificarlo (tal y como pidió el usuario)**: el contrato observable
+desde el lado EE es solo `send`/`receive` de `sceSifCallRpc` +
+`sceSifCheckStatRpc` reportando "hecho". Todo lo interno a
+`CDMODULE.IRX` (semáforos `Sema_cd`/`Thread_cd`, hilo `CdReadProc`,
+slots de `EE_TransAddr`, DMA por partes) es un detalle de
+implementación del original que **no necesariamente** tiene que
+replicarse para que el EE observe el mismo resultado — pero no se ha
+decidido esto en esta fase, solo se deja documentado como pregunta
+abierta para I.7/futura implementación.
+
+### FASE I.6 — verificación completa de 68192 bytes (omitida)
+
+**No realizada en esta fase** (opcional según la instrucción del
+usuario; se consideró que el coste de otra sesión completa de
+PCSX2+PINE no aportaba lo suficiente frente al resto de hallazgos ya
+cerrados). Sigue pendiente si se quisiera cerrar del todo la pregunta
+de FASE H.4 sobre si PCSX2 transfiere los 68192 bytes completos de una
+sola vez.
+
+### FASE I.7 — contrato HLE mínimo (boceto, NO implementado)
+
+```
+SID                = 0x12345678                      (HECHO, I.1)
+RPC/fno de lectura  = 2                               (HECHO, I.2, mismo
+                       valor que CallCdModule cmd=2)
+Request (envío, 112 bytes, offsets confirmados HECHO salvo lo indicado):
+  [0x00] resourceId  (u32)                            HECHO (FASE H.3)
+  [0x04] LBA físico  (u32, ya resuelto por el juego)   HECHO (FASE H.3/H.4)
+  [0x08] tamaño bytes (u32, ya resuelto por el juego)  HECHO (FASE H.3/H.5)
+  [0x0C] posible puntero/callback (0x743640 constante) INFERENCIA (FASE H.3)
+  [0x10] posible fecha/versión (*(s3+0x4C))            INFERENCIA (FASE H.3)
+  [0x14] posible flags (byte, máscara 0x7F)            INFERENCIA (FASE H.3)
+  dest EE            : offset exacto dentro del paquete NO confirmado con
+                       certeza (FASE G/H apuntan a 0x87DC64/receiveBuffer,
+                       pendiente de precisar antes de implementar)
+Efecto              : copiar `tamaño` bytes desde el recurso físico
+                       (host: ISO montada o extracción — decisión NO
+                       tomada, ver I.8) hasta `dest` en RAM EE
+Response/status      : replicar el contrato `handled=true` ya usado por
+                       otros servicios de ps2xIOP (FASE G) para que
+                       CdReadCheck/sceSifCheckStatRpc reporte 0
+Resolución de resourceId: el servicio NO necesita repetir la tabla
+                       0x507C50 — el juego ya entrega LBA/tamaño
+                       resueltos en el propio paquete (packet[4]/[8],
+                       HECHO). Puede confiar directamente en esos
+                       valores; no hay necesidad demostrada de
+                       recalcularlos. (Razonamiento derivado directamente
+                       de H.4/H.5 — no es todavía una decisión de
+                       implementación.)
+```
+
+### FASE I.8 — infraestructura de origen de datos ya existente
+
+**HECHO**: antes de diseñar nada nuevo, se revisó qué abstracción ya
+existe en `ps2xIOP`/`ps2xRuntime`. Resultado:
+
+- `ps2x::iop::IopHost` (`ps2xIOP/include/ps2x/iop/iop_host.h`) ya
+  declara `HostPathKind::CdRoot` y `HostPathKind::CdImage` como
+  conceptos de primera clase, junto con `openHostFile`/`hostFileSize`/
+  `readHostFile`/`closeHostFile`/`writeGuest`/`translateGuestPath` —
+  la misma capa usada por `ClFileService` (FASE H.7) y también por
+  `sdrdrv.cpp` (`m_host.hostPath(HostPathKind::CdRoot)` con fallback
+  explícito a `HostPathKind::CdImage` vía `fallbackBodyToCdImage`,
+  `modules/sdrdrv.cpp:149-250`).
+- El lado `ps2xRuntime` (`PS2IopHostAdapter`, `ps2_iop_host.cpp`) ya
+  implementa ambos: `getCdRootPath()` (carpeta extraída/host, con
+  fallback a la carpeta del ELF) y `getCdImagePath()` +
+  `tryGetCdImageTotalSectors()` (ISO real, con aritmética de
+  sectores de 2048 bytes ya lista, `Kernel/Stubs/Helpers/Support.h`).
+
+**Esto cierra I.8**: no hace falta diseñar una fuente de datos nueva
+desde cero. Existen ya, como precedente arquitectónico reutilizable
+(no copiado ni usado todavía para DMC):
+
+```
+Opción A (ISO real)         -> getCdImagePath() + LBA*2048 + sectorsForBytes()
+Opción B (host extraído)    -> getCdRootPath() + IopHost::openHostFile/readHostFile
+Opción C (abstracción genérica) -> IopHost (ya usada por ClFileService/sdrdrv)
+```
+
+Ninguna decisión tomada sobre cuál usar para DMC — solo se confirma que
+las tres opciones ya tienen soporte de infraestructura existente y que
+la ruta natural (por analogía con `ClFileService`/`sdrdrv`) sería un
+nuevo servicio/perfil que consuma la misma interfaz `IopHost`, no un
+mecanismo aparte.
+
+### Resultado de FASE I
+
+```
+SID                     = 0x12345678  (HECHO, doble confirmación EE+IOP)
+RPC/fno lectura         = 2           (HECHO, == cmd de CallCdModule,
+                                        demostrado no asumido)
+handler IOP (dispatch)  = cdfunc@6184 -> tabla .rodata@10136 -> fno=2:
+                           CdReadProcess@0xbe8 (HECHO, símbolos reales)
+handler IOP (trabajo)   = CdReadProc@2016 (hilo, señalizado por Sema_cd)
+                           -> CDFileOpen/CDFileSeekL/CDFileRead/CDFileClose
+                           -> sceCdRead/sceCdSync/sceCdCallback (HECHO,
+                              API CDVDMAN real de ps2sdk)
+request.resourceId/.LBA/.size = offsets 0x00/0x04/0x08 (HECHO, FASE H.3);
+                           0x0C/0x10/0x14 sin resolver (INFERENCIA);
+                           dest EE sin offset confirmado (INFERENCIA)
+mecanismo IOP->EE       = trans_mem_to_ee@1680 -> sceSifSetDma/
+                           sceSifDmaStat sobre descriptor real `dma`
+                           (SifDmaTransfer_t) (HECHO — reemplaza HIPÓTESIS
+                           de FASE H.6). Sitio de llamada indirecto no
+                           localizado (INFERENCIA).
+chunks                  = sí, vía slot EE_TransAddr[]/EE_TransSize
+                           acumulativos (HECHO, mecanismo; INFERENCIA,
+                           si DMC concretamente llega a usar más de un
+                           chunk para este recurso)
+response/status         = sceSifCheckStatRpc / CdReadCheck (HECHO, FASE G);
+                           traducción exacta hilo-IOP -> respuesta RPC
+                           no trazada (INFERENCIA/pendiente)
+completion semantics    = ver arriba
+fuente host disponible  = HECHO — ya existe infraestructura para ISO real
+                           y para carpeta extraída (I.8), reutilizable
+                           por analogía con ClFileService/sdrdrv
+```
+
+**Contrato HLE mínimo definido en I.7 — NO implementado.** Ningún
+servicio creado. Ningún `builtin_profiles` modificado. Ningún asset
+copiado. Ningún `regenerate`/build realizado. Todo el trabajo de esta
+fase es desensamblado estático de `CDMODULE.IRX` y lectura de código
+`ps2xIOP`/`ps2xRuntime` ya existente.
