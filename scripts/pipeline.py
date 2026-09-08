@@ -128,23 +128,34 @@ def prepare(args):
         source_elf = source.parent / source_elf
     if digest(source_elf) != value['sha256']:
         raise ValueError('El ELF del export Ghidra no coincide con el ELF solicitado.')
-    csv_path = args.csv.resolve(strict=True)
-    with csv_path.open(encoding='utf-8-sig', newline='') as stream:
-        rows = list(csv.DictReader(stream))
-    if not rows or not {'Name', 'Start', 'End', 'Size'} <= rows[0].keys():
-        raise ValueError('CSV vacio o distinto del formato ExportPS2Functions.')
-    for row in rows:
-        if int(row['Start'], 0) >= int(row['End'], 0):
-            raise ValueError('Rango CSV invalido.')
+
+    csv_path = None
+    if args.csv is not None:
+        csv_path = args.csv.resolve(strict=True)
+        with csv_path.open(encoding='utf-8-sig', newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        if not rows or not {'Name', 'Start', 'End', 'Size'} <= rows[0].keys():
+            raise ValueError('CSV vacio o distinto del formato ExportPS2Functions.')
+        for row in rows:
+            if int(row['Start'], 0) >= int(row['End'], 0):
+                raise ValueError('Rango CSV invalido.')
+
     output = ROOT / 'recomp/generated' / value['sha256'] / str(time.time_ns())
-    for key, path in [('input', Path(value['path'])), ('ghidra_output', csv_path), ('output', output)]:
+    substitutions = [('input', Path(value['path'])), ('output', output)]
+    if csv_path is not None:
+        # Only overwrite ghidra_output when a CSV was explicitly given; the default
+        # symtab-first template already has ghidra_output = "" and stays that way.
+        substitutions.append(('ghidra_output', csv_path))
+    for key, path in substitutions:
         raw, count = re.subn(rf'(?m)^{key}\s*=.*$', lambda _: f'{key} = {json.dumps(path.as_posix())}', raw)
         if count != 1:
             raise ValueError(f'Campo {key} ausente o duplicado.')
     config_path = ROOT / 'recomp/config.toml'
     config_path.write_text(raw, encoding='utf-8')
     save(LOCAL / 'prepared.json', dict(elf=value, config_sha256=digest(config_path),
-         csv_path=csv_path.as_posix(), csv_sha256=digest(csv_path), upstream=LOCK['commit']))
+         csv_path=csv_path.as_posix() if csv_path else None,
+         csv_sha256=digest(csv_path) if csv_path else None,
+         upstream=LOCK['commit']))
     print('Configuracion preparada. Revisar stubs/untracked_stubs exportados antes de generar.')
 
 
@@ -154,8 +165,10 @@ def prepared():
     if identity(Path(receipt['elf']['path'])) != receipt['elf']:
         raise ValueError('El ELF ha cambiado. Repetir Ghidra/prepare.')
     config_path = ROOT / 'recomp/config.toml'
-    if digest(config_path) != receipt['config_sha256'] or digest(Path(receipt['csv_path'])) != receipt['csv_sha256']:
-        raise ValueError('Config/CSV ha cambiado. Repetir prepare desde el export revisado.')
+    if digest(config_path) != receipt['config_sha256']:
+        raise ValueError('Config ha cambiado. Repetir prepare.')
+    if receipt['csv_path'] is not None and digest(Path(receipt['csv_path'])) != receipt['csv_sha256']:
+        raise ValueError('CSV ha cambiado. Repetir prepare desde el export revisado.')
     return receipt, tomllib.loads(config_path.read_text(encoding='utf-8'))
 
 
@@ -191,7 +204,13 @@ def sync_active(folder, files):
     # unchanged files keep their path and mtime and MSBuild skips recompiling them.
     # The timestamped folder in recomp/generated/<sha256>/<timestamp> stays untouched
     # and remains the traceable source of truth (see generated.json / built.json).
-    active = ROOT / 'recomp/generated_active'
+    #
+    # This points at analysis/local/symtabfirst/generated (not recomp/generated_active)
+    # because that is where the symtab-first baseline's CMake cache and .vcxproj files
+    # have absolute paths baked in (see analysis/notes/SYMTAB_BASELINE_PROMOTION.md).
+    # Moving/renaming that directory would invalidate those paths and force a full
+    # rebuild, so the "active" location is defined here instead of physically moved.
+    active = ROOT / 'analysis/local/symtabfirst/generated'
     active.mkdir(parents=True, exist_ok=True)
     manifest_path = active / '.manifest.json'
     manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
@@ -209,7 +228,9 @@ def sync_active(folder, files):
 def build(_):
     receipt, folder, gen = generated()
     active = sync_active(folder, gen['files'])
-    build_dir = ROOT / 'build/runtime/active'
+    # Same reasoning as sync_active(): the promoted symtab-first build's CMake cache
+    # has C:/.../analysis/local/symtabfirst/build baked in absolute-path form.
+    build_dir = ROOT / 'analysis/local/symtabfirst/build'
     run([cmake(), '-S', ROOT, '-B', build_dir, '-G', 'Visual Studio 17 2022', '-A', 'x64',
          f'-DDMC_GENERATED_DIR={active.as_posix()}',
          f'-DDMC_MSVC_MP_JOBS={PARALLEL_JOBS}'], 'configure-runtime')
@@ -242,8 +263,13 @@ def main():
     command.set_defaults(function=identify)
     command = commands.add_parser('prepare')
     command.add_argument('--elf', type=Path, required=True)
-    command.add_argument('--toml', type=Path, required=True)
-    command.add_argument('--csv', type=Path, required=True)
+    command.add_argument('--toml', type=Path, default=ROOT / 'recomp/symtabfirst.toml',
+                          help='Default: symtab-first (no Ghidra CSV). Pass '
+                               'analysis/ghidra/export/dmc.toml explicitly for the '
+                               'Ghidra-CSV-boundaries experiment/reversing path.')
+    command.add_argument('--csv', type=Path, default=None,
+                          help='Only needed together with a --toml that has a non-empty '
+                               'ghidra_output (e.g. analysis/ghidra/export/dmc.toml).')
     command.set_defaults(function=prepare)
     args = parser.parse_args()
     try:
