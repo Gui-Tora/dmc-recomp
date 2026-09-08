@@ -3,9 +3,17 @@
 /logs/
 /original/*
 !/original/README.md
-/analysis/ghidra/
+# El proyecto Ghidra en si (bases de datos binarias, decenas de MB) no se
+# versiona. Los exports (TOML/CSV en texto plano, ~470KB cada uno) SI se
+# versionan a proposito: son nuestro trabajo real de investigacion y
+# correccion manual (ver analysis/notes/*.md para el porque de cada cambio),
+# y queremos trazabilidad completa aunque mas adelante cambiemos de fuente
+# de limites de funcion (p.ej. a la .symtab real del ELF).
+/analysis/ghidra/project/
+/analysis/ghidra/project_r5900/
 /analysis/local/
 /recomp/generated/
+/recomp/generated_active/
 /recomp/config.toml
 __pycache__/
 *.iso

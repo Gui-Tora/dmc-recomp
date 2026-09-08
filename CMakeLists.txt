@@ -27,3 +27,11 @@ target_sources(ps2EntryRunner PRIVATE ${generated_sources} runtime/dmc_overrides
 target_include_directories(ps2EntryRunner BEFORE PRIVATE "${DMC_GENERATED_DIR}")
 set_target_properties(ps2EntryRunner PROPERTIES OUTPUT_NAME dmc-recomp
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(DMC_MSVC_MP_JOBS "0" CACHE STRING "MSVC /MP job count for ps2EntryRunner (0 = let the compiler use all logical cores)")
+if(MSVC)
+    if(DMC_MSVC_MP_JOBS STREQUAL "0")
+        target_compile_options(ps2EntryRunner PRIVATE /MP)
+    else()
+        target_compile_options(ps2EntryRunner PRIVATE "/MP${DMC_MSVC_MP_JOBS}")
+    endif()
+endif()

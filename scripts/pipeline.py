@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VENDOR = ROOT / 'vendor/PS2Recomp'
 LOCAL = ROOT / 'analysis/local'
 LOCK = json.loads((ROOT / 'upstream.lock.json').read_text())
+PARALLEL_JOBS = max(1, (os.cpu_count() or 4) // 2)
 
 
 def save(path, value):
@@ -26,7 +27,11 @@ def save(path, value):
 
 
 def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def identity(path):
@@ -102,7 +107,8 @@ def tools_build(_):
     build = ROOT / 'build/tools'
     run([cmake(), '-S', VENDOR, '-B', build, '-G', 'Visual Studio 17 2022', '-A', 'x64',
          '-DPS2X_BUILD_RUNTIME=OFF', '-DPS2X_BUILD_STUDIO=OFF', '-DPS2X_BUILD_TEST=OFF'], 'configure-tools')
-    run([cmake(), '--build', build, '--config', 'Debug', '--target', 'ps2_recomp', 'ps2_analyzer', '--parallel', '4'], 'build-tools')
+    run([cmake(), '--build', build, '--config', 'Debug', '--target', 'ps2_recomp', 'ps2_analyzer',
+         '--parallel', str(PARALLEL_JOBS)], 'build-tools')
 
 
 def identify(args):
@@ -180,12 +186,35 @@ def generate(_):
     save(LOCAL / 'generated.json', dict(prepared=receipt, files={p.name: digest(p) for p in folder.iterdir() if p.suffix in ('.cpp', '.h')}))
 
 
+def sync_active(folder, files):
+    # Mirrors the immutable, timestamped `generate` output into a stable directory so
+    # unchanged files keep their path and mtime and MSBuild skips recompiling them.
+    # The timestamped folder in recomp/generated/<sha256>/<timestamp> stays untouched
+    # and remains the traceable source of truth (see generated.json / built.json).
+    active = ROOT / 'recomp/generated_active'
+    active.mkdir(parents=True, exist_ok=True)
+    manifest_path = active / '.manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.is_file() else {}
+    for name, sha in files.items():
+        if manifest.get(name) != sha:
+            shutil.copy2(folder / name, active / name)
+            manifest[name] = sha
+    for stale in set(manifest) - set(files):
+        (active / stale).unlink(missing_ok=True)
+        del manifest[stale]
+    save(manifest_path, manifest)
+    return active
+
+
 def build(_):
     receipt, folder, gen = generated()
-    build_dir = ROOT / 'build/runtime' / folder.name
+    active = sync_active(folder, gen['files'])
+    build_dir = ROOT / 'build/runtime/active'
     run([cmake(), '-S', ROOT, '-B', build_dir, '-G', 'Visual Studio 17 2022', '-A', 'x64',
-         f'-DDMC_GENERATED_DIR={folder.as_posix()}'], 'configure-runtime')
-    run([cmake(), '--build', build_dir, '--config', 'Debug', '--target', 'ps2EntryRunner', '--parallel', '4'], 'build-runtime')
+         f'-DDMC_GENERATED_DIR={active.as_posix()}',
+         f'-DDMC_MSVC_MP_JOBS={PARALLEL_JOBS}'], 'configure-runtime')
+    run([cmake(), '--build', build_dir, '--config', 'Debug', '--target', 'ps2EntryRunner',
+         '--parallel', str(PARALLEL_JOBS)], 'build-runtime')
     exe = executable(build_dir / 'bin', 'dmc-recomp')
     save(LOCAL / 'built.json', dict(generated=gen, exe=str(exe), exe_sha256=digest(exe)))
 
