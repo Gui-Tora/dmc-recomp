@@ -142,10 +142,12 @@ python scripts/pipeline.py identify original/YOUR_ELF_NAME
 
 ## License
 
-No `LICENSE` file has been added to this repository yet — that decision is
-pending. The PS2Recomp upstream this project builds on and links against is
-licensed under the **GNU General Public License, version 3** (plain GPLv3
-text, no per-file SPDX headers or "or later" qualifier in the upstream
-source). Any compiled `dmc-recomp` executable is therefore a combined work
-bound by GPLv3, regardless of what license this repository's own original
-code (scripts, patches, documentation) ends up under.
+Original code in this repository is licensed under the GNU General Public
+License v3.0 only (GPL-3.0-only).
+
+PS2Recomp and other third-party components remain subject to their respective
+licenses.
+
+Devil May Cry, its executable, game data, assets, trademarks and other
+copyrighted material are not distributed by this repository and remain the
+property of their respective rights holders.
