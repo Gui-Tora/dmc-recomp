@@ -5,14 +5,26 @@ ELF identificado y analizado (`SLES_503.58`, SHA-256
 `d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`), baseline
 symtab-first promovido (ver `analysis/notes/SYMTAB_BASELINE_PROMOTION.md`).
 BLOCKER_001 (arranque del entry) resuelto. BLOCKER_002
-(`analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md`) resuelto en
-FASE J: servicio IOP HLE mínimo (`CdModuleService`, perfil
-`SLES_503.58`) para el RPC de lectura de CD (`sid=0x12345678`, `fno=2`)
-que antes quedaba sin manejar; validado con la ISO real, con
-limitaciones documentadas (alcance limitado a `fno=2`; ver FASE J.5).
-El fix vive como parche reproducible (`patches/`) que `bootstrap`
-aplica automáticamente sobre la baseline fijada (FASE K) — `pipeline.py
-build`/`run` funcionan sin pasos manuales.
+(`analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md`) **RESUELTO**
+(FASE L, tras auditoría independiente en
+`analysis/notes/BLOCKER_002_ASTRA_AUDIT.md`): servicio IOP HLE mínimo
+(`CdModuleService`, perfil `SLES_503.58`) para el RPC de lectura de CD
+(`sid=0x12345678`, `fno=2`, `mode=1`, tamaño múltiplo de 16) que antes
+quedaba sin manejar. Caso literal `resourceId=0x9C` validado completo
+en PCSX2 (68192 bytes de RAM == archivo `OPMOJI_G.T32` == slice ISO,
+jump table intacta); en RECOMP el mecanismo se validó con ~15 recursos
+reales servidos y se explicó causalmente por qué ese `resourceId`
+concreto no es alcanzable vía navegación con la configuración OSD
+actual del runtime (`language=1` hardcodeado, se consulta antes de que
+el menú de idioma del juego sea accesible) — ver FASE L.6. A/B
+confirmó que el patrón de corrupción original solo reaparece sin la
+imagen de CD (FASE L.7). Limitaciones futuras documentadas (no
+reservas del blocker): `mode=2`, RPCs `0x9/0xA/0xD`, `fno=1`, DMA no
+alineada, rutas de error (FASE L.8). El fix vive como parche
+reproducible (`patches/`) que `bootstrap` aplica automáticamente sobre
+la baseline fijada, con el `exe` atado a la identidad exacta del vendor
+que lo produjo (FASE L.1) — `pipeline.py build`/`run` funcionan sin
+pasos manuales.
 
 ## Organización
 
@@ -88,7 +100,7 @@ M3 requerirá comprobar la resolución real de archivos y el contenido del disco
 | --- | --- | --- |
 | M0 | ELF real → C++ generado, enlazado con tabla no vacía | Cumplido (baseline symtab-first) |
 | M1 | Evidencia de ejecución del entry del ELF | Cumplido (BLOCKER_001 resuelto) |
-| M2 | Inicialización básica identificada y completada | Cumplido (parcial) — BLOCKER_002 resuelto (FASE J), alcance limitado a `fno=2` |
+| M2 | Inicialización básica identificada y completada | Cumplido — BLOCKER_002 resuelto (FASE L), alcance `fno=2`/`mode=1` |
 | M3–M4 | Lectura de datos y primera imagen | Fuera del objetivo inmediato |
 | M5–M10 | Intro, menú, Mission 1, control, combate, juego completo | Sin evaluar |
 

@@ -1,0 +1,7 @@
+# patches/*.patch are applied verbatim with `git apply` against a vendor
+# checkout with core.autocrlf=false (see scripts/pipeline.py apply_patchset),
+# and their SHA256 is pinned in upstream.lock.json. A checkout of THIS repo
+# with core.autocrlf=true would otherwise materialize them as CRLF and break
+# both git apply and the pinned hash (Astra audit, BLOCKER_002_ASTRA_AUDIT.md
+# section 6). Force LF regardless of host autocrlf configuration.
+patches/*.patch text eol=lf

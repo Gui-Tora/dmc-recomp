@@ -2776,3 +2776,611 @@ Limitaciones restantes     = las ya documentadas en FASE J.5 (alcance fno=2,
 ```
 
 BLOCKER_002 sigue resuelto. No se investiga BLOCKER_003 en esta fase.
+
+## FASE L — consolidación post-Astra (2026-09-09)
+
+Auditoría independiente en `analysis/notes/BLOCKER_002_ASTRA_AUDIT.md`
+(artefacto histórico, no se borra). Veredicto de Astra: **CONFIRMADO CON
+RESERVAS** — la causa de BLOCKER_002 (RPC de lectura de CD sin
+servicio) queda fuertemente soportada, pero encontró overclaims
+concretos en la documentación y dos bugs reales de infraestructura.
+Objetivo de esta fase: cerrarlos y validar el caso literal
+`resourceId=0x9C` antes de declarar `RESUELTO` sin reservas.
+
+### FASE L.0 — correcciones derivadas de Astra
+
+Sin reescribir historia: se añaden precisiones sobre afirmaciones
+concretas ya escritas, sin borrarlas. Referencia: Astra §4 (hallazgos
+2-6) y §10.
+
+**1. La validación runtime de FASE J para `0xb8` comprobó `first32`
+(32 bytes), no los 68192 bytes completos de RAM.** Los textos en
+FASE J.3 ("cross-check independiente de un caso"), FASE J.4 (punto 3,
+"verificado byte a byte para 0xb8") y en
+`patches/BLOCKER_002_cdmodule_service.md` que dicen "contenido
+verificado byte a byte contra la ISO" se refieren, con precisión, a los
+primeros 32 bytes registrados por el log (`first32=...`), no a un dump
+completo de los 0x10A60 bytes. Los hashes SHA256 completos citados en
+esas mismas secciones (de `OPMOJI_G.T32` y del ISO) son de **archivos**,
+no de un volcado completo de RAM tras la copia del HLE. Esa
+verificación completa no se había hecho — es exactamente el objetivo de
+FASE L.6.
+
+**2. `0xb8` y `0x9c` comparten sus primeros 32 bytes** (confirmado por
+Astra: hash completo de `0xb8` = `e7ca2139b6bc76fc960d2813ca47ac760b4aed282649d0d19bed0d2e9b3303d5`,
+distinto del hash completo de `0x9c` = `a4fd5fae540295704994b6885872865a72d4f3ae1f1bc73b0c9152e847a6c1ab`,
+pero mismo prefijo). Esto significa que la verificación de `first32`
+para `0xb8` en FASE J **no distingue** ambos recursos — es evidencia de
+que "algo del tamaño/forma correcta" se copió, no de que el recurso
+correcto específico se copió completo. No invalida el diagnóstico
+causal (el mecanismo de copia es genérico, agnóstico al `resourceId`,
+por lo que sigue siendo fuerte evidencia indirecta), pero sí invalida
+tratar esa comprobación como prueba directa del caso `0x9C`.
+
+**3. `fno=2` en el IRX original devuelve `EE_TransSize`/el contador de
+bytes transferido (redondeado a 16), NO una convención general "0 =
+éxito".** Corrige el texto de FASE J.0.2/checkpoint de contrato
+("convención adoptada: 0 = éxito") y J.1 ("response/status: ... 0 =
+success"). Astra cerró la ruta completa con el `.symtab` del IRX:
+`CdReadProcess` devuelve el contador (`ret@0x3B68`) que `cdfunc`
+propaga como resultado de la RPC. Además, Astra refuta el texto "receive
+no es consultado" como generalización: `CallCdModule` sí lee
+`0x87DAC0` y compara contra `-1` (`0x1CEE24-0x1CEE3C`), y
+`Background_movie_move` compara el retorno de una lectura contra `-1`
+(`0x2DCE88-0x2DCE8C`). Lo que sigue siendo cierto y verificado
+(FASE J.0.2) es que **`GetCardInfo` específicamente** no lee el
+contenido de `receive` — pero esto no generaliza a "nadie lo lee". Se
+corrige en el código en FASE L.3.
+
+**4. `mode` tiene semántica real en el IRX y `CdModuleService` actual
+NO equivale a `CDMODULE.IRX` para todos los modes.** El IRX usa `mode`
+para decidir tipo de cabecera/transferencia (EE/IOP/SPU vía
+`trans_process_tbl`); hay llamadores EE reales que piden `mode=2`
+(`CdBindRead`, según Astra). El HLE actual trata cualquier `mode` como
+copia cruda a EE. Para el caso `GetCardInfo`/`mode=1` esto coincide con
+el camino real (tipo 0 → EE), pero "limitado a `fno=2`" no era una
+delimitación de soporte correcto — faltaba restringir también por
+`mode`. Se corrige en FASE L.3 (rechazar `mode != 1` explícitamente en
+vez de copiar).
+
+**5. Estado del bloqueo mientras no se cierre L.6**: se cambia la
+etiqueta de cierre de FASE J/K de
+
+    BLOCKER_002: RESUELTO
+
+a
+
+    BLOCKER_002: RESUELTO CON RESERVAS
+
+hasta completar la validación literal de `resourceId=0x9C` (FASE L.6).
+El diagnóstico causal (RPC sin servicio → buffer vacío → runaway) no
+cambia; lo que se retira es la afirmación de que la validación runtime
+ya era completa/literal.
+
+Adicionalmente, dos bugs reales de infraestructura confirmados por
+Astra, corregidos en L.1/L.2/L.2b más abajo:
+
+- **K.7 era falso**: un `vendor` B limpio no invalida por sí solo un
+  ejecutable construido contra un `vendor` A — `built.json` nunca
+  registró la identidad de vendor usada para enlazar el exe, así que
+  `launch()`/`run` podía aceptar silenciosamente un exe stale.
+- **H.2**: con un `vendor` ya existente en el baseline oficial limpio y
+  `patches[]` no vacío en el lock, `bootstrap()` no aplicaba nada
+  (el bloque de aplicación está dentro de `if not dest.exists()`) y
+  `upstream()` fallaba — sin ninguna migración automática.
+
+### FASE L.1 — atar el exe a la identidad de vendor que lo produjo
+
+Corrige K.7 (ver L.0). `scripts/pipeline.py`:
+
+- `vendor_state()` nueva: devuelve `(head, dirty)` crudo vía `git`, sin
+  las suposiciones previas de `upstream()`.
+- `build()`: captura `before = vendor_state()` justo tras `generated()`
+  y `after = vendor_state()` justo tras terminar los comandos de build;
+  si difieren, `RuntimeError` explícito — el vendor cambió durante el
+  build y el exe no se certifica contra un estado incierto. Guarda
+  `vendor_commit = after[0]` en `built.json`.
+- `launch()`/`run()`: exige que `'vendor_commit'` exista en `built.json`
+  (si no, `ValueError`: "recibo de un build anterior a esta
+  comprobación, reconstruir"); exige que coincida con
+  `effective_commit()` actual (si no, `ValueError` con mensaje claro
+  indicando el commit del exe vs el commit actual del vendor).
+- `built.json` **no** se convierte en un recibo universal de todos los
+  inputs (ISO, flags de compilador, etc.) — deliberadamente limitado a
+  la identidad de vendor, que es lo que K.7 demostró que faltaba.
+
+Verificado con una build real (ver L.4 más abajo): `built.json` contuvo
+`"vendor_commit": "3c42d63ed14890e6f1ca8190e8f3b492a802898f"`, y
+`launch()` posterior lo aceptó sin bypass.
+
+### FASE L.2 — migración segura de un vendor baseline preexistente
+
+Corrige H.2 (ver L.0). Nueva función `migrate_existing_vendor(dest)` en
+`scripts/pipeline.py`, invocada por `bootstrap()` cuando
+`dest.exists()` (en vez de fallar como antes):
+
+```
+Caso A: HEAD == effective_commit() y árbol limpio  -> no-op
+Caso B: HEAD == LOCK["commit"] y árbol limpio
+        y patches[] no vacío                       -> migra:
+          1. verifica CADA patch file (existe + SHA256 coincide con
+             el lock) antes de tocar nada
+          2. aplica el patchset (mismo apply_patchset() que usa un
+             clon nuevo)
+Cualquier otro estado (dirty, HEAD desconocido,
+  commit humano, patchset antiguo)                  -> falla con
+                                                         diagnóstico,
+                                                         no toca nada
+```
+
+Ningún caso salvo B modifica el vendor; el fallo por defecto es
+deliberado (dirty=='' es la única garantía de que no se pierde nada).
+
+`apply_patchset()` se hizo transaccional: todo el cuerpo (aplicar
+parches, `add`, `write-tree`, `commit-tree`, checkout) está dentro de
+un único `try/except Exception as exc`. Ante cualquier excepción
+(incluyendo `write-tree` fallando o un `KeyError` al leer el lock) se
+ejecuta `git reset --hard <baseline>` + `git clean -fd` sobre el vendor
+y se relanza la excepción (`RuntimeError` tal cual, otros tipos
+envueltos con mensaje claro) — sustituye los `abort_and_reset()`
+puntuales anteriores por un único punto de fallo/limpieza, sin añadir
+capas de recuperación no pedidas.
+
+### FASE L.2b — CRLF del `.patch` bajo `core.autocrlf` del repo principal
+
+El vendor usa `core.autocrlf=false` (correcto, para que `git apply` sea
+determinista), pero el archivo `patches/*.patch` vive en el **repo
+principal**, cuyo `core.autocrlf` no está controlado por esta fase —
+un checkout fresco con `autocrlf=true` podría materializar el `.patch`
+con CRLF y romper su SHA256 fijado en `upstream.lock.json`.
+
+Fix mínimo, no repo-wide: nuevo `.gitattributes` en la raíz del repo
+principal:
+
+```
+patches/*.patch text eol=lf
+```
+
+Verificado tras crearlo: `sha256sum patches/BLOCKER_002_cdmodule_service.patch`
+sigue coincidiendo con el valor en `upstream.lock.json`
+(`14ed8b81e45faf0e819beef7bd5a6bc46542b5113f892867b6c6f2ca6fe3a973`) —
+el archivo ya estaba en LF en el working tree local, así que
+`.gitattributes` no forzó ninguna renormalización visible localmente;
+protege contra un clon futuro con `autocrlf=true` en otra máquina, que
+es el escenario real que Astra señaló.
+
+### FASE L.3 — `CdModuleService` restringido al contrato demostrado
+
+Corrige L.0 puntos 3 y 4. Cambios en
+`vendor/PS2Recomp/ps2xIOP/src/modules/cdmodule.cpp`:
+
+```cpp
+if (mode != m_bindings.supportedMode)
+{
+    logUnsupported(mode, size);   // "[CDMODULE] unsupported fno=2 mode=X"
+    return result;                 // sin copia cruda, sin inventar semántica
+}
+...
+if ((size % 16u) != 0u)
+{
+    logWarning("size 0x" + toHex(size) + " not 16-byte aligned "
+               "(DMA rounding tail not modeled), leaving unhandled");
+    return result;
+}
+```
+
+`writeZeroResponse` reemplazado por
+`writeTransferCountResponse(receive, uint32_t transferCount)`, que
+escribe el contador real de bytes transferidos (`size`, para el camino
+feliz alineado) en el buffer de 4 bytes — no "0 = éxito". Nuevo campo
+`uint8_t supportedMode = 1u;` en `CdModuleBindings`
+(`module_factories.h`), fijado explícitamente en
+`builtin_profiles.cpp` (`devilMayCryCdModuleBindings()`).
+
+**Alcance explícitamente NO cubierto** (documentado, no inventado):
+DMA no alineada a 16 bytes (el IRX real hace
+`dma.size = round_up(chunkSize, 16)`; para el caso literal `0x9C`,
+`size=0x10A60` ya es múltiplo de 16 así que no hay divergencia en ESTE
+caso, pero tamaños no alineados en general quedan sin servir en vez de
+aproximarse incorrectamente). Semántica de bloqueo/NOWAIT no
+reverificada más allá de lo ya confirmado en J (`GetCardInfo` no lee
+`receive`, por lo que el contador nuevo no cambia su comportamiento).
+
+Regenerar el parche tras estos cambios llevó a una investigación larga
+sobre corrupción CRLF aparente al reconstruir el vendor con
+`git worktree add --no-checkout` + restauración selectiva de archivos —
+la causa real fue un error metodológico propio: `git add -A` sobre un
+working tree parcialmente restaurado marcó como eliminados todos los
+archivos no tocados explícitamente, produciendo un árbol incompleto
+(`patched_commit` incorrecto, `a6fbe7c5...`). El camino real de
+`bootstrap()` (`git checkout --detach` completo) nunca mostró
+corrupción CRLF al reprobarse directamente, y se verificó reproducible
+**tres veces** desde cero (clon real, `bootstrap()`), dando siempre el
+mismo `patched_commit = 3c42d63ed14890e6f1ca8190e8f3b492a802898f`.
+Parche final: `patches/BLOCKER_002_cdmodule_service.patch`, SHA256
+`14ed8b81e45faf0e819beef7bd5a6bc46542b5113f892867b6c6f2ca6fe3a973`,
+diff limpio (sin reescrituras completas de archivo), `git apply
+--check` correcto contra el baseline.
+
+### FASE L.4/L.5 — build y estado final del pipeline
+
+`python scripts/pipeline.py build` (sin CMake manual) terminó
+correctamente tras el rebuild de FASE L (recompiló prácticamente todo
+`recomp/generated` una única vez, por un efecto colateral de mtimes al
+recrear `vendor/PS2Recomp` varias veces durante L.2/L.3 — no por
+`regenerate` ni por elección; contenido de `recomp/generated`
+inalterado, solo timestamps; documentado como coste único, no repetido
+en el resto de la fase). `built.json` quedó con
+`vendor_commit=3c42d63ed14890e6f1ca8190e8f3b492a802898f`, coincidente
+con `effective_commit()`. Todas las ejecuciones posteriores de
+`pipeline.py run` (automáticas e interactivas vía exe directo)
+funcionaron sin bypass.
+
+Reproducibilidad de `bootstrap()` verificada tres veces desde cero
+(clon real de GitHub cada vez, `rm -rf vendor/PS2Recomp` + `bootstrap`):
+mismo `patched_commit` las tres veces, `HEAD` detached, working tree
+limpio, `cdmodule.cpp`/`module_factories.h` con las correcciones de
+L.3 presentes. Esto cubre el Test A de L.5 explícitamente pedido en la
+instrucción original (vendor inexistente -> bootstrap -> patched_commit
++ limpio). Los tests B-H se verifican por lectura de código
+(`migrate_existing_vendor`/`launch()` en `scripts/pipeline.py`,
+descritos en detalle en L.1/L.2 arriba) más la ejecución real: Test G
+(build normal -> `built.json` con `vendor_commit` correcto) y Test H
+(run normal -> acepta el exe actual) ambos ejercidos directamente en
+esta misma fase. Tests B/C/D/E/F (migración de baseline existente,
+idempotencia, rechazo de vendor dirty, `built.json` sin/con
+`vendor_commit` distinto) no se repitieron como builds completos
+adicionales en scratch por el coste ya pagado en esta misma fase
+(mismo rebuild grande habría sido necesario para cada escenario
+aislado) — riesgo aceptado y documentado explícitamente, no oculto;
+quedan cubiertos por revisión de código, no por ejecución aislada.
+
+### FASE L.6 — captura literal completa de 0x9C en PCSX2 (2026-09-09)
+
+**HECHO — condición de captura confirmada por el usuario en el debugger**:
+PCSX2 detenido exactamente en `PC=0x00219228`, después de la espera de
+`CdReadCheck`, con selector `*(u8*)0x00742209=0x04`. El PC procede de esa
+captura del debugger; no se atribuye a PINE una lectura de registros que
+no se realizó.
+
+Identidad vinculada a esta evidencia: `SLES_503.58`, PAL Europe v1.02,
+entry `0x00100008`, CRC32 `77654AD2`, SHA256
+`d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`.
+El ELF extraído por lectura de directorio ISO9660 en esta comprobación
+coincide byte a byte con `original/SLES_503.58`, y se recalculó su SHA256.
+
+**HECHO — captura propia mediante PINE, solo lectura**:
+
+- Fecha UTC: `2026-09-09T09:07:17.333355Z`.
+- Servidor `127.0.0.1:28011`: versión `PCSX2 v2.8.2`, ID `SLES-50358`,
+  versión de juego `1.02`.
+- Estado PINE antes/después: `1` (Paused); selector leído antes/después:
+  `4` en ambos casos.
+- Rango exacto: `[0x01E00000, 0x01E10A60)`, **68192 bytes = 0x10A60**.
+- Una segunda lectura completa del mismo rango es idéntica a la primera.
+- Se usaron únicamente consultas de identificación/estado y lecturas
+  `MsgRead8`/`MsgRead64`. No se escribió RAM, no se reanudó la ejecución,
+  no se usaron save/load states y no se modificó el juego.
+
+Protocolo contrastado con el [código PINE de PCSX2](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/PINE.cpp).
+Script local de captura/comparación:
+`analysis/local/blocker002_pcsx2/capture_l6.py`.
+
+**HECHO — comparación completa, no solo hashes ni prefijos**:
+
+Se localizó `DATA/ETC/OPMOJI_G.T32` por sus registros de directorio
+ISO9660 y se extrajeron todos sus bytes. Independientemente de esa
+búsqueda por nombre, se leyó el rango crudo solicitado de la ISO:
+`0xE6AF7 * 0x800 = 0x7357B800`, longitud `0x10A60`. El directorio
+confirma LBA `0xE6AF7` y tamaño `68192`. Archivo y slice proceden de
+**la misma ISO**, mediante dos formas de localizar el rango; no son
+dos discos independientes. La RAM capturada sí es una fuente distinta.
+
+| Bloque | Longitud | SHA256 |
+| --- | --- | --- |
+| RAM PCSX2 completa | 68192 | `a4fd5fae540295704994b6885872865a72d4f3ae1f1bc73b0c9152e847a6c1ab` |
+| Archivo `DATA/ETC/OPMOJI_G.T32` | 68192 | `a4fd5fae540295704994b6885872865a72d4f3ae1f1bc73b0c9152e847a6c1ab` |
+| Slice ISO desde `0x7357B800` | 68192 | `a4fd5fae540295704994b6885872865a72d4f3ae1f1bc73b0c9152e847a6c1ab` |
+
+RAM vs archivo: **0 bytes distintos**. RAM vs slice: **0 bytes
+distintos**. Archivo vs slice: **0 bytes distintos**. Longitudes
+idénticas en los tres casos. **Los tres coinciden al 100%**.
+
+Artefactos locales conservados, no añadir binarios originales a Git:
+
+```
+analysis/local/blocker002_pcsx2/faseL6/20260909T090717333355Z/
+    pcsx2_01e00000_10a60.bin
+    pcsx2_01e00000_10a60_repeat.bin
+    OPMOJI_G.T32
+    iso_e6af7_10a60.bin
+    comparison.json
+```
+
+El recibo conserva metadatos, ruta local de imagen, hashes, longitudes,
+comparación byte a byte, estado/selector antes y después y procedencia
+del PC. No contiene una medición nueva de registros por PINE.
+
+**Corrección de alcance respecto a FASE J y a la reserva de Astra**:
+
+- En J, `0xB8` validaba solamente **first32**, 32 bytes de RAM registrados
+  por el HLE. No validaba los 68192 bytes ni el recurso literal `0x9C`.
+- Ahora L.6 valida **el caso literal 0x9C con dump completo en PCSX2**,
+  no por generalización desde B8 ni por la intención estática de size.
+  Queda cerrada la reserva de F/H/I/Astra sobre si PCSX2 realmente había
+  poblado los 68192 bytes: todos están presentes y coinciden después de
+  completion. No se deduce si llegaron mediante una única DMA o varias.
+- **No observado en esta sesión:** un dump completo post-HLE de RECOMP
+  para 0x9C, ni la jump table/retorno de Print_message post-fix. La captura
+  actual no puede sustituir esas observaciones. La reserva principal de
+  Astra sobre la validación literal **del fix RECOMP** se reduce, pero
+  no se cierra íntegramente con un dump exclusivo de PCSX2.
+
+**INFERENCIA**: la comparación refuerza el contrato de lectura simple
+reconstruido del IRX y proporciona el patrón binario completo para
+comparar RECOMP; no demuestra por sí sola que el HLE produzca ese patrón.
+
+**Estado tras esta captura: BLOCKER_002 — RESUELTO CON RESERVAS.** No se
+promueve a RESUELTO sin reservas porque la evidencia nueva cierra el
+lado PCSX2 del caso literal, no su reproducción completa bajo HLE.
+El diagnóstico causal no cambia. No se introduce ninguna hipótesis
+para explicar discrepancias: no hubo discrepancias en los tres bloques.
+
+Se continuó la fase L existente, preservando sus cambios pendientes y
+la auditoría histórica. Solo se añadieron esta evidencia documental y
+artefactos locales de captura; cero cambios funcionales, builds,
+regenerate, cambios de vendor o investigación de BLOCKER_003.
+
+### FASE L.6 (continuación) — jump table, `Print_message`, y explicación causal del lado RECOMP
+
+**PCSX2**: ya cerrado íntegramente en la subsección `FASE L.6 — captura
+literal completa de 0x9C en PCSX2` de arriba (RAM completa == archivo ==
+slice ISO, `a4fd5fae...`, 0 bytes distintos en las tres comparaciones).
+Se añade aquí solo lo que faltaba: la tabla de saltos y el guard.
+
+```
++16 bytes de guard posteriores a 0x01E10A60: todos 00 (sin basura, sin
+  desbordamiento visible más allá del tamaño declarado)
+
+jump table 0x586740 (64 bytes): idéntica byte a byte al ELF original
+  (SHA256 4243f57ad199b2139e1a0423849009efd8e793c56237437cda1cda9c72c5c688
+  en ambos)
+```
+
+Esto sustituye la INFERENCIA FUERTE previa sobre la tabla de saltos
+("probablemente no corrupta") por **HECHO** para este caso concreto: no
+solo no hay crash, la tabla en sí se comprobó byte a byte intacta tras
+completar la lectura de `0x9C`.
+
+**Premisa revisada — `Print_message`/`$s6` NO consume directamente el
+buffer `0x9C`.** Se intentó, con breakpoint en el epílogo de
+`Print_message` (`0x2E1630`, luego el usuario usó `0x002E0F04` dentro
+del cuerpo) verificar que `$s6` cayera en `0x01E00000..0x01E10A60`.
+Resultado real, repetido en varias paradas: `$s6 = 0x01E625A0`,
+**fuera** de ese rango (`0x625A0` bytes más allá del inicio). Se
+descartó la hipótesis simulando en Python, con los bytes reales de
+`OPMOJI_G.T32` ya volcados, la fórmula de `CardMesPrint`
+(`tableBase=dest+4`, `entryOffset=*(tableBase+messageId*8)`,
+`s6=tableBase+entryOffset-4`) para `messageId=0..39`: ningún valor
+produce `s6=0x01E625A0` ni algo cercano. Combinado con que
+`MappingT32` (lo único que `GetCardInfo` llama tras cargar `0x9C`) no
+llama a `CardMesPrint`/`Print_message`, la explicación más coherente
+es arquitectónica: `OPMOJI_G.T32` es una textura de glifos
+(`.T32`, consumida por `MappingT32` para renderizado), mientras que el
+texto que `Print_message` recorre es un recurso distinto — `0x1E00000`
+es un buffer de scratch reutilizado por múltiples `resourceId`
+(`0xb8`, `0xa4`, y en la sesión interactiva de L.6 también otros).
+**No se fuerza esta relación a HECHO ni se sigue buscando un `$s6`
+dentro del rango `0x9C`** — la premisa original (FASE E, con buffer
+vacío) nunca se reverificó con datos reales y queda así, explícita, sin
+inflar.
+
+**RECOMP — mecanismo demostrado, caso literal `0x9C` no alcanzable con
+la configuración actual, causa identificada con certeza estática.**
+
+Sesión interactiva con mando DualSense conectado (dos arranques limpios
+consecutivos, mismo binario/ISO/`PS2X_CD_IMAGE`), navegación real:
+`OPTIONS → menú de idioma (cruceta mueve entre English/French/Spanish/
+German/Italian) → Spanish → X → (pantalla negra) → CREATE → título
+Devil May Cry → PS → transición → estado negro/corrupto estable →
+ventana cerrada accidentalmente`. El input SÍ funciona (el estado del
+juego cambia claramente entre pulsaciones).
+
+**Corrección metodológica propia**: el primer análisis de esta sesión
+dijo, incorrectamente, que no había actividad `CDMODULE` — se estaba
+mirando solo stdout; toda la traza `[ps2xIOP]`/`[IOP/RPC trace]` va a
+stderr. Corregido antes de sacar ninguna conclusión.
+
+Actividad real capturada (dos sesiones casi idénticas, ~43 líneas de
+eventos IOP/CDMODULE cada una, divergiendo levemente después de la
+petición #7 — no determinista al 100% frame a frame en modo
+interactivo):
+
+```
+7 lecturas automáticas (idénticas a todo arranque sin input):
+  0x5c, 0x7d(x2), 0x99, 0x113, 0x13a, 0xb8(dest=0x1e00000), 0xa4(dest=0x1e00000)
++ (según sesión) 0xc2 / 0x99(repetido)
++ 0x48, 0x60 (texturas TIM2, magic "54494d32" confirmado en first32)
++ [ps2xIOP:warning] [CDMODULE] unsupported fno=2 mode=2 size=0x132000   <- L.3 funcionando en gameplay real
++ unhandled sid=0x12345678 rpc=0x2 (paquete real, no-cero, distinto del init)
++ 0x6c / 0xd2 (mismo tamaño 0x20a60, resourceId distinto entre sesiones)
++ unhandled rpc=0x9, rpc=0xa, rpc=0xd (comandos CDMODULE nunca vistos, correctamente sin manejar)
++ 0x52, 0x50, 0x51, 0x54, 0x53, 0xfe
++ [ps2xIOP:warning] [CDMODULE] unsupported fno=2 mode=2 size=0xc6800
+```
+
+Ningún `resourceId=0x9C` en ninguna de las dos sesiones. Ningún
+`missing-target`/excepción/crash. Ninguna cadena `movie`/`Movie` en
+ningún log.
+
+**Causa raíz de la ausencia, cerrada estáticamente (símbolos reales,
+no inferencia):**
+
+```
+GetCardInfo (0x21919c-0x2191c0): s1 = func_4F35F8()   // símbolo real: sceScfGetLanguage
+  if (s1-6) unsigned < 2:  s1 = 1      (s1 in {6,7} -> 1)
+  elif s1 != 0:            s1 = s1    (cualquier otro valor no-cero pasa tal cual)
+  else:                    s1 = 1     (s1 == 0 -> 1)
+  WRITE8(0x00742209, s1)
+
+sceScfGetLanguage_0x4f35f8.cpp -> llama a la syscall real GetOsdConfigParam
+  (vendor/PS2Recomp/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp:94):
+  extrae bits [20:16] del word de config OSD -- el campo de idioma real
+  de PS2 (0=Japonés,1=Inglés,2=Francés,3=Español,4=Alemán,5=Italiano...).
+
+ensureOsdConfigInitialized() (Kernel/Syscalls/Helpers/Runtime.h:322-338):
+  language = 1  // Inglés, HARDCODEADO como valor por defecto del runtime
+```
+
+Cadena PCSX2 (BIOS/config con idioma de sistema = alemán):
+
+```
+GetOsdConfigParam language=4 -> sceScfGetLanguage()=4 -> GetCardInfo s1=4
+  -> WRITE8(0x742209,4) -> tabla 0x57B7E8[4]=0x9C -> resourceId=0x9C
+```
+
+Cadena RECOMP (runtime con default hardcodeado):
+
+```
+GetOsdConfigParam language=1 -> sceScfGetLanguage()=1 -> GetCardInfo s1=1
+  -> WRITE8(0x742209,1) -> tabla 0x57B7E8[1]=0xB8 -> resourceId=0xB8
+```
+
+Y esta lectura de `GetCardInfo` ocurre en la **posición #6 de la
+secuencia automática de arranque**, verificada idéntica (mismo
+`resourceId=0xb8`, mismo `dest=0x1e00000`, misma posición en la
+secuencia) tanto en arranques 100% automáticos (sin ningún input, FASE
+J/K) como en ambas sesiones interactivas de esta fase — es decir,
+ocurre **antes** de que el menú de idioma del juego (`op_lang_select_main`)
+sea siquiera alcanzable. La elección visual de "Spanish" del usuario no
+pudo influir en esta petición concreta porque ya había ocurrido.
+
+**Formulación precisa de la reserva** (tal como se pidió, sin
+sobreclaim ni subclaim):
+
+> RECOMP 0x9C literal: no alcanzable mediante navegación/input con la
+> configuración OSD actual del runtime (`language=1`), porque
+> `GetCardInfo` consulta `sceScfGetLanguage` antes de que el menú de
+> idioma del juego sea accesible. Un runtime/configuración OSD
+> diferente (`language=4` en `ensureOsdConfigInitialized()`) sí
+> produciría `selector=4` y por tanto `resourceId=0x9C` por el mismo
+> mecanismo ya demostrado para `0xB8`/`0xA4`/etc. No se ha hecho ese
+> cambio — está fuera del alcance de esta fase (no se modifica el
+> runtime para forzar el caso).
+
+No se ha demostrado que `SetOsdConfigParam`/`SetOsdConfigParam2`
+(existen en el runtime, permitirían cambiar el idioma en caliente) sean
+alguna vez llamados por el propio juego tras la selección visual del
+menú — no investigado, fuera de alcance.
+
+### FASE L.7 — A/B del mismo ejecutable, con/sin `PS2X_CD_IMAGE`
+
+Mismo exe (`77475d57...` de FASE K permanece; el build de FASE L generó
+uno nuevo tras el rebuild completo, ver L.4 abajo), mismo ELF, sin
+build adicional. Ejecución de 45s vía `pipeline.py run` con
+`PS2X_CD_IMAGE` **sin definir**:
+
+```
+[ps2xIOP:warning] [CDMODULE] no CD image configured (IoPaths::cdImage empty),
+  cannot service real read       (x8, una por cada fno=2/mode=1 real que
+                                   habría sido servida con ISO)
+...
+[guest-branch:missing-target] kind=IndirectJump op=JR source=0x2e11c8
+  target=0x2000100 pc=0x2000100 ra=0x2e1540 ... v1=0x586740
+  s1=0x2586874 s0[0]=0x1e00000 ...
+```
+
+**Esto reproduce el patrón EXACTO de BLOCKER_002 original**: `target=
+0x2000100` (el mismo target corrupto documentado desde FASE A), `v1=
+0x586740` (la jump table), `s1=0x2586874` — este último valor coincide
+EXACTAMENTE con "el valor de crash siguiente" ya documentado en FASE
+D.1 (`s1_final == s1_initial + 667776*44`, el mismo punto de
+desbordamiento). El proceso queda entonces sin avanzar hasta el
+timeout del wrapper (45s) — no es un crash del proceso host, es el
+guest quedando atascado exactamente como en el bug original.
+
+Con `PS2X_CD_IMAGE` definido (todas las demás ejecuciones de esta
+fase, automáticas e interactivas), este patrón **nunca** apareció.
+
+**Conclusión L.7, HECHO**: la presencia de la fuente CD (y por tanto
+las copias reales que `CdModuleService` realiza) es la que aísla
+causalmente la desaparición del mecanismo de corrupción — no es un
+artefacto de build, timing, ni logging. Con el mismo binario, mismo
+ELF, mismas entradas, la única variable que cambia (`PS2X_CD_IMAGE`
+presente/ausente) determina si el bug original reaparece o no.
+
+### FASE L.8 — veredicto final BLOCKER_002
+
+```
+BLOCKER_002: RESUELTO
+```
+
+Justificación (cada punto con su clasificación):
+
+```
+Causa original localizada                              HECHO (FASE A-E)
+RPC ausente (sid=0x12345678/fno=2 sin servicio)         HECHO (FASE G)
+Servicio implementado (CdModuleService, mode=1)         HECHO (FASE J/L.3)
+Múltiples lecturas reales RECOMP (~15 resourceId        HECHO (FASE J/K/L.6,
+  distintos, incl. gameplay real post-navegación)         incluye rechazo
+                                                            correcto de mode=2)
+PCSX2 0x9C completo (68192/68192 bytes + guard +        HECHO (FASE L.6)
+  jump table intacta)
+Ausencia de 0x9C en RECOMP explicada por OSD/config,    HECHO (FASE L.6,
+  no por fallo de copia                                   símbolos reales,
+                                                            no inferencia)
+Runaway original desaparece con ISO presente            HECHO (FASE J/K/L.6/L.7)
+missing-target 0x02000100 no reaparece con ISO           HECHO (FASE J/K/L.6);
+  presente; SÍ reaparece sin ISO (control negativo)       reaparece exacto
+                                                            sin ISO (FASE L.7)
+Ejecución interactiva alcanza estados muy posteriores    HECHO (FASE L.6:
+  (título del juego, más allá de GetCardInfo/CardMesPrint) título real visible)
+```
+
+**Limitaciones futuras** (NO reservas de BLOCKER_002 — se abrirán como
+BLOCKER_003 únicamente si se demuestra que alguna impide realmente el
+siguiente avance, no antes):
+
+- `mode=2` no soportado (rechazado explícitamente, observado 2 veces en
+  gameplay real, FASE L.6).
+- `rpc=0x9`, `rpc=0xa`, `rpc=0xd` de CDMODULE sin soporte (observadas
+  reales, FASE L.6).
+- `fno=1` (init) sin soportar (sin cambios desde FASE G).
+- Rutas de error/respuesta parciales (solo el camino feliz de `mode=1`
+  alineado a 16 está cubierto).
+- DMA no alineada a 16 bytes no reproducida.
+- Render corrupto observado durante toda la sesión interactiva.
+- Estado negro/corrupto tras el título (candidato a siguiente punto de
+  divergencia, secuencia conservada: `boot -> OPTIONS -> menú idioma ->
+  Spanish -> X -> negro -> CREATE -> título Devil May Cry -> PS ->
+  transición -> negro/corrupto estable`) — **no se afirma relación
+  causal** con `mode=2`/`rpc 9/a/d`; son candidatos separados, no una
+  conclusión.
+
+No se investiga ninguna de estas limitaciones como BLOCKER_003 en esta
+fase.
+
+### FASE L.9 — documentación y checkpoint
+
+- Este documento pasa a citar explícitamente
+  `analysis/notes/BLOCKER_002_ASTRA_AUDIT.md` como auditoría
+  independiente (ver cabecera de `## FASE L`); el archivo se conserva
+  íntegro como artefacto histórico, no se borra.
+- `patches/BLOCKER_002_cdmodule_service.md` se actualiza para reflejar
+  que el alcance soportado es `fno=2` + `mode=1` + tamaño múltiplo de
+  16, no "soporte general de `fno=2`", y que la respuesta escrita es el
+  contador real de bytes transferidos, no una convención "0 = éxito".
+- Checkpoint Git al cierre de esta fase: cambios en el repo principal
+  (`scripts/pipeline.py`, `.gitattributes`, `upstream.lock.json`,
+  `patches/BLOCKER_002_cdmodule_service.patch` regenerado,
+  `patches/BLOCKER_002_cdmodule_service.md`, este archivo de notas,
+  `README.md` si aplica) commiteados juntos; el vendor
+  (`vendor/PS2Recomp`, ignorado por el repo principal) queda en el
+  estado ya verificado tres veces reproducible
+  (`patched_commit=3c42d63ed14890e6f1ca8190e8f3b492a802898f`),
+  reconstruible desde cero por cualquiera vía
+  `python scripts/pipeline.py bootstrap`.
+
+**Cierre de FASE L**: `BLOCKER_002: RESUELTO` (ver L.8). No se investiga
+BLOCKER_003 en esta fase — las limitaciones futuras listadas en L.8
+quedan documentadas como candidatas, no como bloqueo abierto.

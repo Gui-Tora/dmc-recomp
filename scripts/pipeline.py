@@ -80,9 +80,18 @@ def effective_commit():
     return LOCK['patched_commit']
 
 
-def upstream():
-    actual = subprocess.check_output(['git', '-C', str(VENDOR), 'rev-parse', 'HEAD'], text=True).strip()
+def vendor_state():
+    # Raw (HEAD, dirty) snapshot, independent of whether it currently satisfies
+    # upstream()'s guard. Used by build() to detect vendor changing mid-build
+    # (which upstream() alone, called only once, cannot catch) and by launch()
+    # to bind an exe to the exact vendor identity that produced it.
+    head = subprocess.check_output(['git', '-C', str(VENDOR), 'rev-parse', 'HEAD'], text=True).strip()
     dirty = subprocess.check_output(['git', '-C', str(VENDOR), 'status', '--porcelain'], text=True).strip()
+    return head, dirty
+
+
+def upstream():
+    actual, dirty = vendor_state()
     if actual != effective_commit() or dirty:
         raise ValueError('Upstream difiere del lock o tiene cambios; revisar antes de continuar.')
 
@@ -112,62 +121,98 @@ def apply_patchset(dest):
     # baseline commit, then folds the result into one deterministic commit
     # (patched_commit) via commit-tree — never `git commit`, so this never
     # depends on user.name/user.email, commit hooks, commit.gpgsign, or any
-    # local branch. Any failure resets vendor back to the clean baseline and
-    # aborts explicitly; never leaves baseline + a partial subset of patches
-    # applied.
+    # local branch. The whole body runs under one try/except: ANY failure
+    # (a checked git error, or an unexpected exception such as write-tree
+    # raising or a missing patch_identity key) resets vendor back to the
+    # clean baseline and aborts explicitly — never leaves baseline + a
+    # partial subset of patches applied, and never leaves a half-built tree
+    # silently in place (Astra audit finding 9 / H.3).
     resolved_patches = verify_patchset_hashes()
     if not resolved_patches:
         return
     baseline = LOCK['commit']
     print(f'apply-patchset: {len(resolved_patches)} patch(es) sobre {baseline}', flush=True)
 
-    def abort_and_reset(reason):
-        subprocess.run(['git', '-C', str(dest), 'reset', '--hard', baseline],
-                        capture_output=True, text=True)
-        subprocess.run(['git', '-C', str(dest), 'clean', '-fd'],
-                        capture_output=True, text=True)
+    def fail(reason):
         raise RuntimeError(reason)
 
-    for patch_path in resolved_patches:
-        print(f'  apply: {patch_path.relative_to(ROOT)}', flush=True)
-        check = subprocess.run(['git', '-C', str(dest), 'apply', '--check', str(patch_path)],
-                                capture_output=True, text=True)
-        if check.returncode != 0:
-            abort_and_reset(f'git apply --check fallo para {patch_path}:\n{check.stderr}')
-        applied = subprocess.run(['git', '-C', str(dest), 'apply', str(patch_path)],
-                                 capture_output=True, text=True)
-        if applied.returncode != 0:
-            abort_and_reset(f'git apply fallo para {patch_path}:\n{applied.stderr}')
+    try:
+        for patch_path in resolved_patches:
+            print(f'  apply: {patch_path.relative_to(ROOT)}', flush=True)
+            check = subprocess.run(['git', '-C', str(dest), 'apply', '--check', str(patch_path)],
+                                    capture_output=True, text=True)
+            if check.returncode != 0:
+                fail(f'git apply --check fallo para {patch_path}:\n{check.stderr}')
+            applied = subprocess.run(['git', '-C', str(dest), 'apply', str(patch_path)],
+                                     capture_output=True, text=True)
+            if applied.returncode != 0:
+                fail(f'git apply fallo para {patch_path}:\n{applied.stderr}')
 
-    add = subprocess.run(['git', '-C', str(dest), 'add', '-A'], capture_output=True, text=True)
-    if add.returncode != 0:
-        abort_and_reset(f'git add -A fallo tras aplicar patches:\n{add.stderr}')
+        add = subprocess.run(['git', '-C', str(dest), 'add', '-A'], capture_output=True, text=True)
+        if add.returncode != 0:
+            fail(f'git add -A fallo tras aplicar patches:\n{add.stderr}')
 
-    tree = subprocess.check_output(['git', '-C', str(dest), 'write-tree'], text=True).strip()
+        tree = subprocess.check_output(['git', '-C', str(dest), 'write-tree'], text=True).strip()
 
-    identity = LOCK['patch_identity']
-    env = os.environ.copy()
-    env.update(GIT_AUTHOR_NAME=identity['author_name'], GIT_AUTHOR_EMAIL=identity['author_email'],
-               GIT_AUTHOR_DATE=identity['timestamp'], GIT_COMMITTER_NAME=identity['author_name'],
-               GIT_COMMITTER_EMAIL=identity['author_email'], GIT_COMMITTER_DATE=identity['timestamp'])
-    commit_tree = subprocess.run(
-        ['git', '-C', str(dest), 'commit-tree', tree, '-p', baseline, '-m', identity['message']],
-        capture_output=True, text=True, env=env)
-    if commit_tree.returncode != 0:
-        abort_and_reset(f'git commit-tree fallo:\n{commit_tree.stderr}')
-    patched_commit = commit_tree.stdout.strip()
+        identity = LOCK['patch_identity']
+        env = os.environ.copy()
+        env.update(GIT_AUTHOR_NAME=identity['author_name'], GIT_AUTHOR_EMAIL=identity['author_email'],
+                   GIT_AUTHOR_DATE=identity['timestamp'], GIT_COMMITTER_NAME=identity['author_name'],
+                   GIT_COMMITTER_EMAIL=identity['author_email'], GIT_COMMITTER_DATE=identity['timestamp'])
+        commit_tree = subprocess.run(
+            ['git', '-C', str(dest), 'commit-tree', tree, '-p', baseline, '-m', identity['message']],
+            capture_output=True, text=True, env=env)
+        if commit_tree.returncode != 0:
+            fail(f'git commit-tree fallo:\n{commit_tree.stderr}')
+        patched_commit = commit_tree.stdout.strip()
 
-    if patched_commit != LOCK['patched_commit']:
-        abort_and_reset(
-            f"El patchset no reproduce patched_commit: esperado {LOCK['patched_commit']}, "
-            f"obtenido {patched_commit}. Revisar patches[]/patch_identity/patched_commit en "
-            f"upstream.lock.json (probable desincronizacion tras editar un patch).")
+        if patched_commit != LOCK['patched_commit']:
+            fail(f"El patchset no reproduce patched_commit: esperado {LOCK['patched_commit']}, "
+                 f"obtenido {patched_commit}. Revisar patches[]/patch_identity/patched_commit en "
+                 f"upstream.lock.json (probable desincronizacion tras editar un patch).")
 
-    checkout = subprocess.run(['git', '-C', str(dest), 'checkout', '--detach', patched_commit],
-                              capture_output=True, text=True)
-    if checkout.returncode != 0:
-        abort_and_reset(f'git checkout --detach {patched_commit} fallo:\n{checkout.stderr}')
+        checkout = subprocess.run(['git', '-C', str(dest), 'checkout', '--detach', patched_commit],
+                                  capture_output=True, text=True)
+        if checkout.returncode != 0:
+            fail(f'git checkout --detach {patched_commit} fallo:\n{checkout.stderr}')
+    except Exception as exc:
+        subprocess.run(['git', '-C', str(dest), 'reset', '--hard', baseline], capture_output=True, text=True)
+        subprocess.run(['git', '-C', str(dest), 'clean', '-fd'], capture_output=True, text=True)
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f'apply_patchset: fallo inesperado ({type(exc).__name__}: {exc})') from exc
+
     print(f'apply-patchset: HEAD ahora en {patched_commit} (detached)', flush=True)
+
+
+def migrate_existing_vendor(dest):
+    # Called only when dest already exists. Extremely conservative: the ONLY
+    # automatic action taken is completing a migration from the plain,
+    # unmodified upstream baseline to the patched state -- never on a dirty
+    # tree, a human commit, an old/different patchset, or any other
+    # unrecognized state. Anything outside the two recognized states fails
+    # with a diagnostic and touches nothing (Astra audit finding H.2).
+    head, dirty = vendor_state()
+    if head == effective_commit() and not dirty:
+        return  # Case A: already at the expected state; idempotent no-op.
+    if head == LOCK['commit'] and not dirty and LOCK.get('patches'):
+        # Case B: sits exactly at the clean, unpatched baseline. Safe to
+        # migrate: dirty == '' already means zero modified/untracked files,
+        # so the reset/clean paths inside apply_patchset cannot destroy any
+        # user work even on failure. Force a re-checkout of the same commit
+        # first in case this checkout predates core.autocrlf=false being set
+        # here (an older bootstrap could have left CRLF files on disk even
+        # though HEAD/content are otherwise correct).
+        print(f'bootstrap: vendor existente en baseline limpio {head}; migrando al patchset', flush=True)
+        run(['git', '-C', dest, 'config', 'core.autocrlf', 'false'], 'configure-autocrlf-existing')
+        run(['git', '-C', dest, 'checkout', '--force', '--detach', LOCK['commit']], 'refresh-baseline-checkout')
+        apply_patchset(dest)
+        return
+    raise ValueError(
+        f"vendor/PS2Recomp existe en un estado no reconocido para migracion automatica "
+        f"(HEAD={head}, dirty={'si' if dirty else 'no'}). Se esperaba exactamente el baseline "
+        f"limpio ({LOCK['commit']}) o el estado ya parcheado ({effective_commit()}). No se ha "
+        "modificado nada; revisar manualmente (git -C vendor/PS2Recomp status / log).")
 
 
 def cmake():
@@ -208,6 +253,8 @@ def bootstrap(_):
             run(['git', '-C', dest, 'submodule', 'update', '--init', '--recursive'], 'submodules')
             if dest == VENDOR:
                 apply_patchset(dest)
+        elif dest == VENDOR:
+            migrate_existing_vendor(dest)
     upstream()
 
 
@@ -336,6 +383,12 @@ def sync_active(folder, files):
 
 def build(_):
     receipt, folder, gen = generated()
+    # generated() -> prepared() -> upstream() already validated vendor against
+    # the lock; snapshot the raw state here (not just effective_commit()) so a
+    # vendor change mid-build (even one that would still satisfy upstream())
+    # is caught below instead of silently certifying the exe against a vendor
+    # state that no longer matches what actually got linked into it.
+    before = vendor_state()
     active = sync_active(folder, gen['files'])
     # Same reasoning as sync_active(): the promoted symtab-first build's CMake cache
     # has C:/.../analysis/local/symtabfirst/build baked in absolute-path form.
@@ -345,13 +398,31 @@ def build(_):
          f'-DDMC_MSVC_MP_JOBS={PARALLEL_JOBS}'], 'configure-runtime')
     run([cmake(), '--build', build_dir, '--config', 'Debug', '--target', 'ps2EntryRunner',
          '--parallel', str(PARALLEL_JOBS)], 'build-runtime')
+    after = vendor_state()
+    if after != before:
+        raise RuntimeError(
+            'vendor/PS2Recomp cambio durante el build (antes '
+            f'{before}, despues {after}); el exe no se certifica contra ningun '
+            'estado de vendor. Repetir build sobre un vendor estable.')
     exe = executable(build_dir / 'bin', 'dmc-recomp')
-    save(LOCAL / 'built.json', dict(generated=gen, exe=str(exe), exe_sha256=digest(exe)))
+    save(LOCAL / 'built.json', dict(generated=gen, exe=str(exe), exe_sha256=digest(exe),
+                                     vendor_commit=after[0]))
 
 
 def launch(args):
     receipt, _, gen = generated()
     built = json.loads((LOCAL / 'built.json').read_text(encoding='utf-8'))
+    if 'vendor_commit' not in built:
+        raise ValueError(
+            'built.json no registra vendor_commit (recibo de un build anterior '
+            'a esta comprobacion); repetir python scripts/pipeline.py build antes '
+            'de run.')
+    current_commit = effective_commit()
+    if built['vendor_commit'] != current_commit:
+        raise ValueError(
+            f"El ejecutable se construyo contra vendor {built['vendor_commit']}, "
+            f"pero vendor/PS2Recomp representa actualmente {current_commit}; "
+            'repetir python scripts/pipeline.py build antes de run.')
     exe = Path(built['exe'])
     if gen != built['generated'] or digest(exe) != built['exe_sha256']:
         raise ValueError('Ejecutable obsoleto; repetir build.')

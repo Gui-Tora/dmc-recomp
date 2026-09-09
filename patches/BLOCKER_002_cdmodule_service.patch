@@ -8,13 +8,13 @@ index e17b472..32e519c 100644
      src/modules/sdrdrv.cpp
 +    src/modules/cdmodule.cpp
  )
-
+ 
  target_compile_features(ps2_iop PUBLIC cxx_std_20)
 diff --git a/ps2xIOP/src/builtin_profiles.cpp b/ps2xIOP/src/builtin_profiles.cpp
-index ac537ad..c9cbb1c 100644
+index ac537ad..a86286e 100644
 --- a/ps2xIOP/src/builtin_profiles.cpp
 +++ b/ps2xIOP/src/builtin_profiles.cpp
-@@ -92,6 +92,27 @@ namespace ps2x::iop::detail
+@@ -92,6 +92,30 @@ namespace ps2x::iop::detail
                  .imageBodyUpperName = "IMG_BD.BIN",
              };
          }
@@ -24,6 +24,8 @@ index ac537ad..c9cbb1c 100644
 +        // in the consumer project): sceSifRegisterRpc(fno=0x12345678) inside
 +        // CDMODULE.IRX, read function fno=2, request layout
 +        // {resourceId@0x00, lba@0x04, size@0x08, destEE@0x0C, mode(byte,&0x7F)@0x14}.
++        // Only request.mode==1 (plain EE-bound copy) is modeled -- FASE L,
++        // Astra audit finding 3.
 +        CdModuleBindings devilMayCryCdModuleBindings()
 +        {
 +            return {
@@ -37,15 +39,16 @@ index ac537ad..c9cbb1c 100644
 +                .requestDestOffset = 0x0Cu,
 +                .requestModeOffset = 0x14u,
 +                .minimumRequestBytes = 0x15u,
++                .supportedMode = 1u,
 +            };
 +        }
      }
-
+ 
      ServiceList createCoreServices(IopHost &host)
-@@ -145,6 +166,18 @@ namespace ps2x::iop::detail
+@@ -145,6 +169,18 @@ namespace ps2x::iop::detail
              },
          });
-
+ 
 +        profiles.push_back({
 +            "devil-may-cry-pal",
 +            "builtin",
@@ -62,13 +65,13 @@ index ac537ad..c9cbb1c 100644
      }
  }
 diff --git a/ps2xIOP/src/module_factories.h b/ps2xIOP/src/module_factories.h
-index 8e0f422..5926f93 100644
+index 8e0f422..94eba11 100644
 --- a/ps2xIOP/src/module_factories.h
 +++ b/ps2xIOP/src/module_factories.h
-@@ -146,6 +146,25 @@ namespace ps2x::iop::detail
+@@ -146,6 +146,31 @@ namespace ps2x::iop::detail
          std::string imageBodyUpperName;
      };
-
+ 
 +    // Minimal HLE contract for a CDMODULE.IRX-style CD read RPC, closed statically
 +    // in BLOCKER_002 FASE H/I/J (see analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md
 +    // in the consumer project). Only the "read" function is handled here; any other
@@ -86,12 +89,18 @@ index 8e0f422..5926f93 100644
 +        uint32_t requestDestOffset = 0x0Cu;
 +        uint32_t requestModeOffset = 0x14u;
 +        uint32_t minimumRequestBytes = 0x15u;
++        // Only this request.mode value is modeled (the plain EE-bound copy
++        // path in CDMODULE.IRX's trans_process_tbl, header.type==0). Any
++        // other mode (mode&2 header reads, mode&8 block/sound selection, IOP-
++        // or SPU-bound transfer types) is left unhandled -- see FASE L in
++        // BLOCKER_002_indirect_jump_top_of_ram.md and the Astra audit.
++        uint8_t supportedMode = 1u;
 +    };
 +
      std::unique_ptr<IopService> createDbcmanService(IopHost &host);
      std::unique_ptr<IopService> createLibSdService(IopHost &host);
      std::unique_ptr<IopService> createMcservService(IopHost &host);
-@@ -154,4 +173,5 @@ namespace ps2x::iop::detail
+@@ -154,4 +179,5 @@ namespace ps2x::iop::detail
      std::unique_ptr<IopService> createClFileService(IopHost &host, ClFileBindings bindings);
      std::unique_ptr<IopService> createSoundUpdateStubService(IopHost &host, SoundUpdateStubBindings bindings);
      std::unique_ptr<IopService> createSdrdrvService(IopHost &host, SdrdrvBindings bindings);
@@ -99,10 +108,10 @@ index 8e0f422..5926f93 100644
  }
 diff --git a/ps2xIOP/src/modules/cdmodule.cpp b/ps2xIOP/src/modules/cdmodule.cpp
 new file mode 100644
-index 0000000..f851940
+index 0000000..f197bd2
 --- /dev/null
 +++ b/ps2xIOP/src/modules/cdmodule.cpp
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,276 @@
 +#include "module_factories.h"
 +
 +#include <algorithm>
@@ -186,13 +195,42 @@ index 0000000..f851940
 +                    return result;
 +                }
 +
++                if (mode != m_bindings.supportedMode)
++                {
++                    // Only mode==1 (the plain EE-bound copy CDMODULE.IRX's
++                    // trans_process_tbl selects for header.type==0) has been
++                    // demonstrated against the real IRX protocol. mode&2 reads a
++                    // header from disc first; mode&8 drives block
++                    // selection/progression and sound calls; other type entries
++                    // route to IOP/SPU transfers instead of EE. None of that is
++                    // modeled here -- copying raw bytes for an unrecognized mode
++                    // would silently diverge from the original contract, so the
++                    // request is left unhandled instead of a false success.
++                    logUnsupported(mode, size);
++                    return result;
++                }
++
 +                if (size == 0u)
 +                {
 +                    // Nothing to transfer; treat as a trivially completed read rather
 +                    // than an error.
 +                    result.handled = true;
 +                    result.resultAddress = request.receive.address;
-+                    writeZeroResponse(request.receive);
++                    writeTransferCountResponse(request.receive, 0u);
++                    return result;
++                }
++
++                if ((size % 16u) != 0u)
++                {
++                    // The real IRX DMAs in 16-byte units (dma.size =
++                    // round_up(size, 16)), so a non-aligned request would have
++                    // the IOP-side transfer write up to 15 bytes past `size`
++                    // into EE RAM. Every request observed so far (FASE J/L) is
++                    // 16-aligned; reproducing the rounded-up tail read is not
++                    // implemented, so an unaligned size is left unhandled rather
++                    // than silently under-copying relative to the original.
++                    logWarning("size 0x" + toHex(size) + " not 16-byte aligned "
++                               "(DMA rounding tail not modeled), leaving unhandled");
 +                    return result;
 +                }
 +
@@ -247,7 +285,12 @@ index 0000000..f851940
 +
 +                result.handled = true;
 +                result.resultAddress = request.receive.address;
-+                writeZeroResponse(request.receive);
++                // The real CdReadProcess returns the transferred byte count
++                // (EE_TransSize), not a fixed "0 = success" status (Astra audit
++                // finding 2 / IRX 0x3B68). `size` is guaranteed 16-aligned at
++                // this point, so it already equals the real transferCount for
++                // every request this service accepts.
++                writeTransferCountResponse(request.receive, size);
 +
 +                logSuccess(resourceId, lba, size, dest, mode);
 +                return result;
@@ -274,17 +317,33 @@ index 0000000..f851940
 +                return true;
 +            }
 +
-+            void writeZeroResponse(const GuestBuffer &receive) const
++            void writeTransferCountResponse(const GuestBuffer &receive, uint32_t transferCount) const
 +            {
-+                if (receive.address != 0u && receive.size != 0u)
++                if (receive.address != 0u && receive.size >= sizeof(transferCount))
 +                {
-+                    (void)m_host.zeroGuest(receive.address, std::min<uint32_t>(receive.size, 4u));
++                    (void)m_host.writeGuest(receive.address, &transferCount, sizeof(transferCount));
 +                }
++            }
++
++            static std::string toHex(uint32_t value)
++            {
++                std::ostringstream out;
++                out << std::hex << value;
++                return out.str();
 +            }
 +
 +            void logWarning(const std::string &message) const
 +            {
 +                m_host.log(LogLevel::Warning, '[' + m_bindings.serviceName + "] " + message);
++            }
++
++            void logUnsupported(uint8_t mode, uint32_t size) const
++            {
++                m_host.log(LogLevel::Warning,
++                           '[' + m_bindings.serviceName + "] unsupported fno=" +
++                               std::to_string(m_bindings.readFunction) +
++                               " mode=" + std::to_string(static_cast<uint32_t>(mode)) +
++                               " size=0x" + toHex(size));
 +            }
 +
 +            void logSuccess(uint32_t resourceId, uint32_t lba, uint32_t size, uint32_t dest, uint8_t mode) const
@@ -336,7 +395,7 @@ index 563bcbd..5e3b23a 100644
 @@ -226,6 +226,19 @@ int main(int argc, char *argv[])
              return 1;
          }
-
+ 
 +        // Optional, generic (not game-specific): let ps2xIOP CD-image-backed
 +        // services (see PS2Runtime::IoPaths::cdImage / ps2x::iop::IopHost)
 +        // resolve a real disc image without hardcoding any path in the runtime.
@@ -351,5 +410,5 @@ index 563bcbd..5e3b23a 100644
 +        }
 +
          runtime.run();
-
+ 
  #ifdef _DEBUG

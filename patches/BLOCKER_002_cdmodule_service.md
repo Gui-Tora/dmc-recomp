@@ -27,16 +27,29 @@ vacío; `Print_message` entra en runaway (FASE C/D).
 
 Nuevo `IopService` (`CdModuleService`,
 `ps2xIOP/src/modules/cdmodule.cpp`) registrado solo para el perfil
-`SLES_503.58` (`builtin_profiles.cpp`), que atiende únicamente `fno=2`.
-Consume `resourceId`/`LBA`/`size`/`dest`/`mode` directamente del
-paquete de 112 bytes que el propio juego ya resuelve vía su tabla
-interna `0x507C50` (FASE H.4/H.5) — no se duplica esa tabla ni se
-hardcodea ningún `resourceId`/`LBA`/tamaño. Lee los bytes reales desde
-una imagen de CD host (`IopHost::hostPath(HostPathKind::CdImage)` +
+`SLES_503.58` (`builtin_profiles.cpp`), que atiende únicamente
+**`fno=2` con `request.mode==1`** (FASE L, tras la auditoría Astra:
+`mode` selecciona en el IRX real entre copia EE/lectura de cabecera
+IOP/transferencia SPU, y solo la ruta `mode=1`/EE-directa está
+demostrada — `mode!=1` se deja explícitamente sin manejar, con log
+`[CDMODULE] unsupported fno=2 mode=X`, en vez de copiar bytes crudos
+bajo un contrato no verificado). También exige `size` múltiplo de 16
+(el IRX real hace DMA en unidades de 16 bytes; un tamaño no alineado se
+deja sin manejar en vez de reproducir de forma incompleta los bytes
+extra que el original transferiría). Consume `resourceId`/`LBA`/`size`/
+`dest`/`mode` directamente del paquete de 112 bytes que el propio juego
+ya resuelve vía su tabla interna `0x507C50` (FASE H.4/H.5) — no se
+duplica esa tabla ni se hardcodea ningún `resourceId`/`LBA`/tamaño. Lee
+los bytes reales desde una imagen de CD host
+(`IopHost::hostPath(HostPathKind::CdImage)` +
 `openHostFile`/`readHostFile`, mismo patrón que `sdrdrv.cpp`) y los
-escribe en RAM EE vía `IopHost::writeGuest`. `fno!=2` (p. ej. `fno=1`,
-init de `Cd_init`) se deja sin manejar deliberadamente, igual que antes
-del parche.
+escribe en RAM EE vía `IopHost::writeGuest`. La respuesta (`request.
+receive`, 4 bytes) contiene el `transferCount` real transferido
+(`size`, ya alineado), no una convención fija de "0 = éxito" — el IRX
+original (`CdReadProcess`) devuelve el contador de bytes transferido,
+no un código de estado (Astra audit, finding 2). `fno!=2` (p. ej.
+`fno=1`, init de `Cd_init`) se deja sin manejar deliberadamente, igual
+que antes del parche.
 
 Complemento genérico (no específico de DMC): `ps2xRuntime/src/main.cpp`
 lee la variable de entorno opcional `PS2X_CD_IMAGE` y, si está
@@ -51,13 +64,17 @@ del ELF embebido coincide con `original/SLES_503.58`, FASE F.0):
 `sid=0x12345678`/`fno=2` deja de aparecer como unhandled; 7 peticiones
 reales de recursos distintos servidas correctamente (`resourceId`
 `0x5c`/`0x7d`/`0x99`/`0x113`/`0x13a`/`0xb8`/`0xa4`), con LBA/tamaño
-coincidentes con la tabla ELF `0x507C50` y contenido verificado byte a
-byte contra una lectura independiente del ISO. Sin crash/excepción en
-145 s combinados de ejecución; el proceso llega a un estado estable
-(polling normal de memory card) muy por delante del punto donde ocurría
-BLOCKER_002. Detalle completo, incluyendo limitaciones conocidas
-(alcance limitado a `fno=2`; `resourceId=0x9C` no se reprodujo en
-ejecución automática), en la nota FASE J/K.
+coincidentes con la tabla ELF `0x507C50` y los primeros 32 bytes
+(`first32`, no los 68192 bytes completos) verificados contra una
+lectura independiente del ISO — `0xb8` y `0x9C` comparten esos mismos
+32 bytes, así que esa comprobación no distingue ambos recursos
+(auditoría Astra, FASE L.0). Sin crash/excepción en 145 s combinados de
+ejecución; el proceso llega a un estado estable (polling normal de
+memory card) muy por delante del punto donde ocurría BLOCKER_002.
+Detalle completo, incluyendo limitaciones conocidas (alcance limitado a
+`fno=2`; `resourceId=0x9C` no se reprodujo en ejecución automática), en
+la nota FASE J/K. Validación completa (68192 bytes, jump table,
+retorno de `Print_message`) del caso literal `0x9C`: FASE L.6.
 
 ## Integración reproducible (FASE K)
 
@@ -69,3 +86,8 @@ autor/fecha/mensaje fijos) — ver `upstream.lock.json` y
 `analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md` FASE K para el
 algoritmo exacto. No requiere ningún commit remoto ni fork: se deriva
 siempre de `commit` + este archivo.
+
+`patched_commit`/SHA256 del `.patch` se recalcularon en FASE L al
+incorporar las correcciones de mode=1/response de Astra; verificado
+reproducible con tres `bootstrap()` reales independientes (clon +
+apply + commit-tree) desde cero, mismo hash las tres veces.
