@@ -1,111 +1,151 @@
-# Devil May Cry (2001) — PS2 static recompilation bring-up
+# dmc-recomp
 
-Investigación para PC con PS2Recomp y Ghidra. Objetivo inmediato: M0–M2.
-ELF identificado y analizado (`SLES_503.58`, SHA-256
-`d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`), baseline
-symtab-first promovido (ver `analysis/notes/SYMTAB_BASELINE_PROMOTION.md`).
-BLOCKER_001 (arranque del entry) resuelto. BLOCKER_002
-(`analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md`) **RESUELTO**
-(FASE L, tras auditoría independiente en
-`analysis/notes/BLOCKER_002_ASTRA_AUDIT.md`): servicio IOP HLE mínimo
-(`CdModuleService`, perfil `SLES_503.58`) para el RPC de lectura de CD
-(`sid=0x12345678`, `fno=2`, `mode=1`, tamaño múltiplo de 16) que antes
-quedaba sin manejar. Caso literal `resourceId=0x9C` validado completo
-en PCSX2 (68192 bytes de RAM == archivo `OPMOJI_G.T32` == slice ISO,
-jump table intacta); en RECOMP el mecanismo se validó con ~15 recursos
-reales servidos y se explicó causalmente por qué ese `resourceId`
-concreto no es alcanzable vía navegación con la configuración OSD
-actual del runtime (`language=1` hardcodeado, se consulta antes de que
-el menú de idioma del juego sea accesible) — ver FASE L.6. A/B
-confirmó que el patrón de corrupción original solo reaparece sin la
-imagen de CD (FASE L.7). Limitaciones futuras documentadas (no
-reservas del blocker): `mode=2`, RPCs `0x9/0xA/0xD`, `fno=1`, DMA no
-alineada, rutas de error (FASE L.8). El fix vive como parche
-reproducible (`patches/`) que `bootstrap` aplica automáticamente sobre
-la baseline fijada, con el `exe` atado a la identidad exacta del vendor
-que lo produjo (FASE L.1) — `pipeline.py build`/`run` funcionan sin
-pasos manuales.
+Experimental static recompilation of *Devil May Cry* (2001) for PlayStation 2
+to native PC, using [PS2Recomp](https://github.com/ran-j/PS2Recomp).
 
-## Organización
+**Target**: PAL Europe, `SLES_503.58`, version 1.02.
 
-- `original/`: ELF y datos locales, sin distribuirlos ni añadirlos a Git.
-- `analysis/ghidra/`: proyecto Ghidra local; `analysis/local/`: exports y recibos.
-- `analysis/notes/`: evidencia de bloqueos por SHA-256.
-- `recomp/config.toml`: configuración local preparada desde el export de Ghidra.
-- `recomp/generated/<sha256>/<run>/`: C++ generado, sin ediciones manuales.
-- `runtime/`: overrides DMC; `patches/`: cambios generales al runtime upstream,
-  reproducibles (`upstream.lock.json` los aplica automáticamente en `bootstrap`).
-- `vendor/`: upstream fijado en `upstream.lock.json` (baseline real + patchset
-  reconocido, ver `patches/README.md`), clones locales ignorados.
-- `build/` y `logs/`: compilaciones y diagnósticos locales.
+**Status**: work in progress. This is a reverse-engineering / bring-up
+project, not a playable port.
 
-## Flujo en Windows
+- BLOCKER_001 (entry point / function-boundary corruption): **RESOLVED**
+- BLOCKER_002 (missing CD-read IOP service): **RESOLVED**
+- Real interactive boot reached
+- DualSense/gamepad input works well enough to navigate in-game menus
+- Title screen reached
+- Rendering is still incomplete/corrupted
+- Later game states (gameplay, missions) are not yet functional
+- BLOCKER_003 has not yet been formally identified
 
-Python 3.11+, Git, Visual Studio 2022 con C++ x64/Windows SDK y CMake >=3.21.
-El script encuentra también el CMake incluido en Visual Studio. La primera
-configuración descarga dependencias mediante CMake FetchContent.
+Do not read any of the above as "playable", "complete", "ported", or
+"remastered" — none of that is true yet.
 
-Desde esta carpeta:
+## This repository does not include game data
+
+This repository does not include game data, the original executable, BIOS,
+disc image, or other copyrighted game assets. You must provide your own
+legally obtained copy of the game.
+
+The following are never distributed here and are excluded from Git:
+
+- `original/` — your own ELF, `SYSTEM.CNF`, memory cards
+- generated recompilation output (`recomp/generated/`)
+- local builds (`build/`)
+- runtime logs, RAM dumps, PCSX2 captures (`logs/`, `analysis/local/`)
+
+## Reproducibility
+
+- The PS2Recomp upstream commit is pinned in `upstream.lock.json`.
+- Project-specific changes to that upstream live as reviewable patches in
+  `patches/`, not as a fork.
+- `scripts/pipeline.py bootstrap` deterministically reconstructs the patched
+  vendor checkout (clone the pinned commit, apply the patchset, verify the
+  result) — no manual steps.
+- The current baseline derives function boundaries directly from the ELF's
+  own `.symtab` ("symtab-first"), not from a Ghidra CSV export. See
+  `analysis/notes/SYMTAB_BASELINE_PROMOTION.md`.
+- Generated C++ (`recomp/generated/`) is intentionally **not** versioned —
+  it is produced locally from your own ELF and is fully reproducible from
+  it.
+- You provide your own ELF/disc image; `scripts/pipeline.py` drives the
+  rest of the workflow (`bootstrap` → `tools` → `identify` → `prepare` →
+  `generate` → `build` → `run`).
+
+Full setup instructions: [`AGENTS.md`](AGENTS.md) and
+[`analysis/UPSTREAM.md`](analysis/UPSTREAM.md).
+
+## Development workflow
+
+This project is developed with an AI-assisted workflow across three
+different roles, kept deliberately separate so that no single actor both
+implements and grades its own work.
+
+**ChatGPT** — coordinates the investigation: helps structure
+reverse-engineering strategy, connects evidence across experiments, designs
+validation steps, reviews Claude's and Astra's results critically, and
+identifies what is still missing before a blocker can be considered closed.
+
+**Claude** — the operational agent working directly inside the repository:
+reads and modifies code, implements instrumentation and fixes, drives
+bootstrap/build/pipeline, runs experiments, analyzes runtime logs, updates
+technical documentation, and creates local Git checkpoints.
+
+**Astra** — an independent technical auditor, deliberately separated from
+the implementation role. Reconstructs causal chains independently, attempts
+to falsify prior conclusions, and distinguishes demonstrated fact from
+strongly supported conclusion, from inference, from open hypothesis. Looks
+specifically for overclaims, contradictions, and missing validation before a
+major blocker is signed off.
+
+**PCSX2** is used as the reference/oracle for original game behavior — its
+debugger, registers, breakpoints, and RAM dumps let us compare original
+execution against the recompiled build.
+
+The investigative loop:
+
+1. Reproduce a blocker.
+2. Isolate the first meaningful divergence.
+3. Define what evidence would actually settle it.
+4. Claude instruments, implements, and tests.
+5. Compare against PCSX2 where original behavior is needed.
+6. Astra independently audits significant blockers.
+7. Incorporate audit corrections.
+8. Revalidate.
+9. Git checkpoint.
+10. Only then move to the next blocker.
+
+A blocker is not considered closed merely because a fix appears to work. It
+is closed after causal evidence, runtime validation, and — for significant
+blockers — an independent audit.
+
+AI output is not itself evidence. Primary evidence always comes from the
+original machine code / ELF, observed runtime behavior, PCSX2, RAM/register
+dumps, logs, hashes, and reproducible experiments. The AI tools help
+organize, implement, and audit that investigation — they don't replace it.
+
+## Current technical status
+
+**BLOCKER_001** — entry point / function-boundary corruption, resolved by
+switching to a symtab-derived baseline instead of Ghidra's CSV export. See
+[`analysis/notes/BLOCKER_001_entry_di_gap.md`](analysis/notes/BLOCKER_001_entry_di_gap.md).
+
+**BLOCKER_002** — the game registers a real SIF RPC service for CD reads
+(`sid=0x12345678`) that had no HLE implementation, so requested resources
+never arrived; the read cursor (`Print_message`) then advanced without
+bound and eventually corrupted a jump table. Fixed with a minimal HLE read
+service (`CdModuleService`: `fno=2`, `mode=1`, 16-byte-aligned sizes). The
+fix and its closing validation were independently audited (see
+`analysis/notes/BLOCKER_002_ASTRA_AUDIT.md`) before being marked resolved.
+Full causal chain, evidence, and hash-verified validation:
+[`analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md`](analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md).
+
+Known, currently out-of-scope limitations (not yet classified as a new
+blocker — none of them has been shown to actually block further progress):
+
+- `CdModuleService` only handles `mode=1`; `mode=2` is left explicitly
+  unsupported.
+- CDMODULE RPCs `0x9`, `0xA`, `0xD` are unhandled.
+- Rendering is incomplete/corrupted past the title screen.
+- The boot flow after the title screen is still under investigation.
+
+## Build
+
+Windows, Python 3.11+, Git, Visual Studio 2022 (C++ x64/Windows SDK), CMake
+≥ 3.21. See [`AGENTS.md`](AGENTS.md) for the full workflow, coding/evidence
+conventions, and `scripts/pipeline.py` usage.
 
 ```powershell
 python scripts/pipeline.py bootstrap
 python scripts/pipeline.py tools
-python scripts/pipeline.py identify original/NOMBRE_REAL_DEL_ELF
+python scripts/pipeline.py identify original/YOUR_ELF_NAME
 ```
 
-Importar ese mismo ELF en Ghidra, completar y revisar el análisis y ejecutar
-`vendor/PS2Recomp/ps2xRecomp/tools/ghidra/ExportPS2Functions.java` desde Script Manager.
-Añadir su carpeta a Script Directories. Guardar TOML en `analysis/local/ghidra.toml`
-y CSV en `analysis/local/functions.csv`. Crear esas carpetas al guardar si faltan.
-El exportador tiene dos diálogos `askFile`; no hemos supuesto una interfaz CLI
-propia del script ni automatizado el reconocimiento de funciones.
+## License
 
-Verificar que el lenguaje/importador instalado en Ghidra comprende R5900,
-incluyendo las extensiones PS2; no dar por correcto un análisis MIPS genérico.
-La versión de Ghidra y su extensión PS2/JDK se fijarán al preparar ese entorno.
-
-```powershell
-python scripts/pipeline.py prepare --elf original/NOMBRE_REAL_DEL_ELF --toml analysis/local/ghidra.toml --csv analysis/local/functions.csv
-python scripts/pipeline.py generate
-python scripts/pipeline.py build
-python scripts/pipeline.py run --seconds 60
-```
-
-`prepare` conserva las opciones y clasificaciones del export y cambia sus tres
-rutas. Revisar `stubs` y `untracked_stubs` en el TOML exportado: una clasificación
-automática no prueba la semántica. Para cambiarlas, editar el TOML fuente y
-repetir `prepare`. Cada preparación crea una ruta nueva de generación para no
-mezclar restos anteriores. Los recibos comprueban ELF, config, CSV, salida y
-ejecutable; no prueban que los límites de funciones sean correctos.
-
-El lanzador registra stdout/stderr y limita cada intento a 60 s por defecto.
-Un timeout no equivale a un bloqueo confirmado: también puede ser ejecución
-normal; investigar el log y el PC. Los procesos de configuración/compilación
-guardan su salida completa en `logs/`. El runtime abre su ventana al ejecutar.
-Ejecutar con el ELF equivocado debe fallar antes de arrancar.
-
-Para ejercitar lecturas reales de CD (`CdModuleService`, BLOCKER_002)
-definir `PS2X_CD_IMAGE` con la ruta a una imagen de disco real antes de
-`pipeline.py run`; sin esa variable, cualquier RPC de lectura que la
-necesite queda sin manejar (mismo comportamiento que antes del fix, no
-un error nuevo). No versionar ninguna ruta ni imagen personal.
-
-El runtime inicial desactiva debug UI y FFmpeg para M0–M2; FFmpeg desactivado
-impide validar vídeo real. La ruta de datos parte de la carpeta del ELF.
-M3 requerirá comprobar la resolución real de archivos y el contenido del disco.
-
-## Hitos y evidencia
-
-| Hito | Criterio | Estado |
-| --- | --- | --- |
-| M0 | ELF real → C++ generado, enlazado con tabla no vacía | Cumplido (baseline symtab-first) |
-| M1 | Evidencia de ejecución del entry del ELF | Cumplido (BLOCKER_001 resuelto) |
-| M2 | Inicialización básica identificada y completada | Cumplido — BLOCKER_002 resuelto (FASE L), alcance `fno=2`/`mode=1` |
-| M3–M4 | Lectura de datos y primera imagen | Fuera del objetivo inmediato |
-| M5–M10 | Intro, menú, Mission 1, control, combate, juego completo | Sin evaluar |
-
-Registrar el primer fallo significativo con `analysis/notes/BLOCKER_TEMPLATE.md`.
-Una ventana abierta o un ejecutable compilado no demuestran M1/M2.
-
-Ver [hallazgos y APIs](analysis/UPSTREAM.md). La viabilidad de M0–M2 merece una
-prueba, pero el soporte necesario para DMC todavía no está medido.
+No `LICENSE` file has been added to this repository yet — that decision is
+pending. The PS2Recomp upstream this project builds on and links against is
+licensed under the **GNU General Public License, version 3** (plain GPLv3
+text, no per-file SPDX headers or "or later" qualifier in the upstream
+source). Any compiled `dmc-recomp` executable is therefore a combined work
+bound by GPLv3, regardless of what license this repository's own original
+code (scripts, patches, documentation) ends up under.

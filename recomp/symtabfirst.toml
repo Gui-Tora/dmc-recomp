@@ -23,8 +23,8 @@
 # boundary source is used and stay instrumented in runtime/dmc_overrides.cpp.
 
 [general]
-input = "C:/Users/chris/Desktop/proyectos/dmc-recomp/original/SLES_503.58"
-output = "C:/Users/chris/Desktop/proyectos/dmc-recomp/recomp/generated/placeholder"
+input = "original/SLES_503.58"
+output = "recomp/generated/placeholder"
 ghidra_output = ""
 single_file_output = false
 output_worker_threads = 8

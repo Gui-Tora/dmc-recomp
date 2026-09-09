@@ -10,9 +10,9 @@
 # - no SCE symbol database is used by this Ghidra script
 
 [general]
-input = "C:/Users/chris/Desktop/proyectos/dmc-recomp/original/SLES_503.58"
-output = "C:\\Users\\chris\\Desktop\\proyectos\\dmc-recomp\\analysis\\ghidra\\export\\output"
-ghidra_output = "C:\\Users\\chris\\Desktop\\proyectos\\dmc-recomp\\analysis\\ghidra\\export\\dmc_functions.csv"
+input = "original/SLES_503.58"
+output = "analysis/ghidra/export/output"
+ghidra_output = "analysis/ghidra/export/dmc_functions.csv"
 single_file_output = false
 output_worker_threads = 8
 patch_syscalls = false

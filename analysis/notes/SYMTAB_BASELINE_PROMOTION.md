@@ -65,7 +65,8 @@ baseline principal, se promovió el build **existente** sin recompilar:
 - **CMake cache**: `analysis/local/symtabfirst/build/CMakeCache.txt` — tiene
   docenas de rutas absolutas (`DmcBringup_BINARY_DIR`, `FETCHCONTENT_BASE_DIR`,
   `DMC_GENERATED_DIR`, etc.) apuntando literalmente a
-  `C:/Users/chris/Desktop/proyectos/dmc-recomp/analysis/local/symtabfirst/{build,generated}`.
+  `<repo-root>/analysis/local/symtabfirst/{build,generated}` (ruta absoluta
+  local, fuera de Git).
   **No se movió ni renombró ningún directorio** — mover/renombrar habría
   invalidado esas rutas y forzado una reconfiguración/recompilación completa
   (exactamente lo que se quería evitar).

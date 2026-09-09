@@ -1,6 +1,8 @@
 /vendor/
 /build/
 /logs/
+/mc0/
+/mc1/
 /original/*
 !/original/README.md
 # El proyecto Ghidra en si (bases de datos binarias, decenas de MB) no se
