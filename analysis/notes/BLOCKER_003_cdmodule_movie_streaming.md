@@ -114,6 +114,14 @@ para `sid=0x12345678` aparte de `CdModuleService`.
 5. **`0x87DCB0`** (`= 0x87DC80 + 0x30`) = *string* de depuración generado
    por `sprintf` dentro de `CallCdModule` — descriptivo, no operativo.
 
+6. **`fno=9` también recibe LBA y tamaño total desde la tabla de recursos**
+   (`0x507C50 + selector·8`), exactamente igual que `fno=2` — corrección a
+   una afirmación anterior de esta misma nota, que decía que solo `fno==2`
+   poblaba esos campos. Se verificó que la escritura de `s0+4`(LBA) y
+   `s0+8`(size) en `CallCdModule` es **incondicional** dentro del bloque
+   compartido `{2,3,7,9}`; solo `mode` (`s0+0x14`) es exclusivo de
+   `fno==2`.
+
 ## Contrato mínimo general del futuro HLE (NO implementado todavía)
 
 Debe funcionar para **cualquier** PSS que use este protocolo — prohibido
@@ -121,11 +129,35 @@ condicionar por nombre de archivo (`if title.pss` / `if demo1.pss`).
 
 | `fno` | Contrato observable mínimo |
 |---|---|
-| `9` (start) | Registra LBA inicial (`request+4`), posición actual = LBA inicial, marca la sesión "activa" |
-| `0xA` (next chunk) | Lee `dest` de `request+0xC` **en cada llamada** (no cachear del `fno=9`); tamaño de chunk = `request+8` (confirmado por código, ver abajo); copia esa cantidad exacta de bytes reales desde la posición actual del PSS hacia `dest`; avanza la posición; devuelve `request+8` como `EE_TransSize` (eco confirmado por código) |
-| `0xC` (close) | Cierra/resetea el estado de sesión |
-| `0xD` (status) | Refleja si la sesión sigue viva (equivalente observable al OR de semáforos original) |
-| `8` | ABIERTO si participa en el flujo de movie — no observado todavía en las capturas de title/demo1 |
+| `9` (start) | Selector (`request+0`) resuelve LBA (`request+4`) y tamaño total (`request+8`) desde la **misma tabla `0x507C50 + selector·8`** que usa `fno=2` — no es un mecanismo separado (ver corrección más abajo). Inicializa posición actual = LBA inicial, marca la sesión "activa" |
+| `0xA` (next chunk) | Lee `dest` de `request+0xC` **en cada llamada** (no cachear del `fno=9`); tamaño solicitado = `request+8`; copia `min(solicitado, bytes_reales_restantes)` desde la posición actual del PSS hacia `dest`; avanza la posición; devuelve `request+8` tal cual como `EE_TransSize`, **sin usar un valor menor como señal de EOF** (confirmado por código, ver abajo) |
+| `0xC` (close) | `MovieExit` real (corrección: no es `fno=0xB`) — cierra/resetea el estado de sesión, debe permitir arrancar otra película después sin residuo |
+| `0xD` (status) | Refleja si la sesión sigue viva (equivalente observable al OR de semáforos original). **Confirmado en la ruta normal**: aparece en un bucle de poll al final de la reproducción, antes de `MovieExit` |
+| `8` | Aparece una sola vez cerca del inicio de la reproducción (no dentro del bucle de chunks) en las capturas revisadas — no forma parte del contrato mínimo salvo que el código existente lo exija explícitamente para que esta ruta funcione |
+
+### Fin de stream (EOF) — mecanismo real, no el marcador MPEG
+
+`TITLEP.PSS` y `DEMO1P.PSS` terminan físicamente con `00 00 01 B9` (MPEG
+Program End Code) como los **últimos 4 bytes exactos** del archivo
+(verificado byte a byte contra la ISO montada). **Pero `CDMODULE`/DMC no
+usa ese marcador para decidir el fin del stream** — se comprobó que ningún
+código de `CdMovieReadProc`/el bucle EE lo busca o lo compara.
+
+El EOF operativo real es **conteo de bytes**, en dos sitios independientes:
+
+- **IOP** (`CdMovieReadProc`): `total_esperado = *(request+8)` (mismo
+  tamaño de tabla que resuelve `fno=9`); `total_leído += valor de retorno
+  real de CDFileRead` en cada iteración (pide `0x10000` fijo cada vez, pero
+  usa el retorno real, no el pedido, para acumular); sale del bucle
+  (`CDFileClose`+`ExitThread`, sin bandera especial) cuando
+  `total_leído >= total_esperado`.
+- **EE** (bucle en `0x1CE5B0-0x1CE73C`): mantiene su propio contador
+  espejo `[state+0x18]`, decrementado por el tamaño de chunk en cada
+  iteración; abandona el bucle principal cuando `[state+0x18] < 5`.
+
+El decodificador se drena **después** de esa salida (`videoDecFlush`/
+`videoDecIsFlushed` en bucle de poll) — es consecuencia del fin de
+stream, no el mecanismo que lo detecta.
 
 **No hace falta reproducir hilos/semáforos IOP literalmente** — una máquina
 de estados HLE (LBA + posición + tamaño de archivo) puede dar la misma
@@ -152,28 +184,33 @@ tamaño de DMA** — confirmado por código, ya no es una asunción. El valor
 de retorno al EE es ese mismo tamaño, siempre (no hay señal de
 transferencia parcial en esta ruta).
 
-## Mediciones que faltan antes de implementar
+## Mediciones que faltaban — CERRADAS
 
-1. **Valor(es) numérico(s) concretos** que el juego envía en `request+8`
-   para `fno=0xA` durante una reproducción real — la fórmula ya está
-   demostrada por código, falta el número real para dimensionar/validar
-   una implementación.
-2. **Si `fno=0xD` y/o `fno=8` aparecen realmente** durante la reproducción
-   de `title.pss`/`demo1.pss`, o si el llamador nunca los usa en este
-   flujo — call site común `0x001CEE18`, distinguir por `a1`.
-3. **Si `dest` permanece siempre fijo por sesión de movie**, o si puede
-   rotar en otros streams/llamadores — solo se observó fijo en las dos
-   sesiones capturadas hasta ahora.
+1. **Valor numérico real de `request+8` en `fno=0xA`**: capturado
+   dinámicamente en 3 hits sucesivos de `0x001CEDAC` — `0x00010000`
+   (64 KiB) constante en los tres, con `dest` avanzando exactamente
+   `+0x10000` entre hits (`0x01CD37E0` → `0x01CE37E0` → `0x01CF37E0`).
+   Cerrado.
+2. **`fno=0xD` en la ruta normal**: confirmado por código — bucle de poll
+   al final de la reproducción (`CdMovieEndCheck`), antes de
+   `MovieExit`/`MovieBufferRelease`. `fno=8` aparece una vez cerca del
+   inicio, no dentro del bucle de chunks. Cerrado.
+3. **Comportamiento de `dest`**: se comprobó que `CallCdModule` reescribe
+   `s0+0xC` en cada llamada desde `*(s3+68)`, y dinámicamente se confirmó
+   que SÍ avanza entre llamadas sucesivas de `fno=0xA` (no es fijo, como
+   se creyó con la muestra inicial de solo 1-2 hits). El cálculo de a
+   dónde avanza es responsabilidad de la librería SDK oficial
+   (`sceMpegCreate`/`ReadFileGetAddr`, ring buffer de `0xFC800` bytes) —
+   **irrelevante para el HLE**, que solo necesita leer `request+0xC` tal
+   cual en cada llamada. Cerrado.
 
-## Siguiente prueba PCSX2 propuesta (una sola sesión, dos breakpoints)
+Ninguna medición pendiente bloquea la implementación.
 
-Mantener `0x001CEDAC` (`fno=0xA`) y añadir `0x001CEE18` (`fno=8`/`0xD`,
-distinguir por `a1`). Dejar correr una reproducción completa (o al menos
-hasta la aparición de imagen) y registrar, en cada hit:
+## Fuera de alcance del HLE (no bloquea el fix)
 
-- breakpoint disparado y valor de `a1`,
-- `[s0+0x08]` y `[s0+0x0C]`,
-- valor de `$v0` al volver del `jal` (return value real),
-- si `dest` cambia entre hits.
-
-Esto cierra las tres mediciones pendientes en una sola pasada.
+La máquina de estados de Title/Menú (qué película pedir y cuándo — timeout
+de menú hacia `DEMO1P.PSS`, aborto por input de vuelta al menú) es lógica
+de juego EE, ortogonal al protocolo `CDMODULE`. Se localizó parcialmente
+(tabla de selección `0x5072B0`, indexada por un contador de estado en
+`state+108`) pero no se completó — no hace falta para que el HLE de
+streaming funcione con cualquier `resourceId` que el juego pida.
