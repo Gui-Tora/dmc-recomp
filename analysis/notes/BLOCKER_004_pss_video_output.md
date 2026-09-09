@@ -2,14 +2,16 @@
 
 ## Estado
 
-`OPEN / FIRST DIVERGENCE LOCATED (build configuration, not a code bug)`.
-No implementado.
+`OPEN / FIRST DIVERGENCE LOCATED`. No implementado.
 
-No lo llamo todavía "bug de IPU", "bug de decodificador MPEG" ni "bug de
-GS" porque, aunque la primera divergencia real ya está localizada (ver
-más abajo) y apunta a una sola capa concreta, las capas posteriores
-(subida a GS, presentación) siguen sin ejercitarse y por tanto sin
-verificar — no se puede afirmar todavía que sean correctas.
+**Actualización**: la causa documentada originalmente (`PS2X_ENABLE_FFMPEG=OFF`,
+sección 2) ya se corrigió y se probó — ver sección 5. Con FFmpeg realmente
+activo apareció una divergencia **nueva y más profunda**, que es ahora la
+primera divergencia vigente: el decodificador produce fotogramas reales,
+pero `sceMpegGetPicture` no se llama nunca, lo que autobloquea todo el
+pipeline por diseño de *backpressure*. Ver sección 5 para la cadena
+completa. No lo llamo todavía "bug de scheduler", "bug de MPEG" ni "bug de
+dispatch HLE" — eso es justo lo que queda por localizar.
 
 ## Evidencia inicial
 
@@ -117,7 +119,7 @@ decoded frame               ❌  NUNCA se produce en este build — causa
 GS upload/presentation      ABIERTO — no verificable sin fotogramas que subir
 ```
 
-## 3. Experimento mínimo para cerrar la duda
+## 3. Experimento mínimo para cerrar la duda — EJECUTADO, ver sección 5
 
 Un solo experimento, automatizable, sin PCSX2: **reconfigurar con
 `-DPS2X_ENABLE_FFMPEG=ON`, dejar que `ExternalProject_Add` descargue el
@@ -155,11 +157,87 @@ imagen normal (`fno=2`), no el pipeline PSS/movie. Es un candidato
 lado GS/rendering directamente, no relacionado con `sceMpeg`/FFmpeg. No
 se investiga aquí para no mezclar dos cadenas causales distintas.
 
+## 5. Experimento de BLOCKER_004 ejecutado — nueva divergencia, más profunda
+
+Se activó `PS2X_ENABLE_FFMPEG=ON` de verdad (build reparado quirúrgicamente
+tras una interrupción que dejó un `.obj` truncado — ver historial de la
+sesión; no afecta a esta nota) y se validó en runtime: el mensaje `[MPEG]
+runtime built without FFmpeg` desaparece, las DLLs de FFmpeg
+(`avcodec-61.dll` etc.) se copian y cargan correctamente.
+
+Con instrumentación temporal mínima en `MPEG.cpp` (contadores dispersos,
+sin spam por paquete — pendiente de revertir cuando se cierre este
+blocker), una corrida real de `TITLEP.PSS` dio:
+
+```
+feed call #1, #2, #5     → fedOk=1
+frame decoded total=1..8  (en feed calls #9, #23, #36, #49, #62, #74, #87, #100)
+[CDMODULE/MOVIE:chunk] ... hasta offset=0xC0000
+```
+
+y ahí el proceso se **detiene de forma permanente** — más de 10 minutos
+reales, CPU activa todo el tiempo (~habitual, no colgado en I/O), sin una
+sola línea nueva de progreso. **Cero llamadas a `sceMpegGetPicture` en
+toda la ejecución** (instrumentado con un contador de entrada
+independiente del de éxito).
+
+### Causa mecánica exacta, confirmada por código (`MPEG.cpp`)
+
+```cpp
+constexpr size_t kMaxDecodedPicturesAhead = 8u;
+// mpegDemuxBackpressured(): decodedFrames.size() >= kMaxDecodedPicturesAhead
+```
+
+Cadena demostrada:
+
+```
+FFmpeg produce frames reales
+  -> nadie llama sceMpegGetPicture para consumirlos
+  -> decodedFrames llega a kMaxDecodedPicturesAhead = 8
+  -> mpegDemuxBackpressured() = true
+  -> el demux deja de aceptar más datos (consumed=0)
+  -> el juego (código recompilado normal) deja de pedir nuevos chunks
+     vía fno=0xA a CDMODULE
+  -> todo el pipeline de movie queda bloqueado permanentemente
+```
+
+**No se toca `kMaxDecodedPicturesAhead` ni el backpressure** — es el
+mecanismo que expuso esta divergencia; quitarlo solo la ocultaría.
+
+### Corrección importante sobre el comportamiento con FFmpeg OFF
+
+Con `PS2X_ENABLE_FFMPEG=OFF` (estado documentado en la sección 2, ya
+superado como causa principal) el juego avanzaba más lejos —
+completaba `TITLEP.PSS` entero, encadenaba varias películas seguidas
+(`title → demo1 → title → demo0`, ver `BLOCKER_003`) — **pero eso no era
+comportamiento correcto**: `decodedFrames` nunca crecía (porque `feed()`
+nunca decodificaba nada), así que el backpressure nunca se activaba. El
+avance observado antes era un efecto secundario accidental de que el
+decoder real estuviera desactivado, no una señal de que el pipeline
+funcionara — el bloqueo actual estaba ahí todo el tiempo, solo quedó
+enmascarado.
+
+### Mapa de capas — actualizado
+
+```
+PSS bytes in EE RAM        ✅  (BLOCKER_003, verificado byte a byte)
+demux input                ✅  FUERTEMENTE SOPORTADO (sin leer el parser línea a línea)
+decoded frame               ✅  HECHO — 8 frames reales confirmados por instrumentación
+sceMpegGetPicture llamado   ❌  NUNCA, en ninguna de las corridas — nueva primera divergencia
+GS upload/presentation      ABIERTO — no alcanzable mientras el pipeline esté bloqueado antes de esto
+```
+
 ## Qué NO se ha hecho
 
-- No se ha tocado ningún build (`PS2X_ENABLE_FFMPEG` sigue en `OFF`).
+- No se ha tocado `kMaxDecodedPicturesAhead` ni el mecanismo de
+  backpressure.
+- No se ha determinado todavía quién debería llamar a
+  `sceMpegGetPicture` ni por qué no ocurre (siguiente paso).
 - No se ha leído `appendGuestRingBytes`/`appendGuestBytes` línea a línea
   (demux input queda en FUERTEMENTE SOPORTADO, no HECHO).
 - No se ha investigado la causa del logo CAPCOM.
 - No se ha abierto ninguna investigación de GS/presentación — prematuro
-  mientras no haya un solo fotograma decodificado que subir.
+  mientras el pipeline se bloquee antes de llegar ahí.
+- La instrumentación temporal en `MPEG.cpp` (contadores de diagnóstico)
+  sigue en el árbol de trabajo, sin commit — pendiente de revertir al
+  cerrar este blocker.
