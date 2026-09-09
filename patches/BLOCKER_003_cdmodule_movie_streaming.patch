@@ -1,0 +1,405 @@
+diff --git a/ps2xIOP/src/builtin_profiles.cpp b/ps2xIOP/src/builtin_profiles.cpp
+index a86286e..7f03e8d 100644
+--- a/ps2xIOP/src/builtin_profiles.cpp
++++ b/ps2xIOP/src/builtin_profiles.cpp
+@@ -100,6 +100,16 @@ namespace ps2x::iop::detail
+         // {resourceId@0x00, lba@0x04, size@0x08, destEE@0x0C, mode(byte,&0x7F)@0x14}.
+         // Only request.mode==1 (plain EE-bound copy) is modeled -- FASE L,
+         // Astra audit finding 3.
++        //
++        // Movie/PSS streaming functions (BLOCKER_003, see
++        // analysis/notes/BLOCKER_003_cdmodule_movie_streaming.md in the consumer
++        // project): fno=9 start (CdMovieReadProcess), fno=0xA next chunk
++        // (CdMovieTransProcess), fno=0xC close (MovieExit), fno=0xD status
++        // (CdMovieProcessEndCheck) -- reconstructed from CDMODULE.IRX's own EE-side
++        // dispatch table in CallCdModule (0x584D10, indexed by raw fno) and confirmed
++        // dynamically (PCSX2 breakpoints at the real per-fno sceSifCallRpc call
++        // sites, byte-exact match between the EE destination and growing offsets
++        // inside the real .PSS files on the ISO).
+         CdModuleBindings devilMayCryCdModuleBindings()
+         {
+             return {
+@@ -114,6 +124,10 @@ namespace ps2x::iop::detail
+                 .requestModeOffset = 0x14u,
+                 .minimumRequestBytes = 0x15u,
+                 .supportedMode = 1u,
++                .movieStartFunction = 9u,
++                .movieTransferFunction = 0xAu,
++                .movieCloseFunction = 0xCu,
++                .movieStatusFunction = 0xDu,
+             };
+         }
+     }
+diff --git a/ps2xIOP/src/module_factories.h b/ps2xIOP/src/module_factories.h
+index 94eba11..16ef2a5 100644
+--- a/ps2xIOP/src/module_factories.h
++++ b/ps2xIOP/src/module_factories.h
+@@ -169,6 +169,18 @@ namespace ps2x::iop::detail
+         // or SPU-bound transfer types) is left unhandled -- see FASE L in
+         // BLOCKER_002_indirect_jump_top_of_ram.md and the Astra audit.
+         uint8_t supportedMode = 1u;
++        // Movie/PSS streaming protocol (BLOCKER_003, see
++        // analysis/notes/BLOCKER_003_cdmodule_movie_streaming.md in the
++        // consumer project). These reuse requestLbaOffset/requestSizeOffset/
++        // requestDestOffset above -- CallCdModule rewrites the same 112-byte
++        // packet for every fno, just with different fields populated per
++        // call. fno=8 (EE_TransSize query) is deliberately not modeled here:
++        // it was observed once near movie start, outside the per-chunk loop,
++        // and is not required for the demonstrated contract.
++        uint32_t movieStartFunction = 9u;
++        uint32_t movieTransferFunction = 0xAu;
++        uint32_t movieCloseFunction = 0xCu;
++        uint32_t movieStatusFunction = 0xDu;
+     };
+ 
+     std::unique_ptr<IopService> createDbcmanService(IopHost &host);
+diff --git a/ps2xIOP/src/modules/cdmodule.cpp b/ps2xIOP/src/modules/cdmodule.cpp
+index f197bd2..2f9537b 100644
+--- a/ps2xIOP/src/modules/cdmodule.cpp
++++ b/ps2xIOP/src/modules/cdmodule.cpp
+@@ -26,6 +26,30 @@ namespace ps2x::iop::detail
+         // range from the CD image host file and write it straight to EE RAM through
+         // the existing IopHost abstraction, without simulating IOP threads, semaphores
+         // or chunked DMA.
++        //
++        // Movie/PSS streaming (fno 9/0xA/0xC/0xD) follows the same "observable
++        // contract, not literal IOP threads" approach -- see
++        // analysis/notes/BLOCKER_003_cdmodule_movie_streaming.md (consumer project)
++        // for the full reconstruction (CdMovieReadProcess/CdMovieReadProc/
++        // CdMovieTransProc/CdMovieProcessEndCheck) this is modeled on. Summary of the
++        // demonstrated contract:
++        //   fno=9  (start):    request+4/+8 already carry the resolved LBA/total size
++        //                      (CallCdModule fills them from the same 0x507C50
++        //                      resource table it uses for fno=2 -- verified
++        //                      unconditional for the whole {2,3,7,9} dispatch block,
++        //                      not fno=2-specific as first documented). Returns
++        //                      total size.
++        //   fno=0xA (chunk):   request+0xC (dest) and request+0x8 (requested size)
++        //                      must be read fresh on every call -- CallCdModule
++        //                      rewrites both unconditionally on every invocation, and
++        //                      dest is dynamically demonstrated to advance between
++        //                      calls (SDK-managed ring buffer on the EE side; opaque
++        //                      to this service). The real CdMovieTransProc always
++        //                      echoes the requested size back as EE_TransSize --
++        //                      never a smaller value to signal a short/last chunk.
++        //   fno=0xC (close):   MovieExit. Resets session state.
++        //   fno=0xD (status):  CdMovieProcessEndCheck ORs three semaphore handles;
++        //                      callers only test the result for zero/non-zero.
+         class CdModuleService final : public IopService
+         {
+         public:
+@@ -37,23 +61,62 @@ namespace ps2x::iop::detail
+             [[nodiscard]] std::string_view name() const override { return m_bindings.serviceName; }
+             [[nodiscard]] std::span<const uint32_t> sids() const override { return m_sids; }
+ 
+-            void reset() override {}
++            void reset() override { m_movie = MovieStreamState{}; }
+ 
+             [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
+             {
+-                RpcResult result;
+                 if (request.sid != m_bindings.sid)
+                 {
+-                    return result;
++                    return RpcResult{};
+                 }
+-                if (request.function != m_bindings.readFunction)
++
++                if (request.function == m_bindings.readFunction)
+                 {
+-                    // Any other CDMODULE function (init, seek-only, etc.) is left to
+-                    // the existing generic RPC fallback: this service only models the
+-                    // read path closed in FASE I/J.
+-                    return result;
++                    return handleRead(request);
++                }
++                if (request.function == m_bindings.movieStartFunction)
++                {
++                    return handleMovieStart(request);
++                }
++                if (request.function == m_bindings.movieTransferFunction)
++                {
++                    return handleMovieTransfer(request);
++                }
++                if (request.function == m_bindings.movieCloseFunction)
++                {
++                    return handleMovieClose(request);
++                }
++                if (request.function == m_bindings.movieStatusFunction)
++                {
++                    return handleMovieStatus(request);
+                 }
+ 
++                // Any other CDMODULE function (init, seek-only, EE_TransSize query,
++                // etc.) is left to the existing generic RPC fallback: this service
++                // only models the operations closed in FASE I/J (fno=2) and
++                // BLOCKER_003 (fno 9/0xA/0xC/0xD).
++                return RpcResult{};
++            }
++
++        private:
++            // Session state for a single in-flight movie/PSS stream. One CDMODULE
++            // sid only ever drives one movie at a time in the demonstrated protocol
++            // (fno=9 always precedes the fno=0xA chunk sequence for a given file), so
++            // a single slot is sufficient -- see the BLOCKER_003 note for the
++            // dynamic evidence (title.pss -> menu -> demo1.pss, no overlap observed).
++            struct MovieStreamState
++            {
++                bool active = false;
++                uint32_t resourceId = 0u;
++                uint32_t lba = 0u;
++                uint64_t totalSize = 0u;
++                uint64_t bytesConsumed = 0u;
++            };
++
++            [[nodiscard]] RpcResult handleRead(const RpcRequest &request)
++            {
++                RpcResult result;
++
+                 if (request.send.address == 0u ||
+                     request.send.size < m_bindings.minimumRequestBytes)
+                 {
+@@ -182,7 +245,222 @@ namespace ps2x::iop::detail
+                 return result;
+             }
+ 
+-        private:
++            [[nodiscard]] RpcResult handleMovieStart(const RpcRequest &request)
++            {
++                RpcResult result;
++
++                if (request.send.address == 0u ||
++                    request.send.size < m_bindings.minimumRequestBytes)
++                {
++                    logMovieWarning("start: malformed request (send buffer missing or too short)");
++                    return result;
++                }
++
++                uint32_t resourceId = 0u;
++                uint32_t lba = 0u;
++                uint32_t totalSize = 0u;
++                // request+4/+8 already carry the resolved LBA/total size by the time
++                // this RPC reaches the IOP -- CallCdModule fills them from the same
++                // 0x507C50 resource table it uses for fno=2, unconditionally for the
++                // whole {2,3,7,9} dispatch block (see BLOCKER_003 note). No table
++                // lookup is needed on this side.
++                if (!m_host.readGuest(request.send.address + m_bindings.requestResourceIdOffset,
++                                      &resourceId, sizeof(resourceId)) ||
++                    !m_host.readGuest(request.send.address + m_bindings.requestLbaOffset,
++                                      &lba, sizeof(lba)) ||
++                    !m_host.readGuest(request.send.address + m_bindings.requestSizeOffset,
++                                      &totalSize, sizeof(totalSize)))
++                {
++                    logMovieWarning("start: failed to read request fields from guest memory");
++                    return result;
++                }
++
++                m_movie = MovieStreamState{};
++                m_movie.active = true;
++                m_movie.resourceId = resourceId;
++                m_movie.lba = lba;
++                m_movie.totalSize = totalSize;
++                m_movie.bytesConsumed = 0u;
++
++                m_host.log(LogLevel::Info,
++                           '[' + m_bindings.serviceName + "/MOVIE:start] resourceId=0x" +
++                               toHex(resourceId) + " lba=0x" + toHex(lba) +
++                               " totalSize=0x" + toHex(totalSize));
++
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                // CdMovieReadProcess returns request+8 (the total size) once the
++                // (real) reader/transfer threads are started.
++                writeTransferCountResponse(request.receive, totalSize);
++                return result;
++            }
++
++            [[nodiscard]] RpcResult handleMovieTransfer(const RpcRequest &request)
++            {
++                RpcResult result;
++
++                if (request.send.address == 0u ||
++                    request.send.size < m_bindings.minimumRequestBytes)
++                {
++                    logMovieWarning("transfer: malformed request (send buffer missing or too short)");
++                    return result;
++                }
++
++                if (!m_movie.active)
++                {
++                    // fno=0xA without a preceding fno=9 start: nothing to serve.
++                    // Left unhandled rather than fabricating a session -- the
++                    // contract only defines behavior for a started stream.
++                    logMovieWarning("transfer: no active movie session (fno=9 not called first)");
++                    return result;
++                }
++
++                uint32_t requested = 0u;
++                uint32_t dest = 0u;
++                // Both fields must be re-read on every call: CallCdModule rewrites
++                // request+0xC unconditionally on every invocation (dest is not
++                // cacheable from fno=9 -- dynamically demonstrated to advance
++                // between successive fno=0xA calls), and request+0x8 here is the
++                // per-call requested chunk size (a distinct reuse of the same byte
++                // offset that holds the resource's total size for fno=9).
++                if (!m_host.readGuest(request.send.address + m_bindings.requestSizeOffset,
++                                      &requested, sizeof(requested)) ||
++                    !m_host.readGuest(request.send.address + m_bindings.requestDestOffset,
++                                      &dest, sizeof(dest)))
++                {
++                    logMovieWarning("transfer: failed to read request fields from guest memory");
++                    return result;
++                }
++
++                uint32_t normalizedDest = 0u;
++                if (dest == 0u ||
++                    !m_host.normalizeGuestAddress(dest, normalizedDest) ||
++                    normalizedDest >= kEeRamSize ||
++                    requested > kEeRamSize - normalizedDest)
++                {
++                    logMovieWarning("transfer: destination address/size out of EE RAM bounds");
++                    return result;
++                }
++
++                // How many real bytes are left in the resource. Once this reaches
++                // zero, further fno=0xA calls copy nothing but still echo back
++                // `requested` -- the real CdMovieTransProc never uses a smaller
++                // response to signal EOF (see the writeTransferCountResponse call
++                // below).
++                const uint64_t remaining = (m_movie.bytesConsumed < m_movie.totalSize)
++                                                ? (m_movie.totalSize - m_movie.bytesConsumed)
++                                                : 0u;
++                const uint32_t toCopy =
++                    static_cast<uint32_t>(std::min<uint64_t>(requested, remaining));
++
++                bool copied = true;
++                if (toCopy > 0u)
++                {
++                    const std::string imagePath = m_host.hostPath(HostPathKind::CdImage);
++                    if (imagePath.empty())
++                    {
++                        logMovieWarning("transfer: no CD image configured, cannot service chunk");
++                        return result;
++                    }
++
++                    const uint64_t handle = m_host.openHostFile(imagePath);
++                    if (handle == 0u)
++                    {
++                        logMovieWarning("transfer: failed to open CD image '" + imagePath + "'");
++                        return result;
++                    }
++
++                    const uint64_t byteOffset =
++                        static_cast<uint64_t>(m_movie.lba) * m_bindings.sectorSize +
++                        m_movie.bytesConsumed;
++                    copied = copyHostRangeToGuest(handle, byteOffset, dest, toCopy);
++                    m_host.closeHostFile(handle);
++                }
++                // When toCopy==0 (resource exhausted), nothing is written to `dest`
++                // at all -- any bytes beyond what was actually copied are left
++                // untouched rather than zero-filled or fabricated. The real IRX
++                // leaves genuine leftover Trans_buffer content there in the
++                // equivalent case; this service does not attempt to reproduce that
++                // byte-for-byte, only "no invented data" is preserved.
++
++                if (!copied)
++                {
++                    logMovieWarning("transfer: short read or guest write failure while servicing chunk");
++                    return result;
++                }
++
++                const uint32_t offsetBefore = static_cast<uint32_t>(m_movie.bytesConsumed);
++                m_movie.bytesConsumed += toCopy;
++
++                m_host.log(LogLevel::Info,
++                           '[' + m_bindings.serviceName + "/MOVIE:chunk] offset=0x" +
++                               toHex(offsetBefore) + " requested=0x" + toHex(requested) +
++                               " copied=0x" + toHex(toCopy) + " dest=0x" + toHex(dest) +
++                               " remaining=0x" +
++                               toHex(static_cast<uint32_t>(
++                                   m_movie.totalSize > m_movie.bytesConsumed
++                                       ? m_movie.totalSize - m_movie.bytesConsumed
++                                       : 0u)));
++
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                // The real CdMovieTransProc echoes back `request+8` (the requested
++                // size) as EE_TransSize unconditionally -- dma.qwc = *(request+8),
++                // used directly without rounding, and EE_TransSize is set to that
++                // same value after the DMA (BLOCKER_003 note, "fno=0xA" section).
++                // `toCopy` (which may be less than `requested` near EOF) is only
++                // used internally to bound the host read/guest write; it is
++                // deliberately NOT what gets echoed back.
++                writeTransferCountResponse(request.receive, requested);
++                return result;
++            }
++
++            [[nodiscard]] RpcResult handleMovieClose(const RpcRequest &request)
++            {
++                RpcResult result;
++
++                const uint32_t bytesConsumed = static_cast<uint32_t>(m_movie.bytesConsumed);
++                m_movie = MovieStreamState{};
++
++                m_host.log(LogLevel::Info,
++                           '[' + m_bindings.serviceName + "/MOVIE:close] bytesConsumed=0x" +
++                               toHex(bytesConsumed));
++
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                // MovieExit's real return-value contract has not been
++                // reconstructed (BLOCKER_003 note); 0 is a conservative
++                // placeholder, not a demonstrated value. What matters
++                // observably -- the session resetting so a later fno=9 can
++                // start cleanly -- is handled above.
++                writeTransferCountResponse(request.receive, 0u);
++                return result;
++            }
++
++            [[nodiscard]] RpcResult handleMovieStatus(const RpcRequest &request)
++            {
++                RpcResult result;
++
++                // CdMovieProcessEndCheck ORs three semaphore handles; every caller
++                // observed only tests the result for zero/non-zero (BLOCKER_003
++                // note, "fno=0xD" section), never against a specific non-zero
++                // constant. Modeled as: non-zero while a session is active and
++                // still has unconsumed bytes, zero once the stream has naturally
++                // drained or been closed. The exact non-zero value is not
++                // demonstrated and observably does not matter.
++                const bool alive = m_movie.active && (m_movie.bytesConsumed < m_movie.totalSize);
++                const uint32_t status = alive ? 1u : 0u;
++
++                m_host.log(LogLevel::Info,
++                           '[' + m_bindings.serviceName + "/MOVIE:status] alive=" +
++                               (alive ? std::string("1") : std::string("0")));
++
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                writeTransferCountResponse(request.receive, status);
++                return result;
++            }
++
+             bool copyHostRangeToGuest(uint64_t handle, uint64_t offset, uint32_t destination, uint32_t byteCount)
+             {
+                 std::array<uint8_t, 16 * 1024> chunk{};
+@@ -223,6 +501,11 @@ namespace ps2x::iop::detail
+                 m_host.log(LogLevel::Warning, '[' + m_bindings.serviceName + "] " + message);
+             }
+ 
++            void logMovieWarning(const std::string &message) const
++            {
++                m_host.log(LogLevel::Warning, '[' + m_bindings.serviceName + "/MOVIE] " + message);
++            }
++
+             void logUnsupported(uint8_t mode, uint32_t size) const
+             {
+                 m_host.log(LogLevel::Warning,
+@@ -260,6 +543,7 @@ namespace ps2x::iop::detail
+             IopHost &m_host;
+             CdModuleBindings m_bindings;
+             std::array<uint32_t, 1> m_sids;
++            MovieStreamState m_movie;
+         };
+     }
+ 

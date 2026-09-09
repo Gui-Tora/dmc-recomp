@@ -7,6 +7,10 @@
     {
       "path": "patches/BLOCKER_002_cdmodule_service.patch",
       "sha256": "14ed8b81e45faf0e819beef7bd5a6bc46542b5113f892867b6c6f2ca6fe3a973"
+    },
+    {
+      "path": "patches/BLOCKER_003_cdmodule_movie_streaming.patch",
+      "sha256": "e7da13f9aba86b2f22ead8eac3bcb237638b4fc3e26fbfaa0a0a5a308581a356"
     }
   ],
   "patch_identity": {
@@ -15,5 +19,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "3c42d63ed14890e6f1ca8190e8f3b492a802898f"
+  "patched_commit": "eaa4fe47d01f8a74a20ff0b5f65b9862ee4c3afc"
 }

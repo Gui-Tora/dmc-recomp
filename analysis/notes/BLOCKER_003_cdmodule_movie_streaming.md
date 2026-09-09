@@ -2,17 +2,59 @@
 
 ## Estado
 
-`OPEN / CAUSE CONFIRMED`, implementación no iniciada.
+**`RESOLVED`** — con alcance explícito: **CD/PSS transport arreglado**. Ver
+"Alcance del RESOLVED" más abajo antes de asumir nada sobre la imagen en
+pantalla — esa capa sigue rota y se investiga por separado en
+`BLOCKER_004_pss_video_output.md`.
 
-No es un bug de pantalla negra, ni un bug de `demo1.pss`, ni de `title.pss`.
-La causa es general y afecta a cualquier reproducción de película que use
-este protocolo:
+No fue un bug de pantalla negra, ni un bug de `demo1.pss`, ni de
+`title.pss`. La causa era general y afectaba a cualquier reproducción de
+película que usara este protocolo:
 
 **El protocolo de streaming de `CDMODULE.IRX` para películas PSS (`fno`
-`9`/`0xA`/`0xC`/`0xD`) no está implementado en `CdModuleService` de RECOMP.**
-`CdModuleService` únicamente maneja `fno=2` (lectura simple, contrato
-cerrado en BLOCKER_002). Las llamadas de movie caen en el *fallback*
-genérico de RPC no manejada.
+`9`/`0xA`/`0xC`/`0xD`) no estaba implementado en `CdModuleService` de
+RECOMP.** `CdModuleService` únicamente manejaba `fno=2` (lectura simple,
+contrato cerrado en BLOCKER_002). Las llamadas de movie caían en el
+*fallback* genérico de RPC no manejada.
+
+## Alcance del RESOLVED — leer antes de asumir nada
+
+Lo que este blocker demuestra arreglado:
+
+- `fno=9/0xA/0xC/0xD` manejados por `CdModuleService`, sin caer en el
+  *fallback* genérico.
+- LBA y tamaño total resueltos correctamente desde la tabla de recursos
+  del juego (verificado contra 3 archivos `.PSS` reales distintos en
+  ejecución: `TITLEP.PSS`, `DEMO1P.PSS`, `DEMO0P.PSS`).
+- Bytes reales copiados desde la ISO al `dest` EE que pide cada `fno=0xA`,
+  con el `dest` re-leído en cada llamada (no cacheado).
+- EOF correcto por conteo de bytes contra el tamaño real del archivo
+  (último chunk corta exactamente en el resto matemático, sin usarlo como
+  señal hacia el EE).
+- Sesiones de movie consecutivas sin estado residual (segunda y tercera
+  reproducción arrancan limpias aunque `fno=0xC` no siempre se haya visto
+  disparar entre ellas).
+- Cero crashes, cero `missing-target`, cero RPC `unhandled` para estos
+  cuatro `fno` en 8 minutos de ejecución real.
+- **Validación visual manual** (usuario, build local): el juego llega al
+  menú principal, el *timeout* del menú dispara `DEMO1.PSS` correctamente,
+  y el input del mando durante `DEMO1` la interrumpe y vuelve al menú —
+  es decir, **la máquina de estados EE que consume estas RPCs se comporta
+  con normalidad** cuando recibe datos reales en vez del eco de basura
+  anterior.
+
+Lo que **NO** demuestra arreglado, y no se debe afirmar a partir de este
+blocker:
+
+- Que las películas se rendericen correctamente.
+- Que el decodificador MPEG funcione.
+- Que la reproducción de vídeo esté arreglada.
+
+La propia validación visual demuestra lo contrario en esas capas: el logo
+CAPCOM no se ve correctamente, y durante `DEMO1` la pantalla permanece
+negra pese a que el transporte CD/PSS ya entrega los bytes reales
+correctos. Esa divergencia se abre y se investiga en
+`BLOCKER_004_pss_video_output.md` — no se resuelve ni se toca aquí.
 
 ## Cadena causal
 
@@ -214,3 +256,71 @@ de juego EE, ortogonal al protocolo `CDMODULE`. Se localizó parcialmente
 (tabla de selección `0x5072B0`, indexada por un contador de estado en
 `state+108`) pero no se completó — no hace falta para que el HLE de
 streaming funcione con cualquier `resourceId` que el juego pida.
+
+## Implementación
+
+`CdModuleService` (`vendor/PS2Recomp/ps2xIOP/src/modules/cdmodule.cpp`)
+gana un `MovieStreamState` (miembro simple: `active`, `resourceId`, `lba`,
+`totalSize`, `bytesConsumed`) y cuatro manejadores nuevos, sin hilos ni
+semáforos:
+
+- `fno=9`: lee `resourceId`/`lba`/`totalSize` directamente del packet
+  (`request+0/+4/+8`, ya resueltos por `CallCdModule` en el EE contra la
+  misma tabla `0x507C50` que usa `fno=2` — no hay lookup propio en el
+  HLE), inicializa la sesión, devuelve `totalSize`.
+- `fno=0xA`: relee `dest`(`request+0xC`) y `requested`(`request+0x8`) en
+  cada llamada; copia `min(requested, bytesRestantes)` desde la ISO al
+  `dest`; **siempre** devuelve `requested` tal cual (nunca un valor menor
+  para señalizar EOF, tal como demuestra el original). Cuando el recurso
+  ya se agotó, copia 0 bytes y no toca el resto del rango pedido en
+  `dest` — no se inventan datos ni se rellena con ceros.
+- `fno=0xC`: resetea `MovieStreamState` a su valor por defecto. El valor
+  de retorno real de `MovieExit` no está reconstruido; se devuelve `0`
+  como placeholder explícito, no como dato demostrado.
+- `fno=0xD`: `alive = active && bytesConsumed < totalSize`; devuelve `1`/`0`.
+  El valor no-cero exacto del original (OR de tres handles de semáforo)
+  no importa observablemente — todo consumidor visto solo compara contra
+  cero.
+
+Nuevos campos en `CdModuleBindings`
+(`vendor/PS2Recomp/ps2xIOP/src/module_factories.h`):
+`movieStartFunction=9`, `movieTransferFunction=0xA`,
+`movieCloseFunction=0xC`, `movieStatusFunction=0xD`. `fno=8` no se
+implementa — apareció una sola vez cerca del arranque en las capturas
+revisadas, fuera del bucle de chunks, y no bloqueaba el contrato.
+
+Reproducibilidad: el diff se capturó como
+`patches/BLOCKER_003_cdmodule_movie_streaming.patch`, añadido a
+`upstream.lock.json` (`patches[]`) con un nuevo `patched_commit`
+recalculado con el mismo mecanismo determinista que BLOCKER_002
+(`commit-tree` sobre el baseline + ambos patches en orden, misma
+`patch_identity`) — no se editó el campo a mano.
+
+## Validación
+
+**Automatizada (`pipeline.py run`, `PS2X_CD_IMAGE` real, sin interacción)**,
+8 minutos continuos, cierre limpio por fin de ventana (no timeout, no
+crash):
+
+- 4 arranques de película (`fno=9`), los 4 con LBA/tamaño coincidiendo
+  exactamente con archivos reales de la ISO: `TITLEP.PSS` (×2),
+  `DEMO1P.PSS`, `DEMO0P.PSS` — el propio juego avanzó solo por
+  `title → demo1 → title → demo0` sin ninguna intervención.
+- 3.092 chunks (`fno=0xA`) sin error; el último de cada archivo corta
+  exactamente en el resto matemático real (p. ej. `0xC004` para
+  `TITLEP.PSS`), sin usarlo como señal de EOF.
+- `fno=0xD` reporta `alive=0` correctamente al agotarse cada stream.
+- Segunda y tercera sesión de movie arrancan limpias sin haber visto
+  `fno=0xC` disparar entre medias — confirma que resetear el estado
+  íntegramente en cada `fno=9` es la decisión de diseño correcta.
+- Único `unhandled` restante en todo el log: `fno=1` (`CdInit`) y
+  `fno=2 resourceId=0x56` (`FIRST.DAT`, `mode=2`) — limitaciones
+  preexistentes, fuera de alcance de este blocker, sin relación con
+  movie streaming.
+
+**Manual (usuario, misma build)**: el juego llega al menú principal; el
+*timeout* del menú dispara `DEMO1.PSS`; el input del mando durante
+`DEMO1` la interrumpe y vuelve al menú. **Pantalla negra durante la
+reproducción y logo CAPCOM incorrecto** — confirma que el transporte
+CD/PSS ya no es la causa de lo que se ve en pantalla; la causa está en
+una capa posterior (ver `BLOCKER_004_pss_video_output.md`).
