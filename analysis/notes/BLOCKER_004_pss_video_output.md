@@ -175,6 +175,54 @@ vigente de BLOCKER_004. **No implementado**: fix de `sceMpegInit`. Ver
 (auditoría de productores, diseño del fix, test aislado, comparación
 byte a byte por corrida).
 
+**Actualización (Prompt P3.13, SCEMPEGINIT_SESSION_OWNERSHIP_MATRIX_AND_REVERIFY,
+EXPERIMENTAL, no implementado como fix)**: matriz causal de 4 modos
+opt-in (`baseline`/`ownership`/`queued`/`full`, `DMC_P313_INIT_MODE`) para
+determinar qué continuidad de estado host through `sceMpegInit` hace falta
+para cruzar el primer `GetPicture`. Resultado, 3/3 por modo salvo
+baseline/ownership (1 corrida cada uno, sin sorpresas que ameritaran
+repetición): **ownership puro (callbacks+config+`sawInput` preservados,
+decoder/frames NO) es INSUFICIENTE** — sigue en `GP:H` idéntico a baseline.
+**Preservar la cola de 4 frames ya decodificados (`queued`) SÍ basta para
+cruzar el primer `GetPicture` caller-visible** (`[GP:CONT]`, boundary
+equivalente a `0x47A8EC`, 4/4 éxitos en las tres corridas) pero se detiene
+en exactamente esos 4 frames — cero frames nuevos post-init. **Preservar
+además el objeto decoder en vivo (`full`) SÍ sostiene progreso más allá de
+la cola**: 10 éxitos y 6 frames nuevos decodificados tras el init en las
+tres corridas, hasta agotar un recurso no relacionado
+(`RuntimeGuestArena`, hallazgo lateral, fuera de alcance). Clasificación:
+**QUEUED_OUTPUT_BRIDGE_REQUIRED**, con continuidad de decoder demostrada
+como requisito adicional de la arquitectura HLE ACTUAL para progreso
+sostenido — explícitamente NO una afirmación de equivalencia con el
+reset de hardware IPU/DMA real del original. **No implementado ningún fix
+de producción.** Ver `BLOCKER_004_P313_SCEMPEGINIT_OWNERSHIP_MATRIX.md`
+para la tabla de ownership completa, la auditoría de generación
+(`cdStreamGeneration`, riesgo latente confirmado pero no disparado en la
+corrida actual) y el detalle de las 8 corridas.
+
+**Actualización (Prompt P3.13.1, FULL_MODE_VISUAL_TRACE_AND_LANGUAGE_VARIATION,
+observacional puro)**: capturas densas (~500ms) de la ventana propia en 5
+corridas nuevas en modo `full` confirmaron, de forma independiente y
+automatizada, la **primera salida visual reconocible del juego en
+RECOMP**: la pantalla de advertencia de contenido violento, real y
+legible. Hallazgo clave: es una secuencia de DOS páginas (inglés+alemán+
+francés, luego italiano+español) que TODAS las corridas recorren en el
+mismo orden — la variación de idioma observada manualmente por el
+usuario en capturas sueltas queda explicada como distintos puntos de esa
+misma secuencia fija, capturados en momentos distintos por una carrera
+con el agotamiento de `RuntimeGuestArena` (mismo límite de recursos ya
+identificado en P3.13, reproducido 5/5 aquí también) — NO por selección
+de idioma de menú ni por nondeterminismo de estado del guest. Una
+hipótesis intermedia de correlación con el estado del menú antes de
+CROSS se formuló y se **RETRACTÓ explícitamente** dentro de la misma
+iteración al inspeccionar más capturas. Artefacto de renderizado real y
+reproducible confirmado por separado: el bloque en español aparece
+duplicado 2-3 veces en la página 2. Ningún fotograma de vídeo MPEG
+decodificado (CAPCOM logo, animación PSS) fue observado — solo texto de
+UI. No cambia ninguna conclusión causal de P3.13; `sceMpegInit` sigue
+siendo el bloqueo vigente. Ver
+`BLOCKER_004_P3131_VISUAL_LANGUAGE_TRACE.md` para el detalle completo.
+
 **Actualización**: la causa documentada originalmente (`PS2X_ENABLE_FFMPEG=OFF`,
 sección 2) ya se corrigió y se probó — ver sección 5. Con FFmpeg realmente
 activo apareció una divergencia **nueva y más profunda**, que es ahora la
@@ -4208,6 +4256,23 @@ etiquetas `GP:*`/`[MPEG:diag]` de prompts anteriores).
 
 ## Qué NO se ha hecho
 
+- (P3.13) No se implementó ningún fix de producción de `sceMpegInit` —
+  los 4 modos son sondas experimentales temporales opt-in, marcadas
+  explícitamente como tales en el código.
+- (P3.13) No se investigó ni corrigió el agotamiento de
+  `RuntimeGuestArena` observado 3/3 en modo `full` (hallazgo lateral,
+  fuera de alcance de la pregunta causal de este prompt).
+- (P3.13) No se determinó si `queued`/`full` producen salida visual de
+  película correcta — las capturas siguen sin contenido reconocible,
+  consistente con la limitación de renderizado GS ya conocida y fuera de
+  alcance.
+- (P3.13) No se disparó dinámicamente el riesgo de contradicción de
+  generación (`cdStreamGeneration`) identificado por Fable — confirmado
+  como mecanismo latente real (el único incrementador,
+  `notifyMpegCdStreamStart`, sigue siendo código muerto), pero no se
+  forzó un escenario donde se manifieste.
+- (P3.13) No se tocó `sceMpegGetPicture`, `waitExternal`, `waitVSync`, el
+  scheduler ni el orden del demux — confirmado explícitamente.
 - (P3.12) No se implementó ningún fix de `sceMpegInit` — instrucción
   explícita ("aislar UNA variable"). El over-reset de
   callbacks/config/ownership sigue exactamente como lo dejó P3.11.1.

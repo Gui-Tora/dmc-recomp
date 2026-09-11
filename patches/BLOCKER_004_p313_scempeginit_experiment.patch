@@ -1,0 +1,202 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index f9b8bb4..f5cf7a0 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -821,6 +821,127 @@ namespace ps2_stubs
+             return playback;
+         }
+ 
++        // ============================================================
++        // P3.13 experimental ownership matrix (temporary, causal probe only).
++        // See analysis/notes/BLOCKER_004_P313_SCEMPEGINIT_OWNERSHIP_MATRIX.md.
++        // Opt-in via DMC_P313_INIT_MODE; absent/invalid -> baseline, which is
++        // byte-for-byte the current P3.12 sceMpegInit behavior (callers never
++        // invoke applyP313OwnershipMode for baseline at all). Not a production
++        // design: MODE D in particular preserves state the original's real
++        // IPU/DMA hardware reset would not have an equivalent for.
++        // ============================================================
++        enum class P313InitMode
++        {
++            Baseline,
++            Ownership,
++            Queued,
++            Full
++        };
++
++        P313InitMode parseP313InitMode()
++        {
++            const char *raw = std::getenv("DMC_P313_INIT_MODE");
++            if (!raw || !*raw)
++            {
++                return P313InitMode::Baseline;
++            }
++            const std::string mode(raw);
++            if (mode == "baseline") return P313InitMode::Baseline;
++            if (mode == "ownership") return P313InitMode::Ownership;
++            if (mode == "queued") return P313InitMode::Queued;
++            if (mode == "full") return P313InitMode::Full;
++            std::cerr << "[P313:init] INVALID DMC_P313_INIT_MODE='" << mode
++                      << "' (expected baseline|ownership|queued|full) -- using baseline"
++                      << std::endl;
++            return P313InitMode::Baseline;
++        }
++
++        const char *p313ModeName(P313InitMode mode)
++        {
++            switch (mode)
++            {
++                case P313InitMode::Baseline: return "baseline";
++                case P313InitMode::Ownership: return "ownership";
++                case P313InitMode::Queued: return "queued";
++                case P313InitMode::Full: return "full";
++            }
++            return "?";
++        }
++
++        // Builds the POST-init replacement for one playback session from its
++        // PRE-init snapshot (oldPlayback), per the selected experimental mode.
++        // Only called for ownership/queued/full -- baseline never rebuilds a
++        // session at all (matches current P3.12: the map simply stays empty
++        // after resetMpegStubStateUnlocked(), exactly as today).
++        MpegPlaybackState applyP313OwnershipMode(P313InitMode mode, MpegPlaybackState &oldPlayback)
++        {
++            MpegPlaybackState fresh = makeFreshPlaybackState();
++            // MODE B (ownership) fields: logical software-session ownership and
++            // configuration -- state the ORIGINAL sceMpegInit's real hardware
++            // reset (stack/MMIO only, see BLOCKER_004_ASTRA_P311_OVERNIGHT.md
++            // section "Hallazgo estatico: contrato ORIGINAL") never touches in
++            // guest RAM, so it has no reason to disappear from the game's own
++            // point of view. Deliberately NOT copied here (left at fresh/reset
++            // defaults for every non-baseline mode): decoder, decodedFrames,
++            // streamEnded, decoderFailed, waitingForVideoSequenceHeader,
++            // videoSequenceSyncBuffer, frameRateCode/frameRateExtensionN/D/
++            // hasFrameRateExtension, videoTimingScanBuffer, pictureIntervalQ32,
++            // nextPictureTickQ32, presentationEndTickQ32, firstPresentedPts90k,
++            // ptsPresentationBaseTickQ32 -- all codec/parser/presentation
++            // pipeline state tied to the decoder object being destroyed (see
++            // the field table in the P3.13 report for the per-field
++            // justification).
++            fresh.width = oldPlayback.width;
++            fresh.height = oldPlayback.height;
++            fresh.decodeMode = oldPlayback.decodeMode;
++            fresh.imageBufferAddr = oldPlayback.imageBufferAddr;
++            fresh.sawInput = oldPlayback.sawInput;
++            fresh.sawSequenceEnd = oldPlayback.sawSequenceEnd;
++            fresh.picturesServed = oldPlayback.picturesServed;
++            fresh.pssBuffer = oldPlayback.pssBuffer;
++            fresh.pssGuestAddrs = oldPlayback.pssGuestAddrs;
++            // fresh.cdStreamGeneration is already correct: makeFreshPlaybackState()
++            // set it from g_mpeg_stub_state.cdStreamGeneration, which by the time
++            // this runs has already been restored to its pre-reset value by
++            // sceMpegInit. Intentionally NOT copied from oldPlayback -- see the
++            // generation audit in the P3.13 report.
++
++            if (mode == P313InitMode::Queued || mode == P313InitMode::Full)
++            {
++                // MODE C: bridge only the already-decoded OUTPUT queue, not the
++                // decoder that produced it. No presentation-timing field needs
++                // to accompany it: presentationTickForFrame()'s fresh defaults
++                // (nextPictureTickQ32==max, firstPresentedPts90k<0) already make
++                // the FIRST queued frame due immediately relative to "now" --
++                // verified by reading that function, not assumed.
++                fresh.decodedFrames = oldPlayback.decodedFrames;
++            }
++
++            if (mode == P313InitMode::Full)
++            {
++                // MODE D: full continuity, including the live decoder object and
++                // every remaining codec/parser/presentation field MODE B/C leave
++                // fresh. Experimental upper bound only.
++                fresh.decoder = std::move(oldPlayback.decoder);
++                fresh.streamEnded = oldPlayback.streamEnded;
++                fresh.decoderFailed = oldPlayback.decoderFailed;
++                fresh.waitingForVideoSequenceHeader = oldPlayback.waitingForVideoSequenceHeader;
++                fresh.videoSequenceSyncBuffer = oldPlayback.videoSequenceSyncBuffer;
++                fresh.frameRateCode = oldPlayback.frameRateCode;
++                fresh.frameRateExtensionN = oldPlayback.frameRateExtensionN;
++                fresh.frameRateExtensionD = oldPlayback.frameRateExtensionD;
++                fresh.hasFrameRateExtension = oldPlayback.hasFrameRateExtension;
++                fresh.videoTimingScanBuffer = oldPlayback.videoTimingScanBuffer;
++                fresh.pictureIntervalQ32 = oldPlayback.pictureIntervalQ32;
++                fresh.nextPictureTickQ32 = oldPlayback.nextPictureTickQ32;
++                fresh.presentationEndTickQ32 = oldPlayback.presentationEndTickQ32;
++                fresh.firstPresentedPts90k = oldPlayback.firstPresentedPts90k;
++                fresh.ptsPresentationBaseTickQ32 = oldPlayback.ptsPresentationBaseTickQ32;
++            }
++
++            return fresh;
++        }
++
+         uint16_t readBe16(const uint8_t *p)
+         {
+             return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8u) | static_cast<uint16_t>(p[1]));
+@@ -2766,6 +2887,31 @@ namespace ps2_stubs
+                 }
+             }
+         }
++        // P3.13 experimental ownership matrix: snapshot the PRE-reset state
++        // needed for the [P313:init] before/after log and, for non-baseline
++        // modes, for reconstruction after the reset. Computed generically over
++        // whatever keys g_mpeg_stub_state.playbackByMpeg/callbacksByMpeg
++        // currently hold -- never hard-codes a specific mpegAddr.
++        const P313InitMode p313Mode = parseP313InitMode();
++        size_t p313KeysBefore = 0u, p313FramesBefore = 0u, p313CallbackKeysBefore = 0u;
++        bool p313DecoderBefore = false, p313SawInputBefore = false;
++        for (const auto &kv : g_mpeg_stub_state.playbackByMpeg)
++        {
++            ++p313KeysBefore;
++            p313FramesBefore += kv.second.decodedFrames.size();
++            p313DecoderBefore = p313DecoderBefore || static_cast<bool>(kv.second.decoder);
++            p313SawInputBefore = p313SawInputBefore || kv.second.sawInput;
++        }
++        p313CallbackKeysBefore = g_mpeg_stub_state.callbacksByMpeg.size();
++
++        std::unordered_map<uint32_t, MpegPlaybackState> p313OldPlayback;
++        std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> p313OldCallbacks;
++        if (p313Mode != P313InitMode::Baseline)
++        {
++            p313OldPlayback = std::move(g_mpeg_stub_state.playbackByMpeg);
++            p313OldCallbacks = std::move(g_mpeg_stub_state.callbacksByMpeg);
++        }
++
+         const uint64_t cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+         const uint64_t cdStreamBytesProduced = g_mpeg_stub_state.cdStreamBytesProduced;
+         const uint64_t cdStreamBytesDemuxed = g_mpeg_stub_state.cdStreamBytesDemuxed;
+@@ -2778,6 +2924,37 @@ namespace ps2_stubs
+         g_mpeg_stub_state.cdStreamBytesDemuxed = cdStreamBytesDemuxed;
+         g_mpeg_stub_state.cdStreamEofPending = cdStreamEofPending;
+         g_mpeg_stub_state.currentCdStreamEofSeen = currentCdStreamEofSeen;
++
++        // P3.13: rebuild per the selected mode (baseline: nothing to do, the
++        // map stays empty exactly like current P3.12 behavior).
++        if (p313Mode != P313InitMode::Baseline)
++        {
++            for (auto &[key, oldState] : p313OldPlayback)
++            {
++                g_mpeg_stub_state.playbackByMpeg[key] = applyP313OwnershipMode(p313Mode, oldState);
++            }
++            g_mpeg_stub_state.callbacksByMpeg = std::move(p313OldCallbacks);
++        }
++
++        {
++            size_t keysAfter = 0u, framesAfter = 0u, callbackKeysAfter = g_mpeg_stub_state.callbacksByMpeg.size();
++            bool decoderAfter = false, sawInputAfter = false;
++            for (const auto &kv : g_mpeg_stub_state.playbackByMpeg)
++            {
++                ++keysAfter;
++                framesAfter += kv.second.decodedFrames.size();
++                decoderAfter = decoderAfter || static_cast<bool>(kv.second.decoder);
++                sawInputAfter = sawInputAfter || kv.second.sawInput;
++            }
++            std::cerr << "[P313:init] mode=" << p313ModeName(p313Mode)
++                      << " keysBefore=" << p313KeysBefore << " keysAfter=" << keysAfter
++                      << " callbackKeysBefore=" << p313CallbackKeysBefore << " callbackKeysAfter=" << callbackKeysAfter
++                      << " framesBefore=" << p313FramesBefore << " framesAfter=" << framesAfter
++                      << " decoderBefore=" << p313DecoderBefore << " decoderAfter=" << decoderAfter
++                      << " sawInputBefore=" << p313SawInputBefore << " sawInputAfter=" << sawInputAfter
++                      << std::endl;
++        }
++
+         if (std::getenv("DMC_P311_MPEG_DIAG"))
+             std::fprintf(stderr,"[P311:R1] init complete playbackKeys=%zu callbackKeys=%zu\n",g_mpeg_stub_state.playbackByMpeg.size(),g_mpeg_stub_state.callbacksByMpeg.size());
+         setReturnU32(ctx, 0u);

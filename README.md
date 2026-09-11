@@ -154,19 +154,35 @@ video. **Open.** Validated so far:
   segment is `sceMpegInit` ownership: the original resets IPU/DMA hardware
   on init but does not destroy the guest-side MPEG software session; the
   current HLE over-resets MPEG callbacks, configuration, and accepted-input
-  ownership on every init. Whether preserving the decoder/decoded-frame
-  state across that reset is itself sufficient or necessary is still
-  **unknown** — not yet implemented or validated.
+  ownership on every init.
+- An opt-in, four-mode experiment (not a production fix) established which
+  host state continuity the *current* HLE architecture actually needs to
+  cross that boundary: ownership/config continuity alone is insufficient;
+  preserving the already-decoded output queue bridges exactly the frames
+  already queued and no more; sustained post-init decoding additionally
+  requires the live FFmpeg decoder object to survive. None of this implies
+  original hardware preserves an equivalent decoder state — it only
+  characterizes what RECOMP's current architecture requires.
+- With that experiment, RECOMP renders recognizable game UI for the first
+  time (the multi-language content warning screen) — confirmed by
+  automated, owned-window screenshots, not just a single manual capture.
+  Apparent per-run language differences turned out to be the same fixed
+  two-page warning sequence sampled at different moments, not
+  nondeterministic language selection.
 - This is the first contractual divergence demonstrated *within the
   segment audited so far*, not a claim that it is the absolute first
   divergence since cold boot.
-- Visible movie/PSS playback does not work yet; the project remains **not
+- No recognizable decoded movie (CAPCOM logo/PSS) frame has been observed.
+  Visible movie/PSS playback does not work yet; the project remains **not
   playable**.
 
 Full history: [`analysis/notes/BLOCKER_004_pss_video_output.md`](analysis/notes/BLOCKER_004_pss_video_output.md)
-(canonical, cumulative) and the independent audits referenced from it
-(`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`, `BLOCKER_004_FABLE_P3111_CAUSAL_AUDIT.md`,
-`BLOCKER_004_P312_SCHEDULER_BATCH_ORDER.md`).
+(canonical, cumulative) and the independent audits/experiments referenced
+from it (`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`,
+`BLOCKER_004_FABLE_P3111_CAUSAL_AUDIT.md`,
+`BLOCKER_004_P312_SCHEDULER_BATCH_ORDER.md`,
+`BLOCKER_004_P313_SCEMPEGINIT_OWNERSHIP_MATRIX.md`,
+`BLOCKER_004_P3131_VISUAL_LANGUAGE_TRACE.md`).
 
 Known, currently out-of-scope limitations (not yet classified as blocking
 further progress):

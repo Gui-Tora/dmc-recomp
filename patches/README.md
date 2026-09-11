@@ -107,3 +107,23 @@ arriba). Los cuatro patches actualmente activos:
    - `analysis/notes/BLOCKER_004_P312_SCHEDULER_BATCH_ORDER.md` — diseño,
      implementación y validación byte-exacta del fix de orden de
      invocaciones pendientes (P3.12).
+
+5. `BLOCKER_004_p313_scempeginit_experiment.patch` (convención B).
+   **EXPERIMENTAL / NOT A PRODUCTION FIX.** Añade una matriz de 4 modos
+   opt-in (`DMC_P313_INIT_MODE=baseline|ownership|queued|full`) sobre
+   `sceMpegInit`, usada exclusivamente para determinar experimentalmente
+   qué continuidad de estado host hace falta para cruzar el primer
+   `sceMpegGetPicture` — no implementa ningún diseño de producción.
+   `baseline` (el valor por defecto cuando la variable está ausente) es
+   byte-a-byte idéntico al comportamiento validado en
+   `BLOCKER_004_runtime_p37_p312.patch`. Se preserva reproduciblemente
+   porque P3.14 construirá sobre este estado exacto ya validado
+   dinámicamente (8 corridas `full`, 3/3 y 5/5 reproducibles).
+   Documentación (no duplicada aquí):
+   - `analysis/notes/BLOCKER_004_P313_SCEMPEGINIT_OWNERSHIP_MATRIX.md` —
+     tabla de ownership completa, diseño de los 4 modos, resultados de
+     las 8 corridas (P3.13).
+   - `analysis/notes/BLOCKER_004_P3131_VISUAL_LANGUAGE_TRACE.md` —
+     seguimiento visual observacional, primera salida de UI reconocible
+     confirmada, resolución de la variación de idioma como secuencia
+     PAL fija de 2 páginas (P3.13.1).

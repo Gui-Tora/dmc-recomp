@@ -19,6 +19,10 @@
     {
       "path": "patches/BLOCKER_004_runtime_p37_p312.patch",
       "sha256": "1efe1e2ada188e760314cee414da9a698a69d74ad24226a1280a3c9fea40077f"
+    },
+    {
+      "path": "patches/BLOCKER_004_p313_scempeginit_experiment.patch",
+      "sha256": "8e3d77110d60e4f6597163118898292d9e2c4fca6fc215fcae3e470244417e00"
     }
   ],
   "patch_identity": {
@@ -27,5 +31,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "bea812535e0595697b4b28e1889e422553112b34"
+  "patched_commit": "ed83ab53fa4635715eb10b72bdfe9fa7469e26cd"
 }

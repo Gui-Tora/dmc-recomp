@@ -19,12 +19,14 @@ ap.add_argument('--target',default='[GP:H]')
 ap.add_argument('--diagnostics',action='store_true')
 ap.add_argument('--post-target',type=int,default=0,help='Observation seconds after target; no more inputs')
 ap.add_argument('--try-movie-skip',action='store_true',help='One Start pulse 5s after the observed GP:H stall, runtime channel only')
+ap.add_argument('--visual-trace',action='store_true',help='P3.13.1: dense (~500ms) owned-HWND screenshots + explicit before/after key-boundary captures. Adds no sleeps; does not change input timing.')
 args=ap.parse_args()
 if args.runs<1 or args.seconds<1:ap.error('runs and seconds must be positive')
 if args.try_movie_skip and (args.method!='runtime' or args.post_target<15 or args.target!='[GP:H]'):
     ap.error('Movie skip requires runtime method, GP:H target, and post-target >=15')
 keys=args.keys.split(',')
 keymap={'ENTER':(0x0d,0x1c),'X':(0x58,0x2d),'C':(0x43,0x2e)}
+buttonName={'ENTER':'START','X':'CROSS','C':'CIRCLE'}
 assert all(k in keymap for k in keys)
 u=c.WinDLL('user32',use_last_error=True)
 u.PostMessageW.argtypes=[w.HWND,w.UINT,w.WPARAM,w.LPARAM]
@@ -81,8 +83,9 @@ try:
         for k in ('DMC_P311_MPEG_DIAG','DMC_P311_RAM_PREINIT','DMC_P311_RAM_GETPICTURE'):env.pop(k,None)
         if args.diagnostics:env.update(DMC_P311_MPEG_DIAG='1',DMC_P311_RAM_PREINIT=str(d/'preinit.bin'),DMC_P311_RAM_GETPICTURE=str(d/'getpicture.bin'))
         meta=dict(run=d.name,timestamp=time.strftime('%Y-%m-%dT%H:%M:%S%z'),env={k:env[k] for k in ('PS2X_CD_IMAGE','PS2X_RUNTIME_ARENA_BASE','PS2X_RUNTIME_ARENA_LIMIT')},inputs=[],windows=[],milestones={},result='BOOT_ONLY',exe_sha256=hashlib.sha256(exe.read_bytes()).hexdigest())
-        meta['diagnostic_env']={k:v for k,v in env.items() if k.startswith('DMC_P311_')}
+        meta['diagnostic_env']={k:v for k,v in env.items() if k.startswith(('DMC_P311_','DMC_P313_'))}
         log=d/'runtime.log';proc=None;t=time.monotonic();last=0; captured=False; capture_step=0;skip_sent=False
+        visual_start=None; visual_step=-1; meta['visual_boundaries']=[]
         try:
             with log.open('wb') as f:
                 existing=subprocess.check_output(['powershell','-NoProfile','-Command',"@(Get-Process -Name 'dmc-recomp' -ErrorAction SilentlyContinue).Id | ConvertTo-Json -Compress"],creationflags=subprocess.CREATE_NO_WINDOW,text=True).strip()
@@ -107,6 +110,13 @@ try:
                         capture_step=int(elapsed//20)
                         try:ImageGrab.grab(window=wins[0]['hwnd']).save(d/f'state_{capture_step:02d}.png')
                         except Exception as e:meta['capture_error']=repr(e)
+                    if args.visual_trace and len(wins)==1:
+                        if visual_start is None:visual_start=elapsed
+                        step=int((elapsed-visual_start)*2)  # ~500ms cadence, bounded by the 250ms poll below
+                        if step>visual_step:
+                            visual_step=step
+                            try:ImageGrab.grab(window=wins[0]['hwnd']).save(d/f'visual_{int(elapsed*1000):06d}ms.png')
+                            except Exception as e:meta['capture_error']=repr(e)
                     if 'TARGET' in meta['milestones'] and 'PSS_REACHED' in meta['milestones']:
                         if args.try_movie_skip and not skip_sent and elapsed-meta['milestones']['TARGET']>=5:
                             tail=text[text.rfind('[GP:H]'):]
@@ -133,7 +143,12 @@ try:
                         hwnd=wins[0]['hwnd'];owner=w.DWORD();u.GetWindowThreadProcessId(hwnd,c.byref(owner))
                         if owner.value!=proc.pid:raise RuntimeError('Window ownership changed')
                         ImageGrab.grab(window=hwnd).save(d/f'input_{len(meta["inputs"])+1:02d}.png')
-                        key=keys[len(meta['inputs'])];vk,scan=keymap[key]
+                        key=keys[len(meta['inputs'])];vk,scan=keymap[key];btn=buttonName.get(key,key)
+                        if args.visual_trace:
+                            before_at=time.monotonic()-t
+                            try:ImageGrab.grab(window=hwnd).save(d/f'before_{btn}.png')
+                            except Exception as e:meta['capture_error']=repr(e)
+                            meta['visual_boundaries'].append(dict(phase='before_down',button=btn,key=key,elapsed=before_at,file=f'before_{btn}.png'))
                         if args.method=='runtime':
                             mask={'ENTER':0xFFF7,'X':0xBFFF,'C':0xDFFF}[key]
                             padfile.write_text(f'{mask:04X}');down=True
@@ -144,6 +159,11 @@ try:
                         time.sleep(.25)
                         if args.method=='runtime':padfile.write_text('FFFF');up=True
                         else:up=send_key(hwnd,vk,scan,True) if args.method=='sendinput' else bool(u.PostMessageW(hwnd,0x101,vk,1|(scan<<16)|(3<<30)))
+                        if args.visual_trace:
+                            after_at=time.monotonic()-t
+                            try:ImageGrab.grab(window=hwnd).save(d/f'after_{btn}.png')
+                            except Exception as e:meta['capture_error']=repr(e)
+                            meta['visual_boundaries'].append(dict(phase='after_release',button=btn,key=key,elapsed=after_at,file=f'after_{btn}.png'))
                         meta['inputs'].append(dict(at=elapsed,key=key,duration=.25,method=args.method,hwnd=hwnd,down=down,up=up,observed='MC_CHECK; bounded boot sequence; movie marker absent'))
                         time.sleep(1)
                         ImageGrab.grab(window=hwnd).save(d/f'after_{len(meta["inputs"]):02d}.png')
