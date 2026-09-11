@@ -4536,3 +4536,78 @@ Sin gameplay, cambios semánticos MPEG, commits, push ni builds masivos.
   imagen), el ciclo de `+0x28` entre películas, y las advertencias de
   FFmpeg `ac-tex damaged` (presentes pero sin correlación con el wrap,
   imagen resultante coherente — no bloqueante).
+
+- **P3.15** (informe completo: [BLOCKER_004_P315_GETPICTURE_PRESENTATION_CONTRACT.md](BLOCKER_004_P315_GETPICTURE_PRESENTATION_CONTRACT.md)):
+  audita el contrato guest-visible completo de `sceMpegGetPicture`.
+  **HECHO, por desensamblado directo**: `MpegMovieDecode` (único caller
+  en todo el binario) usa `bgez $v0` tras la llamada — trata 0 y 1 de
+  forma idéntica; solo un retorno NEGATIVO diverge (rama de error con
+  `printf`), y la HLE nunca retorna negativo. **El mismatch `v0=0`
+  (HLE) vs `v0=1` (original) queda descartado como causa de los
+  problemas visuales — mismatch real pero NO causal.** Hallazgo nuevo:
+  `MpegMovieDecode` contiene un bucle interno que llama a
+  `sceMpegGetPicture` repetidamente dentro de una sola invocación hasta
+  `sceMpegIsEnd()`, explicando los cientos de éxitos observados en
+  P3.14.2 dentro de pocas invocaciones guest. Nuevo candidato causal
+  (INFERENCIA fuerte, no confirmado): el caller bifurca según
+  `*(mpegAddr+0x08)` entre `Movie_set_loadimage3` (construcción de
+  paquete ancho×alto con patrones tipo GIFtag/GS — probable subida real
+  de textura) cuando es `0`, y `Movie_loadimage` (escritura a
+  direcciones fijas `0x1000A0xx`) cuando es distinto de `0`. Con el
+  `picturesServed` monótono actual de la HLE, la rama
+  `Movie_set_loadimage3` solo se ejecuta **una vez en toda la sesión**
+  (la primera imagen). No se implementó ningún cambio de código.
+  `CHECKPOINT_DECISION: EXPERIMENT_CHECKPOINT`.
+
+- **P3.15.1** (informe: [BLOCKER_004_P3151_GUEST_PRESENTATION_TRACE.md](BLOCKER_004_P3151_GUEST_PRESENTATION_TRACE.md)):
+  recibe una supuesta evidencia PCSX2 que afirmaba que la bifurcación
+  de P3.15 leía `mpegAddr+0x00` en vez de `+0x08`. **Verificación
+  independiente por decodificación byte a byte del ELF original
+  confirmó que P3.15 tenía razón** — la instrucción real en `0x47A900`
+  es `lw $v0, 0x8($s1)`; la evidencia recibida transcribió mal la
+  dirección (la instrucción que citaba existe, pero en `0x47A90C`, seis
+  instrucciones después). **No se retracta la bifurcación sobre
+  `mpegAddr+0x08`.** Lo que sí se retracta, con evidencia real y
+  verificada contra el código fuente del propio runtime
+  (`GIF_TADR`/`GIF_CHCR`, manejo de modo chain en
+  `PS2Memory::writeIORegister`): la caracterización de P3.15 de
+  `Movie_loadimage` como "probable IOP/SIF, no relacionado con GS" era
+  incorrecta — **`Movie_loadimage` dispara una transferencia DMA real
+  por el canal GIF (canal 2), es genuinamente parte de la vía de
+  presentación GS**, no un mecanismo ajeno. Esto significa que incluso
+  las imágenes posteriores a la primera SÍ alcanzan un camino de
+  presentación GS real (no una vía muerta, como P3.15 temía) — la
+  pregunta abierta de mayor valor pasa a ser si la cadena de tags GIF
+  que se dispara referencia realmente los píxeles frescos de
+  `imageAddr` (`0x79D680`), sin resolver todavía.
+  `CHECKPOINT_DECISION: NO_COMMIT` (solo corrección documental y traza
+  causal más profunda, sin cambios de código).
+
+- **P3.15.2** (informe: [BLOCKER_004_P3152_MOVIE_TAG_CHAIN_IMAGEADDR_DATAFLOW.md](BLOCKER_004_P3152_MOVIE_TAG_CHAIN_IMAGEADDR_DATAFLOW.md)):
+  responde la pregunta abierta de P3.15.1 con instrumentación dinámica
+  real y opt-in (`DMC_P3152_MOVIE_GIF_TRACE=1`, sobre el parser de
+  cadena DMA ya existente en el runtime, sin lógica nueva inventada).
+  **HECHO, exacto, 40/40 disparos observados**: la cadena de tags GIF
+  que `Movie_loadimage` dispara cada frame contiene un tag REF cuyo
+  origen es literalmente `imageAddr` (`0x79D680`, byte exacto) más 31
+  bandas consecutivas de 28672 bytes, cubriendo exactamente 917504
+  bytes = `512×448×4` — el tamaño exacto de una imagen RGBA32 de las
+  dimensiones ya confirmadas tanto en el original (PCSX2, P3.15.1)
+  como en la HLE. La cadena es estructuralmente idéntica en cada
+  disparo (dos slots de doble buffer, `0x773480`/`0x788580`,
+  alternando), consistente con "`Movie_set_loadimage3` configura una
+  vez, `Movie_loadimage` dispara repetidamente sobre el mismo buffer
+  ya actualizado" — un diseño coherente, no un defecto. **Retracta
+  parcialmente** la preocupación causal de P3.15 sobre `+0x08`
+  monótono (sección 24/28 del informe): no hay evidencia de que impida
+  la presentación de imágenes posteriores a la primera. El contrato
+  guest completo, desde `sceMpegGetPicture` hasta la entrega de la
+  cadena GIF ya confirmada correcta a la cola de transferencias
+  pendientes del runtime, queda verificado como coherente.
+  Clasificación: `MPEG_GUEST_CONTRACT_MATCHES` (con el formato exacto
+  de píxel — PSM dentro de BITBLTBUF — sin verificar, UNKNOWN).
+  `CHECKPOINT_DECISION: NO_COMMIT` (solo instrumentación de diagnóstico
+  opt-in, sin cambio de comportamiento). Próximo paso recomendado:
+  `P4.0 — GS_GUEST_TO_RUNTIME_PRESENTATION_CONTRACT` — cualquier
+  divergencia causal restante ya no parece estar del lado
+  guest/MPEG.

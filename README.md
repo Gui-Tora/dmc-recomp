@@ -185,11 +185,23 @@ video. **Open.** Validated so far:
   own capacity, and — for the first time in this investigation —
   recognizable decoded MPEG/PSS imagery (a fire/flame animation) renders
   on screen, reproducibly across independent runs.
-- Movie/render correctness is still incomplete: the HLE's
-  `sceMpegGetPicture` return value still differs from the value observed
-  on original hardware, and general rendering glitches remain open and
-  unrelated to this fix. Visible movie/PSS playback is not yet correct,
-  and the project remains **not playable**.
+- The guest-visible MPEG-to-presentation contract was then traced end to
+  end. `sceMpegGetPicture`'s return value (`v0`) does differ from what has
+  been observed on original hardware, but the game's only caller branches
+  on "negative vs non-negative", so that mismatch is not causal for the
+  missing video. Tracing further identified real game code
+  (`Movie_loadimage`) that constructs and repeatedly triggers a genuine
+  GIF DMA presentation chain — not, as first suspected, something
+  IOP/SIF-related. Forty captured real DMA triggers all reference the
+  exact same freshly-decoded image buffer `sceMpegGetPicture` writes:
+  the chain's data bands cover exactly 512×448×4 bytes starting at that
+  buffer's address, byte-for-byte. Within this validated scope, the MPEG
+  guest contract — decode, `GetPicture`, and the guest's own GIF DMA
+  submission — is consistent; any remaining visual corruption is now
+  understood to sit at or after the guest→runtime GIF/GS hardware
+  boundary (exact pixel-format/layout semantics not yet audited), not in
+  MPEG decode or transport. Visible movie/PSS playback is still not
+  correct, and the project remains **not playable**.
 
 Full history: [`analysis/notes/BLOCKER_004_pss_video_output.md`](analysis/notes/BLOCKER_004_pss_video_output.md)
 (canonical, cumulative) and the independent audits/experiments referenced
@@ -200,7 +212,10 @@ from it (`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`,
 `BLOCKER_004_P3131_VISUAL_LANGUAGE_TRACE.md`,
 `BLOCKER_004_P314_SYNCHRONOUS_GUEST_ES_REDECODE.md`,
 `BLOCKER_004_P3141_FABLE_SYNC_MPEG_AUDIT.md`,
-`BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md`).
+`BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md`,
+`BLOCKER_004_P315_GETPICTURE_PRESENTATION_CONTRACT.md`,
+`BLOCKER_004_P3151_GUEST_PRESENTATION_TRACE.md`,
+`BLOCKER_004_P3152_MOVIE_TAG_CHAIN_IMAGEADDR_DATAFLOW.md`).
 
 Known, currently out-of-scope limitations (not yet classified as blocking
 further progress):
