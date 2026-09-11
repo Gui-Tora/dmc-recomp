@@ -4443,3 +4443,96 @@ Loop local reproducido **3/3 PSS_REACHED**, Start→Cross mediante la API
 de override de pad existente, sin drivers. Script/instrucciones en
 `analysis/tools/runtime_loop/`. Intento posterior de Start no alcanzó título.
 Sin gameplay, cambios semánticos MPEG, commits, push ni builds masivos.
+
+## P3.12–P3.14 — fix de orden del scheduler, matriz de ownership de
+## `sceMpegInit`, redecode síncrono desde ES guest
+
+- **P3.12** (informe: [BLOCKER_004_P312_SCHEDULER_BATCH_ORDER.md](BLOCKER_004_P312_SCHEDULER_BATCH_ORDER.md)):
+  `EeScheduler::run()` drenaba `m_pendingInvocations` (FIFO) hacia
+  `GuestThread::invocations` (pila LIFO) en el orden equivocado,
+  invirtiendo cada lote de invocaciones encoladas (callbacks de demux
+  MPEG, IRQ, VBlank→GS, Alarm). Fix genérico de 2 sitios de consumo
+  (`.front()/pop_front()` → `.back()/pop_back()`). **HECHO, validado
+  3/3**: `viBuf` guest byte-exacto frente al ES MPEG esperado (SHA256
+  `127e3b62…b82c`). Commit `f2b216e` (checkpoint, no push).
+
+- **P3.13** (informe: [BLOCKER_004_P313_SCEMPEGINIT_OWNERSHIP_MATRIX.md](BLOCKER_004_P313_SCEMPEGINIT_OWNERSHIP_MATRIX.md),
+  seguimiento visual: [BLOCKER_004_P3131_VISUAL_LANGUAGE_TRACE.md](BLOCKER_004_P3131_VISUAL_LANGUAGE_TRACE.md)):
+  matriz experimental opt-in de 4 modos sobre `sceMpegInit`
+  (`baseline|ownership|queued|full`). **HECHO, 8 corridas**: ownership
+  sola es insuficiente (sigue el stall); `queued` (+4 tramas
+  preservadas) da exactamente 4 éxitos y nada más; `full` (+decoder
+  vivo preservado) da 10 éxitos pero 3/3 agota
+  `RuntimeGuestArena` (límite de recursos separado, fuera de alcance).
+  Primera UI reconocible confirmada (pantalla de warning PAL fija de 2
+  páginas — la "variación de idioma" observada manualmente era la misma
+  secuencia fija muestreada en distintos instantes, no aleatoriedad).
+  Ningún fotograma de película reconocible. Commit `3483f92`
+  (checkpoint experimental, no push).
+
+- **P3.14** (informe completo: [BLOCKER_004_P314_SYNCHRONOUS_GUEST_ES_REDECODE.md](BLOCKER_004_P314_SYNCHRONOUS_GUEST_ES_REDECODE.md)):
+  mecanismo opt-in (`DMC_P314_SYNC_REDECODE=1`) que, tras el reset
+  `ownership` de P3.13, alimenta un decoder FFmpeg **fresco** (no
+  preservado) directamente desde el ES lógicamente pendiente del propio
+  `viBuf` guest (cursor host-only, nunca escrito a RAM guest), en
+  fragmentos acotados de 4 KiB, antes de caer al `waitExternal`
+  existente. **HECHO, validado 4/4** (RUN_029–032): 10 éxitos síncronos
+  de `GetPicture` por corrida, cero dependencia de decoder/tramas
+  pre-init, cero `waitExternal` necesario, cero tramas fabricadas, y —
+  dentro de la ventana observada (~100 s) — cero agotamientos de
+  `RuntimeGuestArena` (a diferencia de `full`, que lo alcanzaba 3/3).
+  Capacidad real del ring buffer `viBuf` medida dinámicamente:
+  524288 bytes; el consumo máximo observado (517313 bytes) se mantuvo
+  por debajo, cerrando la duda de wraparound abierta durante la propia
+  validación. **Sigue sin observarse ninguna imagen de película
+  reconocible** — clasificado `SUSTAINED_SYNC_REDECODE` (nivel 2 de 3),
+  no `_WITH_VISIBLE_MOVIE`. `CHECKPOINT_DECISION: COMMIT_RECOMMENDED`
+  (commit propuesto, no ejecutado — pendiente de autorización explícita
+  en un prompt de checkpoint).
+
+- **P3.14.1** (auditoría adversarial independiente, informe:
+  [BLOCKER_004_P3141_FABLE_SYNC_MPEG_AUDIT.md](BLOCKER_004_P3141_FABLE_SYNC_MPEG_AUDIT.md)):
+  retracta parcialmente la clasificación `SUSTAINED_SYNC_REDECODE` de
+  P3.14 — demuestra que las 4 corridas en realidad terminan en un
+  **deadlock determinista de inanición del productor** a ~520 KiB
+  (~3.5% de la película): el cursor lineal de P3.14 nunca libera
+  espacio guest-visible del ring, así que `viBufBeginPut` deja de poder
+  escribir y el mismo hilo que alimentaría el demux queda suspendido.
+  Identifica la causa raíz completa: `viBufAddDMA` (el único consumidor
+  real) solo es alcanzable vía un callback `stream=false`
+  (`MpegNodataCallBack`) que el filtro de despacho de esta HLE nunca
+  invoca. La premisa causal de P3.14 (decoder fresco + ES guest
+  superviviente bastan) queda **confirmada y sobrevive** la auditoría;
+  la implementación del modelo productor/consumidor, no.
+
+- **P3.14.2** (informe completo: [BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md](BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md)):
+  corrige los dos defectos bloqueantes de P3.14.1. Implementa un
+  "Modelo B" (espejo host del efecto final guest-observable del
+  consumo, derivado y probado algebraicamente a partir de la fórmula
+  real de `viBufBeginPut` — no la mecánica real de dos fases, que
+  depende de un registro DMA/IPU de hardware no emulado) que libera
+  espacio real en `blockCursor`/`pendingBytes`, y corta el camino de
+  decode asíncrono (`feedElementaryStream`) mientras el síncrono tiene
+  ownership, eliminando el riesgo de que un resync destruya el decoder
+  en uso. **HECHO, validado 3/3 con el mismo ejecutable**: el antiguo
+  techo de ~517313 bytes/10 éxitos queda roto ~25× (≥250 éxitos
+  sostenidos de `GetPicture` por corrida), el ring cruza `capacity` dos
+  veces de forma reproducible (offsets de wrap idénticos en las 3
+  corridas), transporte CD/PSS continúa muy más allá del punto de
+  congelamiento anterior, y — **por primera vez en toda la
+  investigación de BLOCKER_004** — aparece una animación de
+  fuego/llamas reconocible y reproducible entre corridas
+  independientes en la pantalla, no solo la advertencia estática.
+  Clasificado `SUSTAINED_RING_SYNC_REDECODE_WITH_VISIBLE_MOVIE` (nivel
+  máximo de la escala). Limitación documentada honestamente: la
+  sub-rama de lectura partida a mitad de bloque nunca se ejerció
+  empíricamente (capacidad y tamaño de chunk resultaron múltiplos
+  exactos), así que la prueba de wrap byte-exacto es algebraica +
+  guarda de staleness limpia, no una comparación externa estricta.
+  `CHECKPOINT_DECISION: CHECKPOINT_P314_RECOMMENDED` (commit propuesto,
+  no ejecutado). Abierto explícitamente sin resolver: el valor de
+  retorno `v0` de GetPicture (HLE=0 vs original=1, candidato principal
+  para explicar por qué la advertencia UI sigue superpuesta a la
+  imagen), el ciclo de `+0x28` entre películas, y las advertencias de
+  FFmpeg `ac-tex damaged` (presentes pero sin correlación con el wrap,
+  imagen resultante coherente — no bloqueante).

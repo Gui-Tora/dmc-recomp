@@ -127,3 +127,32 @@ arriba). Los cuatro patches actualmente activos:
      seguimiento visual observacional, primera salida de UI reconocible
      confirmada, resolución de la variación de idioma como secuencia
      PAL fija de 2 páginas (P3.13.1).
+
+6. `BLOCKER_004_p314_sync_vibuf_redecode.patch` (convención B). Sobre
+   el `sceMpegInit` de `ownership` (P3.13), reemplaza el diseño de
+   "decoder preservado" por un decoder FFmpeg **fresco** post-init,
+   alimentado sincrónicamente desde el `viBuf` guest superviviente,
+   con consumo guest-visible espejado hacia `blockCursor`/
+   `pendingBytes` (Modelo B — efecto final observable, no la mecánica
+   real de dos fases, que depende de un registro DMA/IPU de hardware
+   no emulado por esta HLE) y ownership único de decode post-init
+   (corta el camino asíncrono mientras el síncrono está activo).
+   Corrige el deadlock determinista de inanición del productor a ~520
+   KiB que la auditoría P3.14.1 encontró en la primera versión de este
+   diseño. Validado 3/3 con el mismo ejecutable: techo antiguo roto
+   ~25× (≥250 éxitos sostenidos de `GetPicture`/corrida), ring cruza
+   `capacity` dos veces de forma reproducible, y aparece por primera
+   vez en toda la investigación de BLOCKER_004 imagen de
+   película/PSS reconocible (animación de fuego). Checkpoint de tipo
+   `FIX_CHECKPOINT_WITH_KNOWN_CAVEATS`, no cierre de BLOCKER_004 (ver
+   caveats documentados en el informe P3.14.2). Documentación (no
+   duplicada aquí):
+   - `analysis/notes/BLOCKER_004_P314_SYNCHRONOUS_GUEST_ES_REDECODE.md` —
+     diseño e implementación inicial, validación 4/4 dentro de la
+     ventana pre-inanición (P3.14).
+   - `analysis/notes/BLOCKER_004_P3141_FABLE_SYNC_MPEG_AUDIT.md` —
+     auditoría adversarial independiente que encontró el deadlock
+     determinista y el riesgo de doble ownership de decode (P3.14.1).
+   - `analysis/notes/BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md` —
+     diseño e implementación del Modelo B, ownership único de decode,
+     validación 3/3 con imagen de película reconocible (P3.14.2).

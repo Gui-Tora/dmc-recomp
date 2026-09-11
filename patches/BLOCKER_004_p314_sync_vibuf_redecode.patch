@@ -1,0 +1,421 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index f5cf7a0..4852bf3 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -17,6 +17,7 @@ extern "C"
+ #endif
+ 
+ #include <deque>
++#include <fstream>
+ #include <memory>
+ 
+ #include "Syscalls/Helpers/State.h"
+@@ -512,6 +513,19 @@ namespace ps2_stubs
+             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
+             int64_t firstPresentedPts90k = -1;
+             uint64_t ptsPresentationBaseTickQ32 = 0u;
++            // P3.14 experimental (temporary, causal probe only): host-side
++            // absolute cumulative count of video ES bytes fed to the P3.14
++            // synchronous decoder since the last sceMpegInit. As of P3.14.2
++            // this IS mirrored into guest RAM (rounded down to whole 2048-byte
++            // blocks) via blockCursor(+0x2C0)/pendingBytes(+0x2C8), so the
++            // guest's own producer (viBufBeginPut) sees real freed ring space.
++            // See analysis/notes/BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md.
++            uint32_t p314ConsumedEsBytes = 0u;
++            // P3.14.2: true once sceMpegInit has forced this playback under
++            // P3.14 synchronous-decode ownership. While true, the async PES
++            // path (feedElementaryStream) must not touch decoder/decodedFrames
++            // -- only the P3.14 sync path in sceMpegGetPicture may.
++            bool syncGuestEsDecodeActive = false;
+         };
+ 
+         struct MpegStreamCallbackEvent
+@@ -856,6 +870,15 @@ namespace ps2_stubs
+             return P313InitMode::Baseline;
+         }
+ 
++        // P3.14 experimental: single source of truth for whether the
++        // synchronous guest-ES redecode probe is enabled. Absent/non-"1" ->
++        // disabled, P3.13 behavior unchanged.
++        bool isP314SyncRedecodeEnabled()
++        {
++            const char *raw = std::getenv("DMC_P314_SYNC_REDECODE");
++            return raw != nullptr && std::string(raw) == "1";
++        }
++
+         const char *p313ModeName(P313InitMode mode)
+         {
+             switch (mode)
+@@ -939,6 +962,12 @@ namespace ps2_stubs
+                 fresh.ptsPresentationBaseTickQ32 = oldPlayback.ptsPresentationBaseTickQ32;
+             }
+ 
++            // P3.14.2: independent of mode, propagate whether this playback is
++            // under P3.14 synchronous-decode ownership. p314ConsumedEsBytes is
++            // deliberately NOT copied from oldPlayback -- it always restarts at
++            // 0 for a fresh session (see the P3.14 report, section 12).
++            fresh.syncGuestEsDecodeActive = isP314SyncRedecodeEnabled();
++
+             return fresh;
+         }
+ 
+@@ -1528,13 +1557,37 @@ namespace ps2_stubs
+                                 pes.pts90k,
+                                 pes.dts90k);
+                         }
+-                        feedElementaryStream(
+-                            playback,
+-                            mpegAddr,
+-                            buffer.data() + payloadStart,
+-                            packetEnd - payloadStart,
+-                            pes.pts90k,
+-                            pes.dts90k);
++                        // P3.14.2: with P3.14 sync-decode ownership active for
++                        // this playback, the async path must still deliver the
++                        // guest-visible callback event above (queueStreamCallbackEvent
++                        // -- that is what drives the guest's own viBufBeginPut/
++                        // viBufEndPut writes and +0x28 growth) but must NOT touch
++                        // the host decoder: feedElementaryStream() owns
++                        // decoder/decodedFrames/waitingForVideoSequenceHeader, and
++                        // a second owner risks decoder.reset()+decodedFrames.clear()
++                        // destroying the P3.14 sync decoder mid-use (see
++                        // BLOCKER_004_P3141_FABLE_SYNC_MPEG_AUDIT.md, defect #2).
++                        if (!playback.syncGuestEsDecodeActive)
++                        {
++                            feedElementaryStream(
++                                playback,
++                                mpegAddr,
++                                buffer.data() + payloadStart,
++                                packetEnd - payloadStart,
++                                pes.pts90k,
++                                pes.dts90k);
++                        }
++                        else
++                        {
++                            static std::atomic<uint32_t> s_diagP3142AsyncSkipped{0u};
++                            const uint32_t n = s_diagP3142AsyncSkipped.fetch_add(1u, std::memory_order_relaxed) + 1u;
++                            if (n <= 5u || (n % 200u) == 0u)
++                            {
++                                std::cerr << "[P3142:owner] async feedElementaryStream skipped (sync owns decode) #" << n
++                                          << " mpeg=0x" << std::hex << mpegAddr << std::dec
++                                          << " size=" << (packetEnd - payloadStart) << std::endl;
++                            }
++                        }
+                     }
+                 }
+                 else if (isAudioStreamId(streamId))
+@@ -2244,6 +2297,15 @@ namespace ps2_stubs
+             *reinterpret_cast<uint32_t *>(p + 4) = static_cast<uint32_t>(value >> 32);
+         }
+     }
++    // P3.14 experimental: read-only guest accessor, used to read the movie
++    // state's viBuf bookkeeping fields (base/total bytes written) without
++    // ever writing to them.
++    static uint32_t mpegGuestRead32(const uint8_t *rdram, uint32_t addr)
++    {
++        if (const uint8_t *p = getConstMemPtr(rdram, addr))
++            return *reinterpret_cast<const uint32_t *>(p);
++        return 0u;
++    }
+ 
+     void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+@@ -2631,6 +2693,273 @@ namespace ps2_stubs
+                           << " picturesServed=" << playback.picturesServed
+                           << std::endl;
+             }
++            // P3.14/P3.14.2 experimental (temporary, causal probe only): if the
++            // decoded-output queue is empty but the guest's own viBuf still
++            // holds logically-pending, unread video ES, attempt a bounded
++            // synchronous decode from that guest-owned ES BEFORE falling back
++            // to waitExternal. Does not touch waitExternal/waitVSync/the
++            // scheduler, does not bypass the existing have-frame path below,
++            // and never fabricates a frame -- only real decoder output is
++            // ever pushed to decodedFrames.
++            //
++            // P3.14.2 correction (see BLOCKER_004_P3141_FABLE_SYNC_MPEG_AUDIT.md
++            // and BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md): P3.14's
++            // read address was a linear, unbounded offset from viBufBase and
++            // never freed guest-visible ring space, so the real guest producer
++            // (viBufBeginPut) deterministically starved after ~520 KiB in 4/4
++            // runs. This block now (a) addresses the ring physically as
++            // base + (consumed % capacity) with a wrap-split read, (b) mirrors
++            // consumption back into the guest's own blockCursor(+0x2C0)/
++            // pendingBytes(+0x2C8) bookkeeping so viBufBeginPut's own
++            // free-space formula sees real freed space, and (c) guards against
++            // staleness. It deliberately does NOT invoke the real
++            // viBufAddDMA/MpegNodataCallBack guest callback chain: that chain's
++            // retirement math (getFIFOindex, func_47AE50) reads a live DMA/IPU
++            // hardware register (kernel address 0x1000B410) that this HLE
++            // architecture does not emulate -- see the P3.14.2 report, Model
++            // A/B decision.
++            if (playback.decodedFrames.empty() &&
++                isP314SyncRedecodeEnabled() &&
++                !playback.streamEnded &&
++                !playback.decoderFailed)
++            {
++                static std::atomic<uint32_t> s_diagP314Count{0u};
++                const uint32_t p314Idx = s_diagP314Count.fetch_add(1u, std::memory_order_relaxed) + 1u;
++                const bool p314Trace = p314Idx <= 12u;
++                static std::atomic<uint32_t> s_diagP3142RingCount{0u};
++                const uint32_t p3142RingIdx = s_diagP3142RingCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++                const bool p3142Trace = p3142RingIdx <= 20u;
++                static std::atomic<bool> s_diagP3142FirstWrap{false};
++                static std::atomic<bool> s_diagP3142SecondWrap{false};
++                static std::atomic<uint32_t> s_diagP3142WrapEventCount{0u};
++                static std::atomic<bool> s_diagP3142WrapDumped{false};
++                // Structural offset, statically confirmed (BLOCKER_004_ASTRA_P311_OVERNIGHT.md:
++                // "MPEG state+0x278" == mpegAddr): the movie/viBuf state that owns this
++                // mpeg handle sits exactly 0x278 bytes before it in guest RAM. DMC-specific,
++                // not a generic PS2/MPEG library assumption -- documented, not incidental.
++                const uint32_t movieState = mpegAddr - 0x278u;
++                const uint32_t viBufBase = mpegGuestRead32(rdram, movieState + 0x1Cu);
++                const uint32_t viBufCapacity = mpegGuestRead32(rdram, movieState + 0x20u);
++                const uint32_t videoBytesTotal = mpegGuestRead32(rdram, movieState + 0x28u);
++                // P3.14.2: DMA-tag ring size, statically confirmed = 0x100 (256)
++                // in MovieBufferInit (+0x68 init value) and independently
++                // consistent with capacity/2048 = 256 -- the divisor blockCursor
++                // wraps modulo in the real viBufAddDMA arithmetic.
++                const uint32_t dmaTagRingSize = mpegGuestRead32(rdram, movieState + 0x68u);
++                const uint32_t consumedBefore = playback.p314ConsumedEsBytes;
++                const uint32_t available = (videoBytesTotal > consumedBefore) ? (videoBytesTotal - consumedBefore) : 0u;
++                const bool decoderFreshAtEntry = !playback.decoder;
++                if (p314Trace)
++                {
++                    std::cerr << "[P314:GP] #" << p314Idx << " pre-sync mpeg=0x" << std::hex << mpegAddr
++                              << " movieState=0x" << movieState << " viBufBase=0x" << viBufBase << std::dec
++                              << " frames=0 decoderFresh=" << decoderFreshAtEntry
++                              << " viBufCapacity=" << viBufCapacity
++                              << " videoBytesTotal=" << videoBytesTotal
++                              << " consumedBefore=" << consumedBefore
++                              << " available=" << available << std::endl;
++                }
++                // Staleness guard (P3.14.2 Phase 7): the producer may only be
++                // trusted to have kept unconsumed bytes intact if the backlog
++                // never exceeded one full ring capacity. With guest-visible
++                // consumption mirroring active below, viBufBeginPut's own
++                // free-space check should prevent this from ever firing -- if
++                // it does, something is wrong (e.g. mirroring got out of sync)
++                // and it is safer to stop than to decode overwritten bytes.
++                const bool stale = viBufCapacity != 0u && available > viBufCapacity;
++                if (stale && p3142Trace)
++                {
++                    std::cerr << "[P3142:ring] STALE_DATA_DETECTED mpeg=0x" << std::hex << mpegAddr << std::dec
++                              << " available=" << available << " capacity=" << viBufCapacity
++                              << " -- refusing to decode, falling back to waitExternal" << std::endl;
++                }
++                if (available > 0u && viBufBase != 0u && viBufCapacity != 0u && !stale)
++                {
++                    if (!playback.decoder)
++                        playback.decoder = std::make_unique<MpegFfmpegDecoder>();
++                    constexpr uint32_t kP314ChunkBytes = 4096u; // matches observed real PES payload sizes; == 2*2048
++                    uint32_t fedBytes = 0u;
++                    uint32_t feedCalls = 0u;
++                    uint32_t wrapsThisCall = 0u;
++                    bool feedFailed = false;
++                    static thread_local std::vector<uint8_t> s_wrapScratch;
++                    while (playback.decodedFrames.empty() && fedBytes < available)
++                    {
++                        const uint32_t chunk = std::min(kP314ChunkBytes, available - fedBytes);
++                        const uint32_t physOffset = playback.p314ConsumedEsBytes % viBufCapacity;
++                        const uint8_t *src = nullptr;
++                        if (physOffset + chunk <= viBufCapacity)
++                        {
++                            src = getConstMemPtr(rdram, viBufBase + physOffset);
++                            // P3.14.2 Run-2 evidence: this session's chunking (4096B)
++                            // happens to divide capacity (524288B) evenly, so a
++                            // mid-chunk split read is never actually exercised in
++                            // practice -- every wrap lands exactly on a chunk
++                            // boundary (physOffset resets cleanly to 0). Dump the
++                            // boundary transition (tail of the ring just before the
++                            // reset + head just after) once, so the CONTINUITY of
++                            // the wraparound -- not the split-copy code path -- can
++                            // still be independently verified byte-for-byte.
++                            if (physOffset == 0u && playback.p314ConsumedEsBytes >= viBufCapacity &&
++                                !s_diagP3142WrapDumped.exchange(true, std::memory_order_relaxed))
++                            {
++                                const uint32_t tailLen = std::min<uint32_t>(256u, viBufCapacity);
++                                const uint8_t *tail = getConstMemPtr(rdram, viBufBase + viBufCapacity - tailLen);
++                                const uint32_t headLen = std::min<uint32_t>(256u, chunk);
++                                std::ofstream dump(
++                                    "analysis/local/p3142/wrap_event_dump.bin",
++                                    std::ios::binary | std::ios::trunc);
++                                if (dump && tail && src)
++                                {
++                                    dump.write(reinterpret_cast<const char *>(tail), tailLen);
++                                    dump.write(reinterpret_cast<const char *>(src), headLen);
++                                }
++                                std::cerr << "[P3142:ring] WRAP_BOUNDARY_DUMP mpeg=0x" << std::hex << mpegAddr << std::dec
++                                          << " viBufBase=0x" << std::hex << viBufBase << std::dec
++                                          << " capacity=" << viBufCapacity
++                                          << " tailLen=" << tailLen << " headLen=" << headLen
++                                          << " consumedAtWrap=" << playback.p314ConsumedEsBytes
++                                          << " -> analysis/local/p3142/wrap_event_dump.bin" << std::endl;
++                            }
++                        }
++                        else
++                        {
++                            // Wrap-split read (P3.14.2 Phase 7): the chunk crosses
++                            // the physical end of the ring. Never read past
++                            // viBufBase+capacity -- assemble a contiguous scratch
++                            // copy from the two physical spans instead.
++                            const uint32_t firstLen = viBufCapacity - physOffset;
++                            const uint32_t secondLen = chunk - firstLen;
++                            const uint8_t *p1 = getConstMemPtr(rdram, viBufBase + physOffset);
++                            const uint8_t *p2 = getConstMemPtr(rdram, viBufBase);
++                            if (!p1 || !p2)
++                            {
++                                break;
++                            }
++                            s_wrapScratch.resize(chunk);
++                            std::memcpy(s_wrapScratch.data(), p1, firstLen);
++                            std::memcpy(s_wrapScratch.data() + firstLen, p2, secondLen);
++                            src = s_wrapScratch.data();
++                            ++wrapsThisCall;
++                            s_diagP3142WrapEventCount.fetch_add(1u, std::memory_order_relaxed);
++                            // P3.14.2 Run-2 evidence (one-time only): dump the exact
++                            // physical spans and the assembled scratch buffer so the
++                            // wrap-split reassembly can be independently byte-verified
++                            // offline against a RAM snapshot, without relying on "the
++                            // decoder accepted it" as the only proof.
++                            if (!s_diagP3142WrapDumped.exchange(true, std::memory_order_relaxed))
++                            {
++                                std::ofstream dump(
++                                    "analysis/local/p3142/wrap_event_dump.bin",
++                                    std::ios::binary | std::ios::trunc);
++                                if (dump)
++                                {
++                                    dump.write(reinterpret_cast<const char *>(p1), firstLen);
++                                    dump.write(reinterpret_cast<const char *>(p2), secondLen);
++                                }
++                                std::cerr << "[P3142:ring] WRAP_DUMP mpeg=0x" << std::hex << mpegAddr << std::dec
++                                          << " viBufBase=0x" << std::hex << viBufBase << std::dec
++                                          << " physOffset=" << physOffset
++                                          << " capacity=" << viBufCapacity
++                                          << " firstLen=" << firstLen << " secondLen=" << secondLen
++                                          << " consumedBeforeThisChunk=" << playback.p314ConsumedEsBytes
++                                          << " -> analysis/local/p3142/wrap_event_dump.bin" << std::endl;
++                            }
++                        }
++                        if (!src)
++                        {
++                            break;
++                        }
++                        const bool fedOk = playback.decoder->feed(src, chunk, playback.decodedFrames);
++                        playback.p314ConsumedEsBytes += chunk;
++                        fedBytes += chunk;
++                        ++feedCalls;
++                        if (!fedOk)
++                        {
++                            feedFailed = true;
++                            break;
++                        }
++                    }
++                    if (feedFailed)
++                    {
++                        playback.decoderFailed = true;
++                    }
++                    if (fedBytes > 0u && dmaTagRingSize != 0u)
++                    {
++                        // P3.14.2 Model B (see report section 7-8): mirror the
++                        // FINAL guest-observable effect of consumption -- not the
++                        // real two-phase enqueue/retire mechanism (which depends
++                        // on unemulated DMA hardware, see the comment above this
++                        // block). Rounds DOWN to whole 2048-byte blocks so the
++                        // producer's own dest-position formula
++                        // (viBufBeginPut: base+((blockCursor+queuedBlocks)*2048
++                        // +pendingBytes)%capacity) stays exact: fractional-block
++                        // mirroring would desync the write cursor. queuedBlocks
++                        // (+0x2C4) is deliberately left untouched -- the net
++                        // effect of "enqueue then immediately fully retire the
++                        // same blocks" is queuedBlocks-neutral (derived and
++                        // proven in the P3.14.2 report, section 7).
++                        const uint32_t mirroredBlocks = playback.p314ConsumedEsBytes / 2048u;
++                        const uint32_t mirroredBytes = mirroredBlocks * 2048u;
++                        const uint32_t newBlockCursor = mirroredBlocks % dmaTagRingSize;
++                        const uint32_t newPendingBytes =
++                            (videoBytesTotal > mirroredBytes) ? (videoBytesTotal - mirroredBytes) : 0u;
++                        mpegGuestWrite32(rdram, movieState + 0x2C0u, newBlockCursor);
++                        mpegGuestWrite32(rdram, movieState + 0x2C8u, newPendingBytes);
++                        // P3.14.2: always trace calls that actually wrapped (up to a
++                        // generous cap), in addition to the first 20 calls overall --
++                        // needed to observe wrap behavior in long runs (hundreds of
++                        // GetPicture calls), not just the session's opening calls.
++                        const bool wrapTrace = wrapsThisCall > 0u &&
++                            s_diagP3142WrapEventCount.load(std::memory_order_relaxed) <= 50u;
++                        if (p3142Trace || wrapTrace)
++                        {
++                            const uint32_t freeSpace =
++                                (dmaTagRingSize >= 2u)
++                                    ? (dmaTagRingSize - 2u) * 2048u -
++                                          std::min(newPendingBytes, (dmaTagRingSize - 2u) * 2048u)
++                                    : 0u;
++                            std::cerr << "[P3142:ring] #" << p3142RingIdx << " mpeg=0x" << std::hex << mpegAddr << std::dec
++                                      << " producedTotal=" << videoBytesTotal
++                                      << " consumedTotal=" << playback.p314ConsumedEsBytes
++                                      << " capacity=" << viBufCapacity
++                                      << " dmaTagRingSize=" << dmaTagRingSize
++                                      << " newBlockCursor=" << newBlockCursor
++                                      << " newPendingBytes=" << newPendingBytes
++                                      << " freeSpaceApprox=" << freeSpace
++                                      << " bytesFed=" << fedBytes
++                                      << " wraps=" << wrapsThisCall << std::endl;
++                        }
++                        if (!s_diagP3142FirstWrap.load(std::memory_order_relaxed) &&
++                            videoBytesTotal > viBufCapacity)
++                        {
++                            s_diagP3142FirstWrap.store(true, std::memory_order_relaxed);
++                            std::cerr << "[P3142:ring] FIRST_WRAP producedTotal=" << videoBytesTotal
++                                      << " capacity=" << viBufCapacity << std::endl;
++                        }
++                        if (!s_diagP3142SecondWrap.load(std::memory_order_relaxed) &&
++                            videoBytesTotal > 2u * viBufCapacity)
++                        {
++                            s_diagP3142SecondWrap.store(true, std::memory_order_relaxed);
++                            std::cerr << "[P3142:ring] SECOND_WRAP producedTotal=" << videoBytesTotal
++                                      << " capacity=" << viBufCapacity << std::endl;
++                        }
++                    }
++                    if (p314Trace)
++                    {
++                        std::cerr << "[P314:GP] #" << p314Idx << " post-sync mpeg=0x" << std::hex << mpegAddr << std::dec
++                                  << " fedBytes=" << fedBytes << " feedCalls=" << feedCalls
++                                  << " framesAfter=" << playback.decodedFrames.size()
++                                  << " feedFailed=" << feedFailed << std::endl;
++                    }
++                }
++                else if (p314Trace && !stale)
++                {
++                    std::cerr << "[P314:GP] #" << p314Idx << " no guest ES available (available=0 or viBufBase=0) "
++                                 "-- falling back to waitExternal" << std::endl;
++                }
++            }
++
+             if (playback.decodedFrames.empty() &&
+                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
+                 !playback.streamEnded &&
+@@ -2892,7 +3221,23 @@ namespace ps2_stubs
+         // modes, for reconstruction after the reset. Computed generically over
+         // whatever keys g_mpeg_stub_state.playbackByMpeg/callbacksByMpeg
+         // currently hold -- never hard-codes a specific mpegAddr.
+-        const P313InitMode p313Mode = parseP313InitMode();
++        P313InitMode p313Mode = parseP313InitMode();
++        // P3.14 experimental: synchronous guest-ES redecode needs the SAME
++        // ownership-preserving reset P3.13's "ownership" mode already
++        // implements (logical session/callback/config/input ownership
++        // survives; decoder and decodedFrames do not). Force it, regardless
++        // of DMC_P313_INIT_MODE, and refuse the incompatible combination with
++        // DMC_P313_INIT_MODE=full loudly rather than silently mixing designs.
++        if (isP314SyncRedecodeEnabled())
++        {
++            if (p313Mode == P313InitMode::Full)
++            {
++                std::cerr << "[P314:init] DMC_P313_INIT_MODE=full is incompatible with "
++                             "DMC_P314_SYNC_REDECODE=1 -- overriding to the ownership baseline"
++                          << std::endl;
++            }
++            p313Mode = P313InitMode::Ownership;
++        }
+         size_t p313KeysBefore = 0u, p313FramesBefore = 0u, p313CallbackKeysBefore = 0u;
+         bool p313DecoderBefore = false, p313SawInputBefore = false;
+         for (const auto &kv : g_mpeg_stub_state.playbackByMpeg)

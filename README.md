@@ -172,9 +172,24 @@ video. **Open.** Validated so far:
 - This is the first contractual divergence demonstrated *within the
   segment audited so far*, not a claim that it is the absolute first
   divergence since cold boot.
-- No recognizable decoded movie (CAPCOM logo/PSS) frame has been observed.
-  Visible movie/PSS playback does not work yet; the project remains **not
-  playable**.
+- A follow-up design replaces the preserved-decoder experiment with a
+  fresh post-init FFmpeg decoder fed synchronously from the surviving
+  guest `viBuf` elementary stream. An independent adversarial audit
+  found this first version deadlocked deterministically after ~520 KiB
+  because no guest-visible consumption of the ring ever existed; a
+  follow-up fix mirrors that consumption back into the guest's own ring
+  bookkeeping and gives the synchronous path sole ownership of the host
+  decoder. Validated 3/3 with the same executable: the old ~517 KB /
+  10-picture ceiling is broken by roughly 25x (hundreds of sustained
+  `sceMpegGetPicture` successes per run), the ring recirculates past its
+  own capacity, and — for the first time in this investigation —
+  recognizable decoded MPEG/PSS imagery (a fire/flame animation) renders
+  on screen, reproducibly across independent runs.
+- Movie/render correctness is still incomplete: the HLE's
+  `sceMpegGetPicture` return value still differs from the value observed
+  on original hardware, and general rendering glitches remain open and
+  unrelated to this fix. Visible movie/PSS playback is not yet correct,
+  and the project remains **not playable**.
 
 Full history: [`analysis/notes/BLOCKER_004_pss_video_output.md`](analysis/notes/BLOCKER_004_pss_video_output.md)
 (canonical, cumulative) and the independent audits/experiments referenced
@@ -182,7 +197,10 @@ from it (`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`,
 `BLOCKER_004_FABLE_P3111_CAUSAL_AUDIT.md`,
 `BLOCKER_004_P312_SCHEDULER_BATCH_ORDER.md`,
 `BLOCKER_004_P313_SCEMPEGINIT_OWNERSHIP_MATRIX.md`,
-`BLOCKER_004_P3131_VISUAL_LANGUAGE_TRACE.md`).
+`BLOCKER_004_P3131_VISUAL_LANGUAGE_TRACE.md`,
+`BLOCKER_004_P314_SYNCHRONOUS_GUEST_ES_REDECODE.md`,
+`BLOCKER_004_P3141_FABLE_SYNC_MPEG_AUDIT.md`,
+`BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md`).
 
 Known, currently out-of-scope limitations (not yet classified as blocking
 further progress):
