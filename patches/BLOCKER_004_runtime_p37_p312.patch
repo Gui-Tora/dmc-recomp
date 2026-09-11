@@ -1,0 +1,1552 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index d365cb0..5e04b26 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -372,6 +372,13 @@ public:
+     uint32_t guestHeapBase() const;
+     uint32_t guestHeapEnd() const;
+     uint32_t guestHeapLimit() const;
++    // P3.7.1: RuntimeGuestArena accessors. GameHeapState (above) reflects
++    // what SetupHeap/EndOfHeap declared to the guest; RuntimeGuestArena is
++    // the separate, internal-only region backing guestMalloc and invocation
++    // stacks. See BLOCKER_004_pss_video_output.md section 16.
++    uint32_t runtimeArenaBase() const;
++    uint32_t runtimeArenaEnd() const;
++    uint32_t runtimeArenaLimit() const;
+     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+ 
+     void drainCompletedDmacHandlers(uint8_t *rdram);
+@@ -449,17 +456,56 @@ private:
+         bool free = true;
+     };
+ 
++    // P3.7.1: a single arena's free-list state, parameterized so the SAME
++    // allocator logic can back two INDEPENDENT regions: GameHeapState
++    // (what SetupHeap/EndOfHeap declare to the guest) and RuntimeGuestArena
++    // (internal-only, backs guestMalloc + invocation stacks). Before this
++    // split both concepts shared one instance of these fields, which let
++    // SetupHeap's HLE silently recollapse the region guestMalloc depended
++    // on -- see BLOCKER_004_pss_video_output.md sections 12-16 for the full
++    // evidence trail (P3.4-P3.7.1).
++    struct GuestArenaState
++    {
++        std::vector<GuestHeapBlock> blocks;
++        uint32_t base = 0;
++        uint32_t end = 0;
++        uint32_t limit = 0;
++        uint32_t suggestedBase = 0;
++        bool configured = false;
++        // P3.7.1.2 (C1/C2): true once this arena has been permanently
++        // decided as unusable (no valid explicit override was ever
++        // provided, or one was provided but was malformed). Distinct from
++        // `!configured` (not yet decided) -- once true, guestMalloc and
++        // friends must keep failing loudly forever, never silently fall
++        // back to an unverified heuristic range. Only ever set on
++        // RuntimeGuestArena; GameHeapState does not use this flag.
++        bool unavailable = false;
++    };
++
++    // P3.7.1.2 (C1/C2): outcome of reading the PS2X_RUNTIME_ARENA_BASE/
++    // LIMIT override. Absent and Invalid are deliberately distinct so the
++    // two cases can be logged differently, but both leave RuntimeGuestArena
++    // permanently unavailable -- see ensureRuntimeArenaInitializedLocked().
++    enum class RuntimeArenaOverrideResult
++    {
++        Absent,
++        Invalid,
++        Valid,
++    };
++
+     static uint32_t alignGuestHeapValue(uint32_t value, uint32_t alignment);
+     static bool isGuestHeapAlignmentValid(uint32_t alignment);
+     static uint32_t normalizeGuestHeapAlignment(uint32_t alignment);
+-    uint32_t clampGuestHeapBase(uint32_t guestBase) const;
+-    uint32_t clampGuestHeapLimit(uint32_t guestLimit) const;
+-    void resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit);
+-    void ensureGuestHeapInitializedLocked();
+-    int32_t findGuestHeapBlockIndexLocked(uint32_t guestAddr) const;
+-    uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
+-    void freeGuestBlockLocked(uint32_t guestAddr);
+-    void coalesceGuestHeapLocked();
++    uint32_t clampGuestHeapBase(uint32_t guestBase, uint32_t hardLimit) const;
++    uint32_t clampGuestHeapLimit(uint32_t guestLimit, uint32_t hardLimit) const;
++    void resetArenaLocked(GuestArenaState &arena, uint32_t guestBase, uint32_t guestLimit, uint32_t hardLimit, bool allowEmpty);
++    void ensureGameHeapInitializedLocked();
++    void ensureRuntimeArenaInitializedLocked();
++    int32_t findArenaBlockIndexLocked(const GuestArenaState &arena, uint32_t guestAddr) const;
++    uint32_t allocateArenaBlockLocked(GuestArenaState &arena, uint32_t size, uint32_t alignment);
++    void freeArenaBlockLocked(GuestArenaState &arena, uint32_t guestAddr);
++    void coalesceArenaLocked(GuestArenaState &arena);
++    RuntimeArenaOverrideResult computeRuntimeArenaOverrideLocked(uint32_t &base, uint32_t &limit) const;
+     void HandleIntegerOverflow(R5900Context *ctx);
+ 
+     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
+@@ -486,16 +532,16 @@ private:
+     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
+     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;
+     std::unordered_set<uint32_t> m_eeSyscallMirrorAddresses;
+-    mutable std::mutex m_guestHeapMutex;
+-    mutable std::mutex m_asyncCallbackStackMutex;
+-    std::vector<GuestHeapBlock> m_guestHeapBlocks;
+-    uint32_t m_guestHeapBase = 0x00100000u;
+-    uint32_t m_guestHeapEnd = 0x00100000u;
+-    uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
+-    uint32_t m_guestHeapSuggestedBase = 0x00100000u;
+-    bool m_guestHeapConfigured = false;
+-    uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
+-    uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
++    // P3.7.1: GameHeapState -- exclusively what SetupHeap/EndOfHeap declare
++    // to the guest (the title's own libc/newlib heap contract). NEVER read
++    // or written by guestMalloc/guestFree/reserveAsyncCallbackStack.
++    mutable std::mutex m_gameHeapMutex;
++    GuestArenaState m_gameHeapState;
++    // P3.7.1: RuntimeGuestArena -- exclusively internal to PS2Recomp
++    // (guestMalloc/guestFree callback data, DMA staging, invocation
++    // stacks). NEVER touched by SetupHeap/EndOfHeap/configureGuestHeap.
++    mutable std::mutex m_runtimeArenaMutex;
++    GuestArenaState m_runtimeArena;
+ 
+     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
+     std::atomic<bool> m_missingFunctionReported{false};
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 3a6ec7d..f531dda 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -6,6 +6,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cstring>
++#include <iostream>
+ #include <limits>
+ #include <stdexcept>
+ 
+@@ -180,9 +181,17 @@ void EeScheduler::run()
+             }
+             else
+             {
++                // P3.12 (BLOCKER_004 scheduler batch ordering fix): drain from the
++                // BACK of m_pendingInvocations (FIFO push_back at enqueue), not the
++                // front. running->invocations/owner->invocations is a stack (LIFO
++                // pop_back via activeContext()/completion); draining oldest-last
++                // means the FIRST-queued item ends up on top of the stack and
++                // therefore executes FIRST, matching invokeCurrentSequence's existing
++                // rbegin/rend compensation for the same stack contract. See
++                // analysis/notes/BLOCKER_004_P312_SCHEDULER_BATCH_ORDER.md.
+                 GuestThread *owner = &acquireInvocationThread();
+-                GuestInvocation invocation = std::move(m_pendingInvocations.front());
+-                m_pendingInvocations.pop_front();
++                GuestInvocation invocation = std::move(m_pendingInvocations.back());
++                m_pendingInvocations.pop_back();
+                 owner->status = EeThreadStatus::Running;
+                 m_currentThreadId = owner->id;
+                 renewTimeSlice();
+@@ -254,8 +263,12 @@ void EeScheduler::run()
+ 
+         if (!m_pendingInvocations.empty())
+         {
+-            GuestInvocation invocation = std::move(m_pendingInvocations.front());
+-            m_pendingInvocations.pop_front();
++            // P3.12: see matching comment above (acquireInvocationThread branch) --
++            // same back/pop_back drain-order fix, required at both call sites so a
++            // batch is reversed consistently regardless of which one consumes its
++            // first element.
++            GuestInvocation invocation = std::move(m_pendingInvocations.back());
++            m_pendingInvocations.pop_back();
+             if (getRegU32(&invocation.context, 29) == 0u)
+             {
+                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+@@ -1173,6 +1186,16 @@ uint32_t EeScheduler::invocationStackTop()
+     {
+         throw std::runtime_error("EE invocation stack space exhausted");
+     }
++    // P3.7.1.2 (C6): low-volume by construction -- this branch only runs on
++    // a cache miss (first time this exact thread+depth combination needs a
++    // stack), never on reuse. `top` is the returned SP (block end - 0x10);
++    // recover the actual block bounds from the known allocation size for a
++    // complete, self-contained log line.
++    const uint32_t blockEnd = top + 0x10u;
++    const uint32_t blockBase = blockEnd - kInvocationStackSize;
++    std::cerr << "[RuntimeGuestArena:async-stack] thread=" << owner->id << " depth=" << depth
++              << " block=[0x" << std::hex << blockBase << ",0x" << blockEnd << ")"
++              << " sp=0x" << top << " size=0x" << kInvocationStackSize << std::dec << std::endl;
+     m_invocationStackTops.emplace(key, top);
+     return top;
+ }
+@@ -1860,6 +1883,18 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
++        // P3.8 diagnostic instrumentation (temporary, read-only observability,
++        // no semantic change): confirm whether VBlankStart keeps arriving
++        // during the post-sceMpegGetPicture stall. Low-volume: first 5 ticks,
++        // then every 60th (~once/second at 60Hz). Remove once P3.8 is closed.
++        {
++            static std::atomic<uint64_t> s_gpVsyncLogCount{0u};
++            const uint64_t n = s_gpVsyncLogCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++            if (n <= 5u || (n % 60u) == 0u)
++            {
++                std::cerr << "[GP:VSync] tick=" << m_vsyncTick << std::endl;
++            }
++        }
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         if ((m_vsyncTick & 1u) != 0u)
+         {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+index e1be7d2..976cb72 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+@@ -99,6 +99,14 @@ namespace ps2_stubs
+         BlockTransferState &blockTransfer = g_audio_stub_state.blockTransfers[core];
+         uint32_t returnValue = 0u;
+ 
++        // BLOCKER_004 diag (temporary, not for commit): command/args + blockTransfer.active before/after.
++        static uint32_t s_diagCount = 0u;
++        static uint32_t s_diagLastCmd = 0xFFFFFFFFu;
++        ++s_diagCount;
++        const bool activeBefore = blockTransfer.active;
++        const bool logThis = (s_diagCount <= 20u) || (cmd != s_diagLastCmd);
++        s_diagLastCmd = cmd;
++
+         if (cmd == kLibSdCmdVoiceTrans)
+         {
+             voiceTransfer.sourceAddress = arg4;
+@@ -191,6 +199,15 @@ namespace ps2_stubs
+             returnValue = 0u;
+         }
+ 
++        if (logThis) {
++            std::cerr << "[AUDIO:sceSdRemote] #" << s_diagCount << " cmd=0x" << std::hex << cmd
++                      << " cmdArg0=0x" << cmdArg0 << " cmdArg1=0x" << cmdArg1
++                      << " arg4=0x" << arg4 << " arg5=0x" << arg5 << " arg6=0x" << arg6
++                      << " returnValue=0x" << returnValue << std::dec
++                      << " activeBefore=" << activeBefore << " activeAfter=" << blockTransfer.active
++                      << std::endl;
++        }
++
+         setReturnU32(ctx, returnValue);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..f9b8bb4 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -798,6 +798,9 @@ namespace ps2_stubs
+ 
+         MpegPlaybackState &getPlaybackState(uint32_t mpegAddr)
+         {
++            // P3.11 temporary lifetime observation, no state change.
++            if (std::getenv("DMC_P311_MPEG_DIAG") && !g_mpeg_stub_state.playbackByMpeg.contains(mpegAddr))
++                std::fprintf(stderr,"[P311:R2] new playback key=0x%08X\n",mpegAddr);
+             return g_mpeg_stub_state.playbackByMpeg[mpegAddr];
+         }
+ 
+@@ -1012,7 +1015,7 @@ namespace ps2_stubs
+             }
+         }
+ 
+-        void feedElementaryStream(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k = -1, int64_t dts90k = -1)
++        void feedElementaryStream(MpegPlaybackState &playback, uint32_t mpegAddr, const uint8_t *data, size_t size, int64_t pts90k = -1, int64_t dts90k = -1)
+         {
+             if (!data || size == 0)
+             {
+@@ -1020,6 +1023,8 @@ namespace ps2_stubs
+             }
+ 
+             const uint32_t feedEsIdx = g_mpeg_stub_state.feedEsTraceCount++;
++            if (std::getenv("DMC_P311_MPEG_DIAG") && feedEsIdx < 4u)
++                std::fprintf(stderr,"[P311:R3-R4] video ES key=0x%08X size=%zu sawInputBefore=%d frames=%zu\n",mpegAddr,size,playback.sawInput,playback.decodedFrames.size());
+             if (feedEsIdx < 32u)
+             {
+                 PS2_IF_AGRESSIVE_LOGS({
+@@ -1029,6 +1034,7 @@ namespace ps2_stubs
+                         ::snprintf(hexBuf + i * 2, 3, "%02x", data[i]);
+                     }
+                     std::cerr << "[MPEG:feedES] #" << feedEsIdx
++                              << " mpeg=0x" << std::hex << mpegAddr << std::dec
+                               << " size=" << size
+                               << " first4=" << hexBuf
+                               << " decoderFailed=" << playback.decoderFailed
+@@ -1037,6 +1043,24 @@ namespace ps2_stubs
+                 });
+             }
+ 
++            // BLOCKER_004 P3.10 diagnostic (temporary, not for commit): identify which
++            // mpegAddr's playback state is about to be resync-cleared (decoder reset +
++            // decodedFrames.clear()) so historical "frame decoded" totals can be
++            // reconciled against the specific session that produced them.
++            if (playback.waitingForVideoSequenceHeader && !playback.decodedFrames.empty())
++            {
++                static std::atomic<uint32_t> s_diagResyncClearCount{0u};
++                const uint32_t n = s_diagResyncClearCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++                if (n <= 20u)
++                {
++                    std::cerr << "[MPEG:resync-pending] #" << n
++                              << " mpeg=0x" << std::hex << mpegAddr << std::dec
++                              << " framesAboutToBeCleared=" << playback.decodedFrames.size()
++                              << " sawInput=" << playback.sawInput
++                              << std::endl;
++                }
++            }
++
+             playback.sawInput = true;
+             updateMpegPictureTiming(playback, data, size);
+             if (playback.waitingForVideoSequenceHeader)
+@@ -1097,7 +1121,42 @@ namespace ps2_stubs
+                 playback.decoder = std::make_unique<MpegFfmpegDecoder>();
+             }
+ 
+-            if (!playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k))
++            // BLOCKER_004 diagnostic instrumentation (temporary): distinguish "FFmpeg
++            // receives data" from "FFmpeg produces a frame" without per-packet spam.
++            // Sparse checkpoints only (first few calls, then every Nth). Remove once
++            // BLOCKER_004 is closed.
++            static std::atomic<uint32_t> s_diagFeedCalls{0u};
++            static std::atomic<uint32_t> s_diagFramesTotal{0u};
++            const uint32_t diagFeedCall = s_diagFeedCalls.fetch_add(1u, std::memory_order_relaxed) + 1u;
++            const size_t framesBefore = playback.decodedFrames.size();
++
++            const bool fedOk = playback.decoder->feed(data, size, playback.decodedFrames, pts90k, dts90k);
++            if (std::getenv("DMC_P311_MPEG_DIAG") && feedEsIdx < 4u)
++                std::fprintf(stderr,"[P311:R5-R6] decoder feed key=0x%08X ok=%d framesBefore=%zu framesAfter=%zu\n",mpegAddr,fedOk,framesBefore,playback.decodedFrames.size());
++
++            const size_t framesAfter = playback.decodedFrames.size();
++            if (framesAfter > framesBefore)
++            {
++                const uint32_t newFrameTotal = s_diagFramesTotal.fetch_add(
++                    static_cast<uint32_t>(framesAfter - framesBefore), std::memory_order_relaxed) +
++                    static_cast<uint32_t>(framesAfter - framesBefore);
++                if (newFrameTotal <= 10u || (newFrameTotal % 50u) == 0u)
++                {
++                    std::cerr << "[MPEG:diag] frame decoded, total=" << newFrameTotal
++                              << " mpeg=0x" << std::hex << mpegAddr << std::dec
++                              << " (feed call #" << diagFeedCall << ")" << std::endl;
++                }
++            }
++            if (diagFeedCall == 1u || diagFeedCall == 2u || diagFeedCall == 5u || (diagFeedCall % 200u) == 0u)
++            {
++                std::cerr << "[MPEG:diag] feed call #" << diagFeedCall
++                          << " mpeg=0x" << std::hex << mpegAddr << std::dec
++                          << " size=" << size << " fedOk=" << fedOk
++                          << " framesSoFar=" << s_diagFramesTotal.load(std::memory_order_relaxed)
++                          << std::endl;
++            }
++
++            if (!fedOk)
+             {
+                 playback.decoder.reset();
+                 playback.waitingForVideoSequenceHeader = true;
+@@ -1166,6 +1225,23 @@ namespace ps2_stubs
+             event.pts = pts90k >= 0 ? static_cast<uint64_t>(pts90k) : 0xFFFFFFFFFFFFFFFFull;
+             event.dts = dts90k >= 0 ? static_cast<uint64_t>(dts90k) : 0xFFFFFFFFFFFFFFFFull;
+             event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
++            // BLOCKER_004 P3.4 diag (temporary, not for commit): rows B/C of the
++            // A-K ladder -- event created for a stream type, and whether any
++            // registered guest callback matched it.
++            if (streamType != 0u)
++            {
++                static std::atomic<uint32_t> s_diagQueueCount{0u};
++                static uint32_t s_diagLastMatches = 0xFFFFFFFFu;
++                const uint32_t n = s_diagQueueCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++                const uint32_t matches = static_cast<uint32_t>(event.callbacks.size());
++                if (n <= 10u || matches != s_diagLastMatches)
++                {
++                    std::cerr << "[MPEG:callback-event] #" << n << " mpeg=0x" << std::hex << mpegAddr
++                              << " streamType=" << std::dec << streamType << " len=" << len
++                              << " matches=" << matches << std::endl;
++                    s_diagLastMatches = matches;
++                }
++            }
+             if (!event.callbacks.empty())
+             {
+                 callbackEvents.push_back(std::move(event));
+@@ -1333,6 +1409,7 @@ namespace ps2_stubs
+                         }
+                         feedElementaryStream(
+                             playback,
++                            mpegAddr,
+                             buffer.data() + payloadStart,
+                             packetEnd - payloadStart,
+                             pes.pts90k,
+@@ -1341,6 +1418,17 @@ namespace ps2_stubs
+                 }
+                 else if (isAudioStreamId(streamId))
+                 {
++                    // BLOCKER_004 P3.4 diag (temporary, not for commit): row A --
++                    // demux recognizes an audio PES packet at all.
++                    {
++                        static std::atomic<uint32_t> s_diagAudioPesCount{0u};
++                        const uint32_t n = s_diagAudioPesCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++                        if (n <= 10u || (n % 50u) == 0u)
++                        {
++                            std::cerr << "[MPEG:audio-pes] #" << n << " streamId=0x" << std::hex
++                                      << static_cast<uint32_t>(streamId) << std::dec << std::endl;
++                        }
++                    }
+                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
+                     const size_t payloadStart = pes.payloadOffset;
+                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+@@ -1585,6 +1673,26 @@ namespace ps2_stubs
+                                          const MpegStreamCallbackEvent &event,
+                                          const MpegRegisteredCallback &callback)
+         {
++            // BLOCKER_004 P3.4 diag (temporary, not for commit): row D detail --
++            // pinpoints exactly which guard/step inside dispatchGuestStreamCallback
++            // is stopping the queue, since row D's original log sat after all of
++            // these checks and could not distinguish between them.
++            const bool isStrPcmCallBack = (callback.func == 0x47a600u);
++            {
++                static std::atomic<uint32_t> s_diagEntryCount{0u};
++                static std::atomic<uint32_t> s_diagPcmEntryCount{0u};
++                const uint32_t n = isStrPcmCallBack
++                                       ? (s_diagPcmEntryCount.fetch_add(1u, std::memory_order_relaxed) + 1u)
++                                       : (s_diagEntryCount.fetch_add(1u, std::memory_order_relaxed) + 1u);
++                if (isStrPcmCallBack || n <= 5u)
++                {
++                    const bool hasFn = runtime ? runtime->hasFunction(callback.func) : false;
++                    std::cerr << "[MPEG:callback-dispatch-entry] " << (isStrPcmCallBack ? "PCM#" : "other#") << n
++                              << " func=0x" << std::hex << callback.func << std::dec << " rdram=" << (rdram != nullptr)
++                              << " callerCtx=" << (callerCtx != nullptr) << " runtime=" << (runtime != nullptr)
++                              << " hasFunction=" << hasFn << std::endl;
++                }
++            }
+             if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
+             {
+                 return;
+@@ -1593,11 +1701,33 @@ namespace ps2_stubs
+             const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+             if (cbDataAddr == 0u)
+             {
++                static std::atomic<uint32_t> s_diagMallocFailCount{0u};
++                static std::atomic<uint32_t> s_diagPcmMallocFailCount{0u};
++                const uint32_t n = isStrPcmCallBack
++                                        ? (s_diagPcmMallocFailCount.fetch_add(1u, std::memory_order_relaxed) + 1u)
++                                        : (s_diagMallocFailCount.fetch_add(1u, std::memory_order_relaxed) + 1u);
++                if (isStrPcmCallBack || n <= 5u)
++                {
++                    std::cerr << "[MPEG:callback-dispatch-mallocfail] " << (isStrPcmCallBack ? "PCM#" : "other#") << n
++                              << " arenaBase=0x" << std::hex << runtime->runtimeArenaBase()
++                              << " arenaEnd=0x" << runtime->runtimeArenaEnd()
++                              << " arenaLimit=0x" << runtime->runtimeArenaLimit() << std::dec
++                              << " requestedSize=" << kMpegCallbackDataSize << std::endl;
++                }
+                 return;
+             }
+             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
+             {
+                 runtime->guestFree(cbDataAddr);
++                static std::atomic<uint32_t> s_diagWriteFailCount{0u};
++                static std::atomic<uint32_t> s_diagPcmWriteFailCount{0u};
++                const uint32_t n = isStrPcmCallBack
++                                        ? (s_diagPcmWriteFailCount.fetch_add(1u, std::memory_order_relaxed) + 1u)
++                                        : (s_diagWriteFailCount.fetch_add(1u, std::memory_order_relaxed) + 1u);
++                if (isStrPcmCallBack || n <= 5u)
++                {
++                    std::cerr << "[MPEG:callback-dispatch-writefail] " << (isStrPcmCallBack ? "PCM#" : "other#") << n << std::endl;
++                }
+                 return;
+             }
+ 
+@@ -1617,6 +1747,17 @@ namespace ps2_stubs
+             {
+                 runtime->guestFree(cbDataAddr);
+             };
++            // BLOCKER_004 P3.4 diag (temporary, not for commit): row D -- a guest
++            // callback invocation is actually queued with the scheduler.
++            {
++                static std::atomic<uint32_t> s_diagQueuedCount{0u};
++                const uint32_t n = s_diagQueuedCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++                if (n <= 10u)
++                {
++                    std::cerr << "[MPEG:callback-queued] #" << n << " func=0x" << std::hex
++                              << callback.func << std::dec << std::endl;
++                }
++            }
+             runtime->eeScheduler().queueInvocation(std::move(invocation));
+         }
+ 
+@@ -1895,7 +2036,7 @@ namespace ps2_stubs
+                 {
+                     break;
+                 }
+-                feedElementaryStream(playback, src, chunk);
++                feedElementaryStream(playback, mpegAddr, src, chunk);
+                 copied += chunk;
+             }
+             wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
+@@ -2000,6 +2141,26 @@ namespace ps2_stubs
+ 
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            // BLOCKER_004 P3.10 diagnostic (temporary, not for commit): sceMpegCreate
++            // unconditionally overwrites any existing playback state for this mpegAddr.
++            // Log whenever that overwrite discards non-trivial state, to determine
++            // whether a prior movie's decoded frames/input flag for the SAME address
++            // are being wiped immediately before a new movie's GetPicture calls begin.
++            static std::atomic<uint32_t> s_diagCreateCount{0u};
++            const uint32_t createIdx = s_diagCreateCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++            const auto existingIt = g_mpeg_stub_state.playbackByMpeg.find(param_1);
++            const bool hadExisting = existingIt != g_mpeg_stub_state.playbackByMpeg.end();
++            const size_t existingFrames = hadExisting ? existingIt->second.decodedFrames.size() : 0u;
++            const bool existingSawInput = hadExisting && existingIt->second.sawInput;
++            if (createIdx <= 20u)
++            {
++                std::cerr << "[MPEG:create] #" << createIdx
++                          << " mpeg=0x" << std::hex << param_1 << std::dec
++                          << " hadExisting=" << hadExisting
++                          << " existingFrames=" << existingFrames
++                          << " existingSawInput=" << existingSawInput
++                          << std::endl;
++            }
+             getPlaybackState(param_1) = makeFreshPlaybackState();
+         }
+ 
+@@ -2069,6 +2230,19 @@ namespace ps2_stubs
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            // BLOCKER_004 P3.10 diagnostic (temporary, not for commit): identify when
++            // a playback state is erased, and whether it held non-trivial state.
++            static std::atomic<uint32_t> s_diagDeleteCount{0u};
++            const uint32_t deleteIdx = s_diagDeleteCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++            const auto existingIt = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
++            if (existingIt != g_mpeg_stub_state.playbackByMpeg.end() && deleteIdx <= 20u)
++            {
++                std::cerr << "[MPEG:delete] #" << deleteIdx
++                          << " mpeg=0x" << std::hex << mpegAddr << std::dec
++                          << " existingFrames=" << existingIt->second.decodedFrames.size()
++                          << " existingSawInput=" << existingIt->second.sawInput
++                          << std::endl;
++            }
+             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
+             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
+         }
+@@ -2284,14 +2458,58 @@ namespace ps2_stubs
+     {
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         const uint32_t imageAddr = getRegU32(ctx, 5);
++        if (std::getenv("DMC_P311_MPEG_DIAG")) {
++            static bool dumped=false;
++            if (!dumped) {
++                std::fprintf(stderr,"[P311:R7] first GetPicture key=0x%08X\n",mpegAddr);
++                if (const char* file=std::getenv("DMC_P311_RAM_GETPICTURE")) {
++                    if (FILE* f=std::fopen(file,"wb")) {
++                        const size_t n=std::fwrite(rdram,1,32u*1024u*1024u,f);std::fclose(f);
++                        std::fprintf(stderr,"[P311:dump] getpicture bytes=%zu\n",n);
++                    }
++                }
++                dumped=true;
++            }
++        }
++        // BLOCKER_004 diagnostic instrumentation (temporary): count every entry into
++        // sceMpegGetPicture, independent of whether it succeeds -- distinguishes
++        // "never called" from "called but never succeeds". Remove once BLOCKER_004
++        // is closed.
++        {
++            static std::atomic<uint32_t> s_diagGetPictureCalls{0u};
++            const uint32_t n = s_diagGetPictureCalls.fetch_add(1u, std::memory_order_relaxed) + 1u;
++            if (n <= 10u || (n % 50u) == 0u)
++            {
++                std::cerr << "[MPEG:diag] getPicture ENTRY #" << n
++                          << " mpeg=0x" << std::hex << mpegAddr << std::dec
++                          << std::endl;
++            }
++        }
+         uint32_t width = kStubMovieWidth;
+         uint32_t height = kStubMovieHeight;
+         uint32_t frameCount = 0u;
+         bool haveFrame = false;
+         MpegDecodedFrame frame;
++        // P3.8 diagnostic instrumentation (temporary, GP:* tags, low-volume,
++        // not gated by AGRESSIVE_LOGS): pinpoint exactly which branch the
++        // real first call(s) take. Remove once P3.8 is closed.
++        static std::atomic<uint32_t> s_gpCallCount{0u};
++        const uint32_t gpCallIdx = s_gpCallCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++        const bool gpTrace = gpCallIdx <= 6u;
+         {
+             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
++            if (gpTrace)
++            {
++                std::cerr << "[GP:A] #" << gpCallIdx << " entry mpeg=0x" << std::hex << mpegAddr << std::dec
++                          << " decodedFrames=" << playback.decodedFrames.size()
++                          << " streamEnded=" << playback.streamEnded
++                          << " decoderFailed=" << playback.decoderFailed
++                          << " cdStreamEofSeen=" << g_mpeg_stub_state.currentCdStreamEofSeen
++                          << " sawInput=" << playback.sawInput
++                          << " picturesServed=" << playback.picturesServed
++                          << std::endl;
++            }
+             if (playback.decodedFrames.empty() &&
+                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
+                 !playback.streamEnded &&
+@@ -2307,13 +2525,24 @@ namespace ps2_stubs
+                     });
+                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                 }
++                if (gpTrace)
++                {
++                    std::cerr << "[GP:H] #" << gpCallIdx << " waitExternal(kMpegPictureWaitType, mpeg=0x"
++                              << std::hex << mpegAddr << std::dec << ") -- SUSPENDING, no frame available" << std::endl;
++                }
+                 lock.unlock();
+                 runtime->eeScheduler().waitExternal(
+                     EeWaitReason::Mpeg,
+                     kMpegPictureWaitType,
+                     mpegAddr,
+-                    [rdram, runtime](R5900Context &resumeContext)
++                    [rdram, runtime, gpCallIdx](R5900Context &resumeContext)
+                     {
++                        if (gpCallIdx <= 6u)
++                        {
++                            std::cerr << "[GP:I] resumeCompletion for call #" << gpCallIdx
++                                      << " invoked, v0=" << static_cast<int32_t>(getRegU32(&resumeContext, 2))
++                                      << std::endl;
++                        }
+                         if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                         {
+                             return;
+@@ -2330,6 +2559,17 @@ namespace ps2_stubs
+                 const uint64_t frameIntervalQ32 = decodedFrameIntervalQ32(playback, nextFrame);
+                 uint64_t presentationTargetQ32 = presentationTickForFrame(playback, nextFrame, currentTickQ32);
+ 
++                if (gpTrace)
++                {
++                    std::cerr << "[GP:B] #" << gpCallIdx << " have-frame path, currentTick=" << currentTick
++                              << " currentTickQ32=0x" << std::hex << currentTickQ32
++                              << " presentationTargetQ32(pre-correction)=0x" << presentationTargetQ32
++                              << " frameIntervalQ32=0x" << frameIntervalQ32
++                              << " pts90k=" << std::dec << nextFrame.pts90k
++                              << " firstPresentedPts90k=" << playback.firstPresentedPts90k
++                              << std::endl;
++                }
++
+                 if (currentTickQ32 > presentationTargetQ32 && currentTickQ32 - presentationTargetQ32 >= frameIntervalQ32)
+                 {
+                     const uint64_t correction = currentTickQ32 - presentationTargetQ32;
+@@ -2339,17 +2579,35 @@ namespace ps2_stubs
+                         playback.ptsPresentationBaseTickQ32 += correction;
+                     }
+                     playback.nextPictureTickQ32 = currentTickQ32;
++                    if (gpTrace)
++                    {
++                        std::cerr << "[GP:C] #" << gpCallIdx << " late-correction applied, correction=0x"
++                                  << std::hex << correction << std::dec << std::endl;
++                    }
+                 }
+ 
+                 if (currentTickQ32 < presentationTargetQ32)
+                 {
+                     const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
++                    if (gpTrace)
++                    {
++                        std::cerr << "[GP:G] #" << gpCallIdx << " waitVSync(afterTick=" << (eligibleTick - 1u)
++                                  << ") -- SUSPENDING, presentation not due yet (currentTickQ32=0x" << std::hex
++                                  << currentTickQ32 << " < presentationTargetQ32=0x" << presentationTargetQ32
++                                  << std::dec << ")" << std::endl;
++                    }
+                     lock.unlock();
+                     runtime->eeScheduler().waitVSync(
+                         eligibleTick - 1u,
+                         -1,
+-                        [rdram, runtime](R5900Context &resumeContext)
++                        [rdram, runtime, gpCallIdx](R5900Context &resumeContext)
+                         {
++                            if (gpCallIdx <= 6u)
++                            {
++                                std::cerr << "[GP:I] waitVSync resumeCompletion for call #" << gpCallIdx
++                                          << " invoked, v0=" << static_cast<int32_t>(getRegU32(&resumeContext, 2))
++                                          << std::endl;
++                            }
+                             if (static_cast<int32_t>(getRegU32(&resumeContext, 2)) < 0)
+                             {
+                                 return;
+@@ -2357,6 +2615,11 @@ namespace ps2_stubs
+                             sceMpegGetPicture(rdram, &resumeContext, runtime);
+                         });
+                 }
++                else if (gpTrace)
++                {
++                    std::cerr << "[GP:D] #" << gpCallIdx << " presentation due now, proceeding to pop frame"
++                              << std::endl;
++                }
+ 
+                 frame = std::move(playback.decodedFrames.front());
+                 playback.decodedFrames.pop_front();
+@@ -2369,6 +2632,20 @@ namespace ps2_stubs
+                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
+                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
+                 haveFrame = true;
++                // BLOCKER_004 diagnostic instrumentation (temporary): sparse, always-on
++                // (not gated by AGRESSIVE_LOGS) success counter for sceMpegGetPicture.
++                // Remove once BLOCKER_004 is closed.
++                {
++                    static std::atomic<uint32_t> s_diagGetPictureSuccess{0u};
++                    const uint32_t n = s_diagGetPictureSuccess.fetch_add(1u, std::memory_order_relaxed) + 1u;
++                    if (n <= 10u || (n % 50u) == 0u)
++                    {
++                        std::cerr << "[MPEG:diag] getPicture success #" << n
++                                  << " size=" << width << "x" << height
++                                  << " imageAddr=0x" << std::hex << imageAddr << std::dec
++                                  << std::endl;
++                    }
++                }
+                 if (g_mpeg_stub_state.pictureTraceCount < 32u)
+                 {
+                     PS2_IF_AGRESSIVE_LOGS({
+@@ -2386,9 +2663,22 @@ namespace ps2_stubs
+                 width = playback.width;
+                 height = playback.height;
+                 frameCount = playback.picturesServed;
++                if (gpTrace)
++                {
++                    std::cerr << "[GP:E] #" << gpCallIdx << " decodedFrames still empty after checks"
++                              << " (ended=" << playback.streamEnded << " failed=" << playback.decoderFailed
++                              << " eofSeen=" << g_mpeg_stub_state.currentCdStreamEofSeen
++                              << ") -- falling through to blank-frame path" << std::endl;
++                }
+             }
+         }
+ 
++        if (gpTrace)
++        {
++            std::cerr << "[GP:K] #" << gpCallIdx << " reached synchronous RETURN path, haveFrame=" << haveFrame
++                      << " frameCount=" << frameCount << std::endl;
++        }
++
+         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
+         mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
+         mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
+@@ -2432,6 +2722,50 @@ namespace ps2_stubs
+     {
+         (void)rdram;
+         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++        if (std::getenv("DMC_P311_MPEG_DIAG")) {
++            std::fprintf(stderr,"[P311:R0] init ra=0x%08X callbackKeys=%zu generation=%llu produced=%llu demuxed=%llu eofPending=%d eofSeen=%d\n",
++                getRegU32(ctx,31),g_mpeg_stub_state.callbacksByMpeg.size(),
++                (unsigned long long)g_mpeg_stub_state.cdStreamGeneration,(unsigned long long)g_mpeg_stub_state.cdStreamBytesProduced,
++                (unsigned long long)g_mpeg_stub_state.cdStreamBytesDemuxed,g_mpeg_stub_state.cdStreamEofPending,g_mpeg_stub_state.currentCdStreamEofSeen);
++            for (const auto& [key,p] : g_mpeg_stub_state.playbackByMpeg)
++                std::fprintf(stderr,"[P311:R0-state] key=0x%08X decoder=%d frames=%zu sawInput=%d pssBytes=%zu syncBytes=%zu width=%u height=%u generation=%llu\n",
++                    key,!!p.decoder,p.decodedFrames.size(),p.sawInput,p.pssBuffer.size(),p.videoSequenceSyncBuffer.size(),p.width,p.height,(unsigned long long)p.cdStreamGeneration);
++            // One exact local RAM snapshot. No guest writes, no reinterpretation
++            // of addresses, no dependency on shared/generated headers.
++            static bool dumped=false;
++            if (!dumped && !g_mpeg_stub_state.playbackByMpeg.empty()) {
++                if (const char* file=std::getenv("DMC_P311_RAM_PREINIT")) {
++                    if (FILE* f=std::fopen(file,"wb")) {
++                        const size_t n=std::fwrite(rdram,1,32u*1024u*1024u,f);std::fclose(f);
++                        std::fprintf(stderr,"[P311:dump] preinit bytes=%zu\n",n);dumped=true;
++                    }
++                }
++            }
++        }
++        // BLOCKER_004 P3.10 diagnostic (temporary, not for commit): sceMpegInit
++        // performs a FULL playbackByMpeg.clear() via resetMpegStubStateUnlocked().
++        // Log every call, and specifically whether any tracked mpegAddr held
++        // non-trivial state (frames/sawInput) about to be wiped.
++        {
++            static std::atomic<uint32_t> s_diagInitCount{0u};
++            const uint32_t initIdx = s_diagInitCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
++            if (initIdx <= 20u)
++            {
++                std::cerr << "[MPEG:init] #" << initIdx
++                          << " trackedStates=" << g_mpeg_stub_state.playbackByMpeg.size()
++                          << std::endl;
++                for (const auto &kv : g_mpeg_stub_state.playbackByMpeg)
++                {
++                    if (!kv.second.decodedFrames.empty() || kv.second.sawInput)
++                    {
++                        std::cerr << "[MPEG:init]   about to wipe mpeg=0x" << std::hex << kv.first << std::dec
++                                  << " frames=" << kv.second.decodedFrames.size()
++                                  << " sawInput=" << kv.second.sawInput
++                                  << std::endl;
++                    }
++                }
++            }
++        }
+         const uint64_t cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+         const uint64_t cdStreamBytesProduced = g_mpeg_stub_state.cdStreamBytesProduced;
+         const uint64_t cdStreamBytesDemuxed = g_mpeg_stub_state.cdStreamBytesDemuxed;
+@@ -2444,6 +2778,8 @@ namespace ps2_stubs
+         g_mpeg_stub_state.cdStreamBytesDemuxed = cdStreamBytesDemuxed;
+         g_mpeg_stub_state.cdStreamEofPending = cdStreamEofPending;
+         g_mpeg_stub_state.currentCdStreamEofSeen = currentCdStreamEofSeen;
++        if (std::getenv("DMC_P311_MPEG_DIAG"))
++            std::fprintf(stderr,"[P311:R1] init complete playbackKeys=%zu callbackKeys=%zu\n",g_mpeg_stub_state.playbackByMpeg.size(),g_mpeg_stub_state.callbacksByMpeg.size());
+         setReturnU32(ctx, 0u);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 3530e65..707709a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -564,14 +564,27 @@ namespace ps2_syscalls
+         // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
+         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+         uint32_t heapLimit = kDefaultGuestHeapEnd;
+-
+-        if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
++        // P3.7.1.2 (C3): size==0 is a legitimate declaration of a heap with
++        // ZERO capacity at exactly `heapBase` -- confirmed by DMC's own
++        // crt0, which calls SetupHeap(0x01F00100, 0) unconditionally (see
++        // BLOCKER_004_pss_video_output.md section 17 for the full
++        // revalidation). It is not an error and must not be represented by
++        // some unrelated default region -- GameHeapState now supports
++        // base==limit as a valid state precisely for this case.
++        bool explicitEmptyHeap = false;
++
++        if (heapSize == 0u)
++        {
++            heapLimit = heapBase;
++            explicitEmptyHeap = true;
++        }
++        else if (heapSize != 0xFFFFFFFFu)
+         {
+             const uint64_t candidate = static_cast<uint64_t>(heapBase) + static_cast<uint64_t>(heapSize);
+             heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, kDefaultGuestHeapEnd));
+         }
+ 
+-        if (heapLimit <= heapBase)
++        if (!explicitEmptyHeap && heapLimit <= heapBase)
+         {
+             heapLimit = kDefaultGuestHeapEnd;
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 0e8471e..e605fce 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -19,6 +19,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cctype>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <chrono>
+@@ -91,6 +92,15 @@ namespace
+     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
+     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
+     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
++    // P3.7.1: explicit, opt-in override for RuntimeGuestArena placement,
++    // read once during ensureRuntimeArenaInitializedLocked(). Not a
++    // universal policy -- titles whose own heap/overlay layout collides
++    // with the automatic ELF-derived heuristic (see BLOCKER_004
++    // sections 13-15 for the DMC case) set these explicitly, following the
++    // same env-var convention already used for PS2X_CD_IMAGE. Absent ->
++    // falls back to the (now-hardened) automatic heuristic below.
++    constexpr const char *kRuntimeArenaBaseEnvVar = "PS2X_RUNTIME_ARENA_BASE";
++    constexpr const char *kRuntimeArenaLimitEnvVar = "PS2X_RUNTIME_ARENA_LIMIT";
+ 
+     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
+     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
+@@ -504,14 +514,21 @@ PS2Runtime::PS2Runtime()
+     // Stack pointer (SP) and global pointer (GP) will be set by the loaded ELF
+ 
+     m_loadedModules.clear();
+-    m_guestHeapBlocks.clear();
+-    m_guestHeapBase = kGuestHeapDefaultBase;
+-    m_guestHeapEnd = kGuestHeapDefaultBase;
+-    m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
+-    m_guestHeapConfigured = false;
+-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
++
++    // P3.7.1: reset both arenas to their unconfigured defaults independently.
++    m_gameHeapState = GuestArenaState{};
++    m_gameHeapState.base = kGuestHeapDefaultBase;
++    m_gameHeapState.end = kGuestHeapDefaultBase;
++    m_gameHeapState.limit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    m_gameHeapState.suggestedBase = kGuestHeapDefaultBase;
++    m_gameHeapState.configured = false;
++
++    m_runtimeArena = GuestArenaState{};
++    m_runtimeArena.base = kGuestHeapDefaultBase;
++    m_runtimeArena.end = kGuestHeapDefaultBase;
++    m_runtimeArena.limit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    m_runtimeArena.suggestedBase = kGuestHeapDefaultBase;
++    m_runtimeArena.configured = false;
+ }
+ 
+ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+@@ -882,7 +899,18 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+                                           << ", memsz: 0x" << ph.memsz << ")"
+                                           << std::dec << std::endl);
+ 
+-        if (!scratch)
++        // P3.7.1 (Objetivo 8, general hardening, not DMC-specific): a
++        // PT_LOAD segment that already starts at/above kGuestHeapHardLimit
++        // is, by definition, inside the region the hard limit exists to
++        // protect (overlay windows, linker markers, etc. -- see
++        // BLOCKER_004_pss_video_output.md section 13.1/13.5 Option A for
++        // the evidence: DMC ships 14 such zero-content overlay markers at
++        // 0x01F00000). Letting it push maxLoadedRdramEnd upward defeats the
++        // hard limit instead of respecting it, and was the root cause of
++        // the P3.4 guest-heap collapse. This does not change what gets
++        // loaded/executed -- only what counts toward the heap-placement
++        // heuristic below.
++        if (!scratch && ph.vaddr < kGuestHeapHardLimit)
+         {
+             maxLoadedRdramEnd = std::max(maxLoadedRdramEnd, static_cast<uint32_t>(segmentMemEnd));
+         }
+@@ -921,23 +949,29 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+                                    ? PS2_RAM_SIZE
+                                    : (maxLoadedRdramEnd + kGuestHeapSafetyPad);
+     const uint32_t suggestedHeapBase = alignGuestHeapValue(paddedEnd, kGuestHeapDefaultAlignment);
++
++    // P3.7.1: GameHeapState keeps the pre-P3.7.1 auto-sizing behavior
++    // exactly (titles that never call SetupHeap still get a reasonable
++    // default heap description to hand back from EndOfHeap).
+     {
+-        std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-        if (!m_guestHeapConfigured)
++        std::lock_guard<std::mutex> lock(m_gameHeapMutex);
++        if (!m_gameHeapState.configured)
+         {
+             const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-            m_guestHeapSuggestedBase = std::min(suggestedHeapBase, hardLimit);
+-            m_guestHeapBase = m_guestHeapSuggestedBase;
+-            m_guestHeapEnd = m_guestHeapSuggestedBase;
+-            m_guestHeapLimit = hardLimit;
++            m_gameHeapState.suggestedBase = std::min(suggestedHeapBase, hardLimit);
++            m_gameHeapState.base = m_gameHeapState.suggestedBase;
++            m_gameHeapState.end = m_gameHeapState.suggestedBase;
++            m_gameHeapState.limit = hardLimit;
+         }
+     }
+-    {
+-        std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
+-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+-    }
++    // P3.7.1.2 (C1): RuntimeGuestArena deliberately does NOT consume the
++    // ELF-derived heuristic anymore. P3.7.1.1's independent review found
++    // that, without an explicit override, that heuristic would place the
++    // arena at roughly [0x9F9480, 0x1F00000) for DMC -- structurally
++    // indistinguishable from Mem_alloc's real territory (see
++    // BLOCKER_004_pss_video_output.md sections 15.1/16). Silently using it
++    // as a fallback is exactly the unsafe behavior C1 removes; see
++    // ensureRuntimeArenaInitializedLocked() for what happens instead.
+ 
+     LoadedModule module;
+     module.name = elfPath.substr(elfPath.find_last_of("/\\") + 1);
+@@ -1575,20 +1609,18 @@ uint32_t PS2Runtime::normalizeGuestHeapAlignment(uint32_t alignment)
+     return std::max(alignment, kGuestHeapDefaultAlignment);
+ }
+ 
+-uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
++uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase, uint32_t hardLimit) const
+ {
+     uint32_t normalized = guestBase;
+     if (normalized >= PS2_RAM_SIZE)
+     {
+         normalized &= PS2_RAM_MASK;
+     }
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+     return std::min(normalized, hardLimit);
+ }
+ 
+-uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
++uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit, uint32_t hardLimit) const
+ {
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+     if (guestLimit == 0u || guestLimit > hardLimit)
+     {
+         return hardLimit;
+@@ -1596,57 +1628,191 @@ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
+     return guestLimit;
+ }
+ 
+-void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
++// P3.7.1: generic arena reset, shared by GameHeapState and RuntimeGuestArena
++// (see BLOCKER_004_pss_video_output.md section 16 for the design writeup).
++// `arenaName` is only used for the fail-fast log below -- it does not
++// affect behavior.
++// P3.7.1.2 (C3): `allowEmpty` distinguishes GameHeapState (where a title
++// declaring a zero-capacity heap, e.g. SetupHeap(base, 0), is a legitimate
++// state, not a failure -- base==limit is accepted and NOT collapsed) from
++// RuntimeGuestArena (where the runtime genuinely needs usable capacity --
++// base==limit is still treated as a fatal misconfiguration).
++void PS2Runtime::resetArenaLocked(GuestArenaState &arena, uint32_t guestBase, uint32_t guestLimit, uint32_t hardLimit, bool allowEmpty)
+ {
+-    uint32_t base = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
+-    uint32_t limit = clampGuestHeapLimit(guestLimit);
++    uint32_t base = alignGuestHeapValue(clampGuestHeapBase(guestBase, hardLimit), kGuestHeapDefaultAlignment);
++    uint32_t limit = clampGuestHeapLimit(guestLimit, hardLimit);
+     if (base == 0u)
+     {
+-        const uint32_t fallbackBase = (m_guestHeapSuggestedBase != 0u) ? m_guestHeapSuggestedBase : kGuestHeapDefaultBase;
+-        base = alignGuestHeapValue(clampGuestHeapBase(fallbackBase), kGuestHeapDefaultAlignment);
++        const uint32_t fallbackBase = (arena.suggestedBase != 0u) ? arena.suggestedBase : kGuestHeapDefaultBase;
++        base = alignGuestHeapValue(clampGuestHeapBase(fallbackBase, hardLimit), kGuestHeapDefaultAlignment);
+     }
+ 
+-    if (limit <= base)
++    // An inverted request (limit below base) is never valid, regardless of
++    // allowEmpty -- retry once against the arena's own suggested baseline
++    // before giving up. Note this is strictly "<", not "<=": an exact
++    // base==limit request must reach the allowEmpty check below, not be
++    // silently rewritten here.
++    if (limit < base)
+     {
+-        base = alignGuestHeapValue(clampGuestHeapBase(m_guestHeapSuggestedBase), kGuestHeapDefaultAlignment);
+-        limit = clampGuestHeapLimit(0u);
++        base = alignGuestHeapValue(clampGuestHeapBase(arena.suggestedBase, hardLimit), kGuestHeapDefaultAlignment);
++        limit = clampGuestHeapLimit(0u, hardLimit);
+     }
+ 
+-    if (limit <= base)
++    if (limit < base || (!allowEmpty && limit == base))
+     {
++        // P3.7.1 (Objetivo 9): this used to collapse to base=0,limit=0
++        // silently -- the exact failure that took the P3.1-P3.4 sessions
++        // multiple iterations to isolate (see BLOCKER_004 section 12.6).
++        // Never do that again without saying so loudly.
++        std::cerr << "[GuestArena:FATAL] arena collapsed to empty (requestedBase=0x"
++                  << std::hex << guestBase << " requestedLimit=0x" << guestLimit
++                  << " suggestedBase=0x" << arena.suggestedBase << " hardLimit=0x" << hardLimit
++                  << std::dec << ") -- guestMalloc/guestFree on this arena will fail until"
++                  << " reconfigured. This is a configuration bug, not expected runtime behavior."
++                  << std::endl;
+         base = 0u;
+         limit = 0u;
+     }
++    else if (allowEmpty && limit == base)
++    {
++        // P3.7.1.2 (C3): a legitimate zero-capacity declaration -- NOT an
++        // error, must not be logged as FATAL. See
++        // BLOCKER_004_pss_video_output.md section 17 for the demonstrated
++        // DMC crt0 call (SetupHeap(0x1F00100, 0)) this represents.
++        std::cerr << "[GameHeapState] title declared a zero-capacity heap at 0x"
++                  << std::hex << base << std::dec << " -- valid declaration, not an error."
++                  << std::endl;
++    }
+ 
+-    m_guestHeapBlocks.clear();
++    arena.blocks.clear();
+     if (limit > base)
+     {
+-        m_guestHeapBlocks.push_back({base, limit - base, true});
++        arena.blocks.push_back({base, limit - base, true});
+     }
+ 
+-    m_guestHeapBase = base;
+-    m_guestHeapEnd = base;
+-    m_guestHeapLimit = limit;
+-    m_guestHeapConfigured = true;
++    arena.base = base;
++    arena.end = base;
++    arena.limit = limit;
++    arena.configured = true;
+ }
+ 
+-void PS2Runtime::ensureGuestHeapInitializedLocked()
++void PS2Runtime::ensureGameHeapInitializedLocked()
+ {
+-    if (m_guestHeapConfigured)
++    if (m_gameHeapState.configured)
+     {
+         return;
+     }
+ 
+-    const uint32_t suggested = (m_guestHeapSuggestedBase == 0u) ? kGuestHeapDefaultBase : m_guestHeapSuggestedBase;
+-    resetGuestHeapLocked(suggested, clampGuestHeapLimit(0u));
++    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
++    const uint32_t suggested = (m_gameHeapState.suggestedBase == 0u) ? kGuestHeapDefaultBase : m_gameHeapState.suggestedBase;
++    resetArenaLocked(m_gameHeapState, suggested, clampGuestHeapLimit(0u, hardLimit), hardLimit, /*allowEmpty=*/true);
++}
++
++// P3.7.1 (Objetivo 4) / P3.7.1.2 (C1, C2): explicit, opt-in per-title
++// override for RuntimeGuestArena placement. Returns Absent when neither
++// env var is set (the normal case for every title except ones explicitly
++// configured this way -- NOT a failure, but as of P3.7.1.2 no longer
++// treated as "use the automatic heuristic" either, see
++// ensureRuntimeArenaInitializedLocked). Returns Invalid and logs loudly if
++// a var IS set but malformed -- callers must not silently ignore that case.
++PS2Runtime::RuntimeArenaOverrideResult PS2Runtime::computeRuntimeArenaOverrideLocked(uint32_t &base, uint32_t &limit) const
++{
++    const char *baseStr = std::getenv(kRuntimeArenaBaseEnvVar);
++    const char *limitStr = std::getenv(kRuntimeArenaLimitEnvVar);
++    if (!baseStr && !limitStr)
++    {
++        return RuntimeArenaOverrideResult::Absent;
++    }
++    if (!baseStr || !limitStr)
++    {
++        std::cerr << "[RuntimeGuestArena:FATAL] " << kRuntimeArenaBaseEnvVar << " and "
++                  << kRuntimeArenaLimitEnvVar << " must both be set together (only "
++                  << (baseStr ? kRuntimeArenaBaseEnvVar : kRuntimeArenaLimitEnvVar)
++                  << " was provided)." << std::endl;
++        return RuntimeArenaOverrideResult::Invalid;
++    }
++
++    char *baseEnd = nullptr;
++    char *limitEnd = nullptr;
++    const unsigned long parsedBase = std::strtoul(baseStr, &baseEnd, 0);
++    const unsigned long parsedLimit = std::strtoul(limitStr, &limitEnd, 0);
++    const bool parseOk = baseEnd && *baseEnd == '\0' && limitEnd && *limitEnd == '\0' &&
++                         *baseStr != '\0' && *limitStr != '\0';
++
++    if (!parseOk || parsedBase == 0u || parsedLimit == 0u || parsedLimit > PS2_RAM_SIZE ||
++        parsedBase >= parsedLimit || (parsedBase % kGuestHeapDefaultAlignment) != 0u)
++    {
++        std::cerr << "[RuntimeGuestArena:FATAL] invalid override " << kRuntimeArenaBaseEnvVar
++                  << "=" << baseStr << " " << kRuntimeArenaLimitEnvVar << "=" << limitStr
++                  << " (parsed base=0x" << std::hex << parsedBase << " limit=0x" << parsedLimit
++                  << std::dec << ") -- must be base!=0, base<limit, limit<=PS2_RAM_SIZE, base 16-byte"
++                  << " aligned, and fully numeric (0x-prefixed hex or decimal)." << std::endl;
++        return RuntimeArenaOverrideResult::Invalid;
++    }
++
++    base = static_cast<uint32_t>(parsedBase);
++    limit = static_cast<uint32_t>(parsedLimit);
++    return RuntimeArenaOverrideResult::Valid;
+ }
+ 
+-int32_t PS2Runtime::findGuestHeapBlockIndexLocked(uint32_t guestAddr) const
++// P3.7.1.2 (C1, C2): RuntimeGuestArena has exactly two possible outcomes
++// now -- a verified explicit override, or permanently UNAVAILABLE. There is
++// no automatic third option that silently trusts the ELF-derived
++// heuristic: P3.7.1.1's review demonstrated that heuristic is not safe to
++// use unverified for internal runtime allocations (see the comment at the
++// former call site, now removed, in loadElf()). An unavailable arena keeps
++// returning 0 from guestMalloc/guestFree/reserveAsyncCallbackStack forever
++// -- it never gets silently "fixed" by falling through to a guess.
++void PS2Runtime::ensureRuntimeArenaInitializedLocked()
++{
++    if (m_runtimeArena.configured)
++    {
++        return;
++    }
++
++    uint32_t overrideBase = 0u;
++    uint32_t overrideLimit = 0u;
++    const RuntimeArenaOverrideResult result = computeRuntimeArenaOverrideLocked(overrideBase, overrideLimit);
++    if (result == RuntimeArenaOverrideResult::Valid)
++    {
++        resetArenaLocked(m_runtimeArena, overrideBase, overrideLimit, PS2_RAM_SIZE, /*allowEmpty=*/false);
++        m_runtimeArena.unavailable = false;
++        std::cerr << "[RuntimeGuestArena] using explicit override base=0x" << std::hex
++                  << m_runtimeArena.base << " limit=0x" << m_runtimeArena.limit << std::dec << std::endl;
++        return;
++    }
++
++    m_runtimeArena = GuestArenaState{};
++    m_runtimeArena.configured = true;
++    m_runtimeArena.unavailable = true;
++    if (result == RuntimeArenaOverrideResult::Invalid)
++    {
++        std::cerr << "[RuntimeGuestArena:FATAL] " << kRuntimeArenaBaseEnvVar << "/"
++                  << kRuntimeArenaLimitEnvVar << " was set but invalid (see error above) -- "
++                  << "RuntimeGuestArena is now PERMANENTLY UNAVAILABLE for this process. "
++                  << "guestMalloc/guestCalloc/guestRealloc/guestFree/reserveAsyncCallbackStack "
++                  << "will all fail (return 0) until the process is restarted with a valid override."
++                  << std::endl;
++    }
++    else
++    {
++        std::cerr << "[RuntimeGuestArena:FATAL] no " << kRuntimeArenaBaseEnvVar << "/"
++                  << kRuntimeArenaLimitEnvVar << " override was provided. Automatic ELF-derived "
++                  << "placement is not considered safe (see BLOCKER_004_pss_video_output.md "
++                  << "section 16/17 for why) -- RuntimeGuestArena is PERMANENTLY UNAVAILABLE for "
++                  << "this process. guestMalloc/guestCalloc/guestRealloc/guestFree/"
++                  << "reserveAsyncCallbackStack will all fail (return 0) until an explicit override "
++                  << "is provided and the process is restarted."
++                  << std::endl;
++    }
++}
++
++int32_t PS2Runtime::findArenaBlockIndexLocked(const GuestArenaState &arena, uint32_t guestAddr) const
+ {
+     const uint32_t normalizedAddr = guestAddr & PS2_RAM_MASK;
+-    for (size_t i = 0; i < m_guestHeapBlocks.size(); ++i)
++    for (size_t i = 0; i < arena.blocks.size(); ++i)
+     {
+-        const GuestHeapBlock &block = m_guestHeapBlocks[i];
++        const GuestHeapBlock &block = arena.blocks[i];
+         if (!block.free && block.addr == normalizedAddr)
+         {
+             return static_cast<int32_t>(i);
+@@ -1655,7 +1821,7 @@ int32_t PS2Runtime::findGuestHeapBlockIndexLocked(uint32_t guestAddr) const
+     return -1;
+ }
+ 
+-uint32_t PS2Runtime::allocateGuestBlockLocked(uint32_t size, uint32_t alignment)
++uint32_t PS2Runtime::allocateArenaBlockLocked(GuestArenaState &arena, uint32_t size, uint32_t alignment)
+ {
+     if (size == 0u)
+     {
+@@ -1674,9 +1840,9 @@ uint32_t PS2Runtime::allocateGuestBlockLocked(uint32_t size, uint32_t alignment)
+         return 0u;
+     }
+ 
+-    for (size_t i = 0; i < m_guestHeapBlocks.size(); ++i)
++    for (size_t i = 0; i < arena.blocks.size(); ++i)
+     {
+-        const GuestHeapBlock block = m_guestHeapBlocks[i];
++        const GuestHeapBlock block = arena.blocks[i];
+         if (!block.free)
+         {
+             continue;
+@@ -1717,70 +1883,97 @@ uint32_t PS2Runtime::allocateGuestBlockLocked(uint32_t size, uint32_t alignment)
+             replacement.push_back({static_cast<uint32_t>(allocEnd), suffixSize, true});
+         }
+ 
+-        m_guestHeapBlocks.erase(m_guestHeapBlocks.begin() + static_cast<std::ptrdiff_t>(i));
+-        m_guestHeapBlocks.insert(m_guestHeapBlocks.begin() + static_cast<std::ptrdiff_t>(i),
+-                                 replacement.begin(),
+-                                 replacement.end());
++        arena.blocks.erase(arena.blocks.begin() + static_cast<std::ptrdiff_t>(i));
++        arena.blocks.insert(arena.blocks.begin() + static_cast<std::ptrdiff_t>(i),
++                            replacement.begin(),
++                            replacement.end());
+ 
+-        m_guestHeapEnd = std::max(m_guestHeapEnd, static_cast<uint32_t>(allocEnd));
++        arena.end = std::max(arena.end, static_cast<uint32_t>(allocEnd));
+         return alignedAddr;
+     }
+ 
+     return 0u;
+ }
+ 
+-void PS2Runtime::coalesceGuestHeapLocked()
++void PS2Runtime::coalesceArenaLocked(GuestArenaState &arena)
+ {
+-    if (m_guestHeapBlocks.empty())
++    if (arena.blocks.empty())
+     {
+         return;
+     }
+ 
+     size_t i = 1;
+-    while (i < m_guestHeapBlocks.size())
++    while (i < arena.blocks.size())
+     {
+-        GuestHeapBlock &prev = m_guestHeapBlocks[i - 1];
+-        GuestHeapBlock &curr = m_guestHeapBlocks[i];
++        GuestHeapBlock &prev = arena.blocks[i - 1];
++        GuestHeapBlock &curr = arena.blocks[i];
+         const uint64_t prevEnd = static_cast<uint64_t>(prev.addr) + static_cast<uint64_t>(prev.size);
+         if (prev.free && curr.free && prevEnd == curr.addr)
+         {
+             prev.size += curr.size;
+-            m_guestHeapBlocks.erase(m_guestHeapBlocks.begin() + static_cast<std::ptrdiff_t>(i));
++            arena.blocks.erase(arena.blocks.begin() + static_cast<std::ptrdiff_t>(i));
+             continue;
+         }
+         ++i;
+     }
+ }
+ 
+-void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
++void PS2Runtime::freeArenaBlockLocked(GuestArenaState &arena, uint32_t guestAddr)
+ {
+-    const int32_t index = findGuestHeapBlockIndexLocked(guestAddr);
++    const int32_t index = findArenaBlockIndexLocked(arena, guestAddr);
+     if (index < 0)
+     {
+         return;
+     }
+ 
+-    m_guestHeapBlocks[static_cast<size_t>(index)].free = true;
+-    coalesceGuestHeapLocked();
+-}
+-
++    arena.blocks[static_cast<size_t>(index)].free = true;
++    coalesceArenaLocked(arena);
++}
++
++// P3.7.1: SetupHeap's HLE (Syscalls/System.cpp) calls this. It must only
++// ever touch GameHeapState -- see BLOCKER_004_pss_video_output.md section
++// 14.6 for the demonstrated crt0 call (SetupHeap(0x01F00100, 0)) that used
++// to recollapse guestMalloc's storage through this exact entry point.
++//
++// P3.7.1.2 (C3): hardLimit is PS2_RAM_SIZE here, NOT kGuestHeapHardLimit.
++// kGuestHeapHardLimit exists to keep an AUTOMATIC, unverified
++// RuntimeGuestArena placement out of the title's own high-memory
++// structures (overlays, C heap, stack) -- it was never meant to constrain
++// what the title itself declares as its own heap. GameHeapState carries no
++// backing allocator (guestMalloc never reads it), so clamping the title's
++// own declared base against that boundary only produced incorrect
++// bookkeeping (e.g. DMC's real SetupHeap(0x1F00100, 0) getting clamped
++// down to 0x1F00000 and then spuriously colliding with its own limit).
+ void PS2Runtime::configureGuestHeap(uint32_t guestBase, uint32_t guestLimit)
+ {
+-    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-    uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
++    std::lock_guard<std::mutex> lock(m_gameHeapMutex);
++    const uint32_t hardLimit = PS2_RAM_SIZE;
++    uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase, hardLimit), kGuestHeapDefaultAlignment);
+     if (normalizedBase == 0u)
+     {
+-        normalizedBase = (m_guestHeapSuggestedBase != 0u) ? m_guestHeapSuggestedBase : kGuestHeapDefaultBase;
++        normalizedBase = (m_gameHeapState.suggestedBase != 0u) ? m_gameHeapState.suggestedBase : kGuestHeapDefaultBase;
+     }
+-    m_guestHeapSuggestedBase = normalizedBase;
+-    resetGuestHeapLocked(normalizedBase, guestLimit);
++    m_gameHeapState.suggestedBase = normalizedBase;
++    resetArenaLocked(m_gameHeapState, normalizedBase, guestLimit, hardLimit, /*allowEmpty=*/true);
+ }
+ 
+ uint32_t PS2Runtime::guestMalloc(uint32_t size, uint32_t alignment)
+ {
+-    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-    ensureGuestHeapInitializedLocked();
+-    return allocateGuestBlockLocked(size, alignment);
++    std::lock_guard<std::mutex> lock(m_runtimeArenaMutex);
++    ensureRuntimeArenaInitializedLocked();
++    if (m_runtimeArena.unavailable)
++    {
++        // P3.7.1.2 (C2): low-volume, unmistakable -- never a silent 0.
++        static std::atomic<uint32_t> s_unavailableWarnCount{0u};
++        if (s_unavailableWarnCount.fetch_add(1u, std::memory_order_relaxed) < 5u)
++        {
++            std::cerr << "[RuntimeGuestArena:FATAL] guestMalloc(size=0x" << std::hex << size
++                      << ", alignment=0x" << alignment << std::dec
++                      << ") called while RuntimeGuestArena is UNAVAILABLE -- returning 0." << std::endl;
++        }
++        return 0u;
++    }
++    return allocateArenaBlockLocked(m_runtimeArena, size, alignment);
+ }
+ 
+ uint32_t PS2Runtime::guestCalloc(uint32_t count, uint32_t size, uint32_t alignment)
+@@ -1830,18 +2023,18 @@ uint32_t PS2Runtime::guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t
+     const uint32_t normalizedAlignment = normalizeGuestHeapAlignment(alignment);
+     const uint32_t requestedSize = alignGuestHeapValue(newSize, kGuestHeapDefaultAlignment);
+ 
+-    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-    ensureGuestHeapInitializedLocked();
++    std::lock_guard<std::mutex> lock(m_runtimeArenaMutex);
++    ensureRuntimeArenaInitializedLocked();
+ 
+-    const int32_t index = findGuestHeapBlockIndexLocked(guestAddr);
++    const int32_t index = findArenaBlockIndexLocked(m_runtimeArena, guestAddr);
+     if (index < 0)
+     {
+         return 0u;
+     }
+ 
+     const size_t blockIndex = static_cast<size_t>(index);
+-    const uint32_t oldAddr = m_guestHeapBlocks[blockIndex].addr;
+-    const uint32_t oldSize = m_guestHeapBlocks[blockIndex].size;
++    const uint32_t oldAddr = m_runtimeArena.blocks[blockIndex].addr;
++    const uint32_t oldSize = m_runtimeArena.blocks[blockIndex].size;
+ 
+     if (requestedSize <= oldSize)
+     {
+@@ -1849,43 +2042,43 @@ uint32_t PS2Runtime::guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t
+         {
+             const uint32_t tailAddr = oldAddr + requestedSize;
+             const uint32_t tailSize = oldSize - requestedSize;
+-            m_guestHeapBlocks[blockIndex].size = requestedSize;
+-            m_guestHeapBlocks.insert(m_guestHeapBlocks.begin() + static_cast<std::ptrdiff_t>(blockIndex + 1u),
+-                                     GuestHeapBlock{tailAddr, tailSize, true});
+-            coalesceGuestHeapLocked();
++            m_runtimeArena.blocks[blockIndex].size = requestedSize;
++            m_runtimeArena.blocks.insert(m_runtimeArena.blocks.begin() + static_cast<std::ptrdiff_t>(blockIndex + 1u),
++                                        GuestHeapBlock{tailAddr, tailSize, true});
++            coalesceArenaLocked(m_runtimeArena);
+         }
+         return oldAddr;
+     }
+ 
+-    if (blockIndex + 1u < m_guestHeapBlocks.size())
++    if (blockIndex + 1u < m_runtimeArena.blocks.size())
+     {
+-        GuestHeapBlock &next = m_guestHeapBlocks[blockIndex + 1u];
+-        const uint64_t blockEnd = static_cast<uint64_t>(m_guestHeapBlocks[blockIndex].addr) +
+-                                  static_cast<uint64_t>(m_guestHeapBlocks[blockIndex].size);
++        GuestHeapBlock &next = m_runtimeArena.blocks[blockIndex + 1u];
++        const uint64_t blockEnd = static_cast<uint64_t>(m_runtimeArena.blocks[blockIndex].addr) +
++                                  static_cast<uint64_t>(m_runtimeArena.blocks[blockIndex].size);
+         if (next.free && blockEnd == next.addr)
+         {
+-            const uint64_t combined = static_cast<uint64_t>(m_guestHeapBlocks[blockIndex].size) +
++            const uint64_t combined = static_cast<uint64_t>(m_runtimeArena.blocks[blockIndex].size) +
+                                       static_cast<uint64_t>(next.size);
+             if (combined >= requestedSize)
+             {
+-                const uint32_t extraNeeded = requestedSize - m_guestHeapBlocks[blockIndex].size;
+-                m_guestHeapBlocks[blockIndex].size = requestedSize;
++                const uint32_t extraNeeded = requestedSize - m_runtimeArena.blocks[blockIndex].size;
++                m_runtimeArena.blocks[blockIndex].size = requestedSize;
+                 if (next.size == extraNeeded)
+                 {
+-                    m_guestHeapBlocks.erase(m_guestHeapBlocks.begin() + static_cast<std::ptrdiff_t>(blockIndex + 1u));
++                    m_runtimeArena.blocks.erase(m_runtimeArena.blocks.begin() + static_cast<std::ptrdiff_t>(blockIndex + 1u));
+                 }
+                 else
+                 {
+                     next.addr += extraNeeded;
+                     next.size -= extraNeeded;
+                 }
+-                m_guestHeapEnd = std::max(m_guestHeapEnd, oldAddr + requestedSize);
++                m_runtimeArena.end = std::max(m_runtimeArena.end, oldAddr + requestedSize);
+                 return oldAddr;
+             }
+         }
+     }
+ 
+-    const uint32_t newAddr = allocateGuestBlockLocked(newSize, normalizedAlignment);
++    const uint32_t newAddr = allocateArenaBlockLocked(m_runtimeArena, newSize, normalizedAlignment);
+     if (newAddr == 0u)
+     {
+         return 0u;
+@@ -1901,7 +2094,7 @@ uint32_t PS2Runtime::guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t
+             std::memmove(rdram + dstPhys, rdram + srcPhys, copyBytes);
+     }
+ 
+-    freeGuestBlockLocked(oldAddr);
++    freeArenaBlockLocked(m_runtimeArena, oldAddr);
+     return newAddr;
+ }
+ 
+@@ -1912,29 +2105,64 @@ void PS2Runtime::guestFree(uint32_t guestAddr)
+         return;
+     }
+ 
+-    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-    ensureGuestHeapInitializedLocked();
+-    freeGuestBlockLocked(guestAddr);
++    std::lock_guard<std::mutex> lock(m_runtimeArenaMutex);
++    ensureRuntimeArenaInitializedLocked();
++    freeArenaBlockLocked(m_runtimeArena, guestAddr);
+ }
+ 
++// P3.7.1: reflects GameHeapState -- what the TITLE declared via SetupHeap,
++// not RuntimeGuestArena. EndOfHeap's HLE (Syscalls/System.cpp) depends on
++// guestHeapLimit() staying scoped to GameHeapState; see section 3 of the
++// P3.7.1 prompt ("EndOfHeap debe devolver lo que corresponda al heap
++// declarado por el JUEGO, no el límite de RuntimeGuestArena").
+ uint32_t PS2Runtime::guestHeapBase() const
+ {
+-    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-    return m_guestHeapConfigured ? m_guestHeapBase : m_guestHeapSuggestedBase;
++    std::lock_guard<std::mutex> lock(m_gameHeapMutex);
++    return m_gameHeapState.configured ? m_gameHeapState.base : m_gameHeapState.suggestedBase;
+ }
+ 
+ uint32_t PS2Runtime::guestHeapEnd() const
+ {
+-    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-    return m_guestHeapConfigured ? m_guestHeapEnd : m_guestHeapSuggestedBase;
++    std::lock_guard<std::mutex> lock(m_gameHeapMutex);
++    return m_gameHeapState.configured ? m_gameHeapState.end : m_gameHeapState.suggestedBase;
+ }
+ 
+ uint32_t PS2Runtime::guestHeapLimit() const
+ {
+-    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+-    return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
++    std::lock_guard<std::mutex> lock(m_gameHeapMutex);
++    return m_gameHeapState.configured ? m_gameHeapState.limit : m_gameHeapState.suggestedBase;
+ }
+ 
++// P3.7.1: diagnostic accessors for RuntimeGuestArena (used by the MPEG.cpp
++// P3.4 diagnostics and by the P3.7.1 validation ladder). Deliberately NOT
++// consulted by EndOfHeap.
++uint32_t PS2Runtime::runtimeArenaBase() const
++{
++    std::lock_guard<std::mutex> lock(m_runtimeArenaMutex);
++    return m_runtimeArena.configured ? m_runtimeArena.base : m_runtimeArena.suggestedBase;
++}
++
++uint32_t PS2Runtime::runtimeArenaEnd() const
++{
++    std::lock_guard<std::mutex> lock(m_runtimeArenaMutex);
++    return m_runtimeArena.configured ? m_runtimeArena.end : m_runtimeArena.suggestedBase;
++}
++
++uint32_t PS2Runtime::runtimeArenaLimit() const
++{
++    std::lock_guard<std::mutex> lock(m_runtimeArenaMutex);
++    return m_runtimeArena.configured ? m_runtimeArena.limit : m_runtimeArena.suggestedBase;
++}
++
++// P3.7.1 (Objetivo 6): invocation stacks now come from RuntimeGuestArena's
++// SAME free-list allocator as guestMalloc, instead of an independent
++// cursor counting down from PS2_RAM_SIZE. This is what "coordina ambos
++// cursores" in practice: there is only one allocator, so a stack block and
++// a guestMalloc block can never overlap by construction. It also removes
++// the demonstrated collision with DMC's real stack (_stack=0x01FFE000
++// falls inside the first [0x01FFC000,0x02000000) reservation the old
++// implementation produced -- see BLOCKER_004_pss_video_output.md section
++// 15.3 for the exact arithmetic).
+ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)
+ {
+     if (size == 0u)
+@@ -1942,35 +2170,59 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+         return 0u;
+     }
+ 
+-    const uint32_t normalizedAlignment = normalizeGuestHeapAlignment(alignment);
+     const uint32_t allocSize = alignGuestHeapValue(size, kGuestHeapDefaultAlignment);
+     if (allocSize == 0u)
+     {
+         return 0u;
+     }
+ 
+-    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+-    uint32_t top = m_asyncCallbackStackTop;
+-    if (top > PS2_RAM_SIZE)
++    std::lock_guard<std::mutex> lock(m_runtimeArenaMutex);
++    ensureRuntimeArenaInitializedLocked();
++    if (m_runtimeArena.unavailable)
+     {
+-        top = PS2_RAM_SIZE;
++        static std::atomic<uint32_t> s_unavailableWarnCount{0u};
++        if (s_unavailableWarnCount.fetch_add(1u, std::memory_order_relaxed) < 5u)
++        {
++            std::cerr << "[RuntimeGuestArena:FATAL] reserveAsyncCallbackStack(size=0x" << std::hex
++                      << allocSize << std::dec << ") called while RuntimeGuestArena is UNAVAILABLE"
++                      << " -- returning 0." << std::endl;
++        }
++        return 0u;
+     }
+-    top &= ~(kGuestHeapDefaultAlignment - 1u);
+ 
+-    if (top <= allocSize)
++    const uint32_t blockAddr = allocateArenaBlockLocked(m_runtimeArena, allocSize, alignment);
++    if (blockAddr == 0u)
+     {
++        std::cerr << "[RuntimeGuestArena] async callback stack exhausted (requested 0x"
++                  << std::hex << allocSize << " bytes, arena=[0x" << m_runtimeArena.base
++                  << ",0x" << m_runtimeArena.limit << ")" << std::dec << std::endl;
+         return 0u;
+     }
+ 
+-    uint32_t base = top - allocSize;
+-    base &= ~(normalizedAlignment - 1u);
+-    if (base < m_asyncCallbackStackFloor || base >= top)
+-    {
++    // P3.7.1.2 (C6): structural invariants. allocateArenaBlockLocked should
++    // already guarantee all of these by construction -- this is a cheap
++    // belt-and-suspenders check, not a substitute for that guarantee.
++    const uint64_t blockEnd64 = static_cast<uint64_t>(blockAddr) + static_cast<uint64_t>(allocSize);
++    const bool boundsOk = blockAddr >= m_runtimeArena.base &&
++                          blockEnd64 <= static_cast<uint64_t>(m_runtimeArena.limit) &&
++                          blockEnd64 > blockAddr && // no wraparound
++                          allocSize >= 0x10u;        // guaranteed by 16-byte alignment above, checked anyway
++    if (!boundsOk)
++    {
++        std::cerr << "[RuntimeGuestArena:FATAL] async-stack invariant violation: block=[0x"
++                  << std::hex << blockAddr << ",0x" << blockEnd64 << ") arena=[0x" << m_runtimeArena.base
++                  << ",0x" << m_runtimeArena.limit << ")" << std::dec
++                  << " -- freeing the block and returning 0 instead of a possibly-unsafe pointer."
++                  << std::endl;
++        freeArenaBlockLocked(m_runtimeArena, blockAddr);
+         return 0u;
+     }
+ 
+-    m_asyncCallbackStackTop = base;
+-    return top - 0x10u;
++    // Preserve the pre-P3.7.1 return convention: callers treat the return
++    // value as the stack's initial top-of-frame pointer, 16 bytes below
++    // the end of the reserved block.
++    const uint32_t returnedSp = blockAddr + allocSize - 0x10u;
++    return returnedSp;
+ }
+ 
+ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)

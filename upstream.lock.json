@@ -11,6 +11,14 @@
     {
       "path": "patches/BLOCKER_003_cdmodule_movie_streaming.patch",
       "sha256": "e7da13f9aba86b2f22ead8eac3bcb237638b4fc3e26fbfaa0a0a5a308581a356"
+    },
+    {
+      "path": "patches/BUILD_ffmpeg_private_link_scope.patch",
+      "sha256": "8ec1c47b67aefdaceffb851cdac1846e7c89d2f909588fcb752cfc7cab604699"
+    },
+    {
+      "path": "patches/BLOCKER_004_runtime_p37_p312.patch",
+      "sha256": "1efe1e2ada188e760314cee414da9a698a69d74ad24226a1280a3c9fea40077f"
     }
   ],
   "patch_identity": {
@@ -19,5 +27,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "eaa4fe47d01f8a74a20ff0b5f65b9862ee4c3afc"
+  "patched_commit": "bea812535e0595697b4b28e1889e422553112b34"
 }

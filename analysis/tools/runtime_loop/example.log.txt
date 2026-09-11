@@ -1,0 +1,13 @@
+Abbreviated actual evidence from RUN_008; full log is local/p311/RUN_008/runtime.log.
+[P311:pad] test channel enabled
+[P311:pad] buttons=0xFFF7
+[P311:pad] buttons=0xFFFF
+[P311:pad] buttons=0xBFFF
+[P311:pad] buttons=0xFFFF
+[P311:R0] init ra=0x0047A6F4 callbackKeys=1 generation=0 produced=0 demuxed=262144 eofPending=0 eofSeen=0
+[P311:R0-state] key=0x0087D8F8 decoder=1 frames=4 sawInput=1 pssBytes=0 syncBytes=0 width=320 height=240 generation=0
+[P311:R1] init complete playbackKeys=0 callbackKeys=0
+[P311:R2] new playback key=0x0087D8F8
+[P311:R7] first GetPicture key=0x0087D8F8
+[GP:A] #1 entry mpeg=0x87d8f8 decodedFrames=0 streamEnded=0 decoderFailed=0 cdStreamEofSeen=0 sawInput=0 picturesServed=0
+[GP:H] #1 waitExternal(kMpegPictureWaitType, mpeg=0x87d8f8) -- SUSPENDING, no frame available

@@ -1,0 +1,13 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index e4dc195..a1dc1c5 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -504,7 +504,7 @@ target_include_directories(ps2_runtime PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+ )
+ 
+-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ps2_iop PRIVATE ffmpeg)
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime

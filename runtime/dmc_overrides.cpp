@@ -3,6 +3,7 @@
 #include "ps2_stubs.h"
 
 #include <cstdio>
+#include "p311_pad_test.inc"
 
 // Instrumented stand-ins for 20 addresses whose exported CSV/Ghidra boundaries were
 // bogus (1-3.6MB "functions" caused by Ghidra decoding COP2/VU0/MMI R5900 opcodes as
@@ -74,6 +75,7 @@ namespace
 
     void applyHugeFunctionInstrumentation(PS2Runtime &runtime)
     {
+        startP311PadTest();
         runtime.registerFunction(0x0016B8E0u, dmcStub_Calc_md);
         runtime.registerFunction(0x001A0080u, dmcStub_capVu0MulMatrix2);
         runtime.registerFunction(0x001A0180u, dmcStub_capVu0MulMatrix_r);
