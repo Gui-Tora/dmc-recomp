@@ -10,12 +10,15 @@ project, not a playable port.
 
 - BLOCKER_001 (entry point / function-boundary corruption): **RESOLVED**
 - BLOCKER_002 (missing CD-read IOP service): **RESOLVED**
+- BLOCKER_003 (movie/PSS CD streaming transport): **RESOLVED**
+- BLOCKER_004 (PSS movie data reaches the EE but produces no visible
+  video): **OPEN**
 - Real interactive boot reached
 - DualSense/gamepad input works well enough to navigate in-game menus
 - Title screen reached
 - Rendering is still incomplete/corrupted
 - Later game states (gameplay, missions) are not yet functional
-- BLOCKER_003 has not yet been formally identified
+- Visible movie/PSS playback does not yet work
 
 Do not read any of the above as "playable", "complete", "ported", or
 "remastered" — none of that is true yet.
@@ -56,24 +59,30 @@ Full setup instructions: [`AGENTS.md`](AGENTS.md) and
 
 ## Development workflow
 
-This project is developed with an AI-assisted workflow across three
+This project is developed with an AI-assisted workflow across several
 different roles, kept deliberately separate so that no single actor both
 implements and grades its own work.
 
 **ChatGPT** — coordinates the investigation: helps structure
 reverse-engineering strategy, connects evidence across experiments, designs
-validation steps, reviews Claude's and Astra's results critically, and
-identifies what is still missing before a blocker can be considered closed.
+validation steps, reviews other agents' results critically, and identifies
+what is still missing before a blocker can be considered closed.
 
-**Claude** — the operational agent working directly inside the repository:
-reads and modifies code, implements instrumentation and fixes, drives
-bootstrap/build/pipeline, runs experiments, analyzes runtime logs, updates
-technical documentation, and creates local Git checkpoints.
+**Claude (Sonnet)** — the operational agent working directly inside the
+repository: reads and modifies code, implements instrumentation and fixes,
+drives bootstrap/build/pipeline, runs experiments, analyzes runtime logs,
+updates technical documentation, and creates local Git checkpoints.
 
-**Astra** — an independent technical auditor, deliberately separated from
-the implementation role. Reconstructs causal chains independently, attempts
-to falsify prior conclusions, and distinguishes demonstrated fact from
-strongly supported conclusion, from inference, from open hypothesis. Looks
+**Astra** — an independent, high-depth investigator that runs its own
+runtime experiments (autonomous boot/input loops, RAM/buffer diagnostics)
+separate from the implementation session, and reconstructs causal chains
+from that first-hand evidence rather than from prior write-ups.
+
+**Fable** — an independent adversarial auditor. Deliberately separated from
+both implementation and Astra's own investigation; its job is to try to
+falsify prior conclusions (Claude's or Astra's), re-derive causal chains
+from primary sources, and distinguish demonstrated fact from strongly
+supported conclusion, from inference, from open hypothesis. Looks
 specifically for overclaims, contradictions, and missing validation before a
 major blocker is signed off.
 
@@ -88,7 +97,7 @@ The investigative loop:
 3. Define what evidence would actually settle it.
 4. Claude instruments, implements, and tests.
 5. Compare against PCSX2 where original behavior is needed.
-6. Astra independently audits significant blockers.
+6. Astra and/or Fable independently audit significant blockers or findings.
 7. Incorporate audit corrections.
 8. Revalidate.
 9. Git checkpoint.
@@ -119,12 +128,51 @@ fix and its closing validation were independently audited (see
 Full causal chain, evidence, and hash-verified validation:
 [`analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md`](analysis/notes/BLOCKER_002_indirect_jump_top_of_ram.md).
 
-Known, currently out-of-scope limitations (not yet classified as a new
-blocker — none of them has been shown to actually block further progress):
+**BLOCKER_003** — movie/PSS CD streaming transport. The CDMODULE.IRX RPCs
+used to start, chunk-transfer, and end movie playback (`fno=9/0xA/0xC/0xD`)
+had no HLE implementation; fixed with an HLE movie/PSS streaming service
+that feeds the CD-transport layer used by MPEG demuxing. Scope: CD/IOP
+transport only — see
+[`analysis/notes/BLOCKER_003_cdmodule_movie_streaming.md`](analysis/notes/BLOCKER_003_cdmodule_movie_streaming.md).
+
+**BLOCKER_004** — PSS movie data reaches the EE but produces no visible
+video. **Open.** Validated so far:
+
+- FFmpeg-backed video decode is active and receiving real PSS video bytes.
+- PSS transport/demux reaches the MPEG HLE pipeline.
+- The runtime guest heap/arena and async callback-stack allocation
+  (previously colliding with the game's own heap) were separated and
+  hardened.
+- The EE scheduler's batch ordering for queued guest invocations
+  (`queueInvocation`) was corrected: batches were being drained in FIFO
+  order into a per-thread stack that executes LIFO, silently reversing
+  every batch (MPEG demux callbacks, IRQ handler groups, VBlank
+  callback/IRQ ordering). After the fix, the guest video buffer (`viBuf`)
+  matches the expected MPEG video elementary stream **byte-for-byte**,
+  validated in 3/3 independent runs.
+- The next contractual divergence currently identified within the audited
+  segment is `sceMpegInit` ownership: the original resets IPU/DMA hardware
+  on init but does not destroy the guest-side MPEG software session; the
+  current HLE over-resets MPEG callbacks, configuration, and accepted-input
+  ownership on every init. Whether preserving the decoder/decoded-frame
+  state across that reset is itself sufficient or necessary is still
+  **unknown** — not yet implemented or validated.
+- This is the first contractual divergence demonstrated *within the
+  segment audited so far*, not a claim that it is the absolute first
+  divergence since cold boot.
+- Visible movie/PSS playback does not work yet; the project remains **not
+  playable**.
+
+Full history: [`analysis/notes/BLOCKER_004_pss_video_output.md`](analysis/notes/BLOCKER_004_pss_video_output.md)
+(canonical, cumulative) and the independent audits referenced from it
+(`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`, `BLOCKER_004_FABLE_P3111_CAUSAL_AUDIT.md`,
+`BLOCKER_004_P312_SCHEDULER_BATCH_ORDER.md`).
+
+Known, currently out-of-scope limitations (not yet classified as blocking
+further progress):
 
 - `CdModuleService` only handles `mode=1`; `mode=2` is left explicitly
   unsupported.
-- CDMODULE RPCs `0x9`, `0xA`, `0xD` are unhandled.
 - Rendering is incomplete/corrupted past the title screen.
 - The boot flow after the title screen is still under investigation.
 
