@@ -4703,11 +4703,62 @@ explícita de la teoría inicial.
   deterministamente (`patched_commit` actualizado en
   `upstream.lock.json`); commit local creado, no pusheado.
 
-**Estado consolidado tras P4.1**: la causa raíz original de "los datos
-de película PSS llegan a la EE pero no producen video visible" —en la
-parte de entorno de presentación GS que bloqueaba mostrar cualquier
-imagen coherente— está corregida y validada. BLOCKER_004 **no se cierra
-globalmente**: quedan pendientes el fix de `AMOD` (P4.1.x, ya
-localizado), auditoría exhaustiva de semántica PSM/formato de píxel, y
-la causa del patrón de "mitad de cuadro negra" observado en algunos
-frames post-fix.
+- **P4.1.1 → P4.1.1R → P4.1.1B** (informes:
+  [BLOCKER_004_P411_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE.md](BLOCKER_004_P411_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE.md),
+  [BLOCKER_004_P411R_P314_BASELINE_REPRODUCIBILITY.md](BLOCKER_004_P411R_P314_BASELINE_REPRODUCIBILITY.md),
+  [BLOCKER_004_P411B_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE_RETRY.md](BLOCKER_004_P411B_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE_RETRY.md)):
+  localiza dinámicamente el patrón de "mitad de cuadro negra" dejado
+  abierto por P4.1 — el frame decodificado y su copia en el buffer guest
+  `0x79D680` están siempre completos; la divergencia aparece en el VRAM
+  de GS, específicamente en el buffer de presentación `FBP=0x0A0`, cuyas
+  filas 256-447 aparecían sistemáticamente en negro (52/52 muestras).
+  P4.1.1's primer intento quedó invalidado por un error de entorno de
+  lanzamiento propio (variable `DMC_P314_SYNC_REDECODE` no fijada,
+  identificado y corregido en P4.1.1R); P4.1.1B repite la instrumentación
+  con el entorno corregido y confirma el mismo resultado. `preferredSource`
+  y `FIELD` quedan exonerados dinámicamente. Causa raíz exacta dejada
+  como candidato para P4.1.2 (upload parcial vs. algo que borra después).
+
+- **P4.1.2** (informe:
+  [BLOCKER_004_P412_FABLE_FBPA0_PARTIAL_UPLOAD_ROOT_CAUSE_AUDIT.md](BLOCKER_004_P412_FABLE_FBPA0_PARTIAL_UPLOAD_ROOT_CAUSE_AUDIT.md),
+  auditoría adversarial independiente, "Fable"): **retracta** la
+  caracterización de P4.1.1B ("el buffer 0xA0 nunca recibe las filas
+  256-447") — la subida GIF de película es completa y simétrica para
+  ambos slots (384/384 strips, relectura de VRAM confirma 0-447). La
+  causa real: `sceGsSetDefDBuffDc` sembraba el `FRAME FBP` de los
+  draw-envs del segundo slot (`draw11`/`draw12`) con `zbufAddr` (`0xE0`)
+  en vez de literal `0` — la MISMA clase de bug que P4.1 ya había
+  corregido para el entorno de *display* (`dispfb0`), esta vez en el
+  entorno de *draw*. Por direccionamiento real de páginas GS, `FRAME
+  FBP=0xE0` alias exactamente las filas 256-447 de `FBP=0xA0`: cada
+  frame en que el guest dibuja su propio sprite de fade/UI opaco negro
+  mientras muestra ese buffer, lo hace sin querer sobre esas filas y las
+  borra, después de la subida y antes de la presentación.
+
+- **P4.1.3** (informe:
+  [BLOCKER_004_P413_SCEGSSETDEFDBUFFDC_DRAWENV_FRAME_FIX.md](BLOCKER_004_P413_SCEGSSETDEFDBUFFDC_DRAWENV_FRAME_FIX.md),
+  patch: `patches/BLOCKER_004_p413_scegssetdefdbuffdc_drawenv_frame_zero.patch`):
+  implementa el fix de una línea identificado por P4.1.2
+  (`draw11`/`draw12`'s `FRAME FBP` → literal `0`), sin tocar `zbufAddr`,
+  `ZBUF`, ni el fix de `dispfb` de P4.1. Validado 3/3: 0 draws reales con
+  `FRAME=0xE0` en toda la corrida (antes: 100% de las presentaciones de
+  `FBP=0xA0` mostraban la mitad inferior en negro puro); el patrón
+  52/52→0/N desaparece por completo; entorno guest confirmado
+  dinámicamente (`draw11` `FRAME=0x000`, `ZBUF=0xE0`/`ZMSK=1` sin cambio
+  en ambos slots); `DISPFB2` de P4.1 sigue alternando `0x000`/`0x0A0`
+  sin regresión; confirmado visualmente (ventana previamente afectada,
+  6/6 capturas completas, sin corte). Clasificación
+  `P413_DRAWENV_FRAME_FIX_CAUSAL_AND_VALIDATED`, checkpoint
+  `FIX_CHECKPOINT_WITH_KNOWN_CAVEATS`.
+
+**Estado consolidado tras P4.1.3**: los dos defectos de entorno de
+presentación GS localizados hasta ahora en BLOCKER_004 (`dispfb`
+corregido en P4.1; `FRAME` de draw corregido en P4.1.3) están
+corregidos y validados 3/3 cada uno. BLOCKER_004 **no se cierra
+globalmente**: quedan pendientes el fix de `AMOD` (ya localizado desde
+P4.0.2), auditoría exhaustiva de semántica PSM/formato de píxel, el
+flicker general de UI/presentación (mejora estructural esperada, sin
+comparación visual A/B dedicada), y — el residual mayor conocido — la
+corrupción determinista tardía de MPEG a partir de aproximadamente
+picture 43 (camino de feed/recirculación del ring, no tocado por
+ninguno de los prompts P4.1.x).

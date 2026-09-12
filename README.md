@@ -224,10 +224,35 @@ video. **Open.** Validated so far:
   project has rendered recognizable movie imagery beyond a single
   warning-screen UI. A separate, already-identified `PMODE.AMOD` bit
   mismatch was deliberately left unfixed in this change to isolate its
-  effect, and remains open, along with an unexplained pattern where
-  several post-fix frames only populate the upper half of the frame.
-  Visible movie/PSS playback is therefore substantially improved but
-  still not fully correct, and the project remains **not playable**.
+  effect, and remains open. That fix also left an unexplained pattern
+  where several post-fix frames only populated the upper ~58% of the
+  frame (rows 0-255), black below.
+- That remaining half-frame pattern was then traced dynamically, first
+  through a launch-environment mistake in the diagnostic harness itself
+  (a required env var was never set, invalidating an initial attempt;
+  identified and corrected), then successfully: the decoded frame and
+  its copy in the guest movie buffer are always complete, but the GS
+  VRAM framebuffer used for one of the two display buffers (`FBP=0xA0`)
+  systematically lost its lower rows (256-447) between upload and
+  presentation. An independent adversarial audit found the exact
+  mechanism: the same HLE stub responsible for the earlier display-buffer
+  fix also seeded the *draw*-environment framebuffer for that slot with
+  the Z-buffer address instead of literal `0` — a second instance of the
+  same bug class. Because of how the GS addresses VRAM pages, that wrong
+  draw target physically aliased exactly the missing rows, so the game's
+  own per-frame opaque black fade/UI sprite was silently overwriting them
+  right after the movie upload, every time that buffer was displayed. A
+  second single-line fix (this time to the draw-environment
+  initialization, leaving the earlier display-environment fix and the
+  Z-buffer value itself untouched) was validated 3/3: zero real draw
+  calls now target the wrong framebuffer, the systematic lower-row
+  blackout is gone, and the double-buffer display selection from the
+  first fix remains intact. Visible movie/PSS playback is therefore
+  further improved but still not fully correct — a separate, already
+  deterministic late-stream MPEG decode corruption (starting around
+  picture 43 of a scene) remains open and unrelated to either of these
+  two presentation-environment fixes — and the project remains **not
+  playable**.
 
 Full history: [`analysis/notes/BLOCKER_004_pss_video_output.md`](analysis/notes/BLOCKER_004_pss_video_output.md)
 (canonical, cumulative) and the independent audits/experiments referenced
@@ -245,7 +270,13 @@ from it (`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`,
 `BLOCKER_004_P40_FABLE_GS_PRESENTATION_CAUSAL_BASELINE.md`,
 `BLOCKER_004_P401_MOVIE_DISPLAY_ENV_RECONCILIATION.md`,
 `BLOCKER_004_P402_SCEGSSETDEFDBUFFDC_ROOT_CAUSE.md`,
-`BLOCKER_004_P41_SCEGSSETDEFDBUFFDC_DISPFB0_ZERO_FIX.md`).
+`BLOCKER_004_P41_SCEGSSETDEFDBUFFDC_DISPFB0_ZERO_FIX.md`,
+`BLOCKER_004_P41F_DISPFB0_FIX_AND_RESIDUAL_FLICKER_AUDIT.md`,
+`BLOCKER_004_P411_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE.md`,
+`BLOCKER_004_P411R_P314_BASELINE_REPRODUCIBILITY.md`,
+`BLOCKER_004_P411B_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE_RETRY.md`,
+`BLOCKER_004_P412_FABLE_FBPA0_PARTIAL_UPLOAD_ROOT_CAUSE_AUDIT.md`,
+`BLOCKER_004_P413_SCEGSSETDEFDBUFFDC_DRAWENV_FRAME_FIX.md`).
 
 Known, currently out-of-scope limitations (not yet classified as blocking
 further progress):

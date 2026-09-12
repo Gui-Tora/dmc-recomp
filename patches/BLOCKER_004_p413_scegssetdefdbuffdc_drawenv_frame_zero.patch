@@ -1,0 +1,24 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index f7c34c5..44e2ea9 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -903,7 +903,18 @@ namespace ps2_stubs
+             zbufAddr = getRegU32(&temp, 2);
+         }
+ 
+-        const uint32_t fbp1 = zbufAddr;
++        // P4.1.3 fix (BLOCKER_004_P412_FABLE_FBPA0_PARTIAL_UPLOAD_ROOT_CAUSE_AUDIT.md):
++        // draw11/draw12's FRAME FBP must default to 0, matching draw01/draw02
++        // below -- not the Z-buffer address. Using zbufAddr (fbp1) here seeded
++        // the slot1 draw-env with FRAME FBP=0xE0, which -- via real GS page
++        // addressing (FBW=8, y=256 -> page 0xA0+8*8=0xE0) -- physically aliases
++        // rows 256-447 of the FBP=0xA0 movie/display buffer: every frame the
++        // guest's own opaque black fade/UI sprite is rasterized through this
++        // env while displaying FBP 0xA0, it silently erases that buffer's
++        // lower half. ZBUF is unaffected (ZMSK=1, no Z writes occur); this was
++        // purely a COLOR FRAME addressing bug, the second instance of the same
++        // root-class defect P4.1 already fixed for the display env (dispfb0).
++        const uint32_t fbp1 = 0u;
+         // P4.1 fix (BLOCKER_004_P402_SCEGSSETDEFDBUFFDC_ROOT_CAUSE.md): disp[0]'s
+         // DISPFB must default to FBP 0, matching disp[1]'s own literal below --
+         // not the Z-buffer address. Using zbufAddr here produced FBP 0xE0,

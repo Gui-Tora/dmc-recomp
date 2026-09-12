@@ -191,3 +191,44 @@ arriba). Los cuatro patches actualmente activos:
    - `analysis/notes/BLOCKER_004_P41_SCEGSSETDEFDBUFFDC_DISPFB0_ZERO_FIX.md` —
      implementación del fix de una línea y validación causal A/B 3/3
      (P4.1).
+
+8. `BLOCKER_004_p413_scegssetdefdbuffdc_drawenv_frame_zero.patch`
+   (convención B). Cambio de una sola línea en `sceGsSetDefDBuffDc`
+   (HLE del SDK, `GS.cpp`): el `FRAME FBP` de los draw-envs del segundo
+   slot (`draw11`/`draw12`) pasa de usar `zbufAddr` (`0xE0`) a literal
+   `0`, igual que `draw01`/`draw02` — la MISMA clase de bug que el
+   patch 7 corrigió para el entorno de *display* (`dispfb0`), esta vez
+   en el entorno de *draw*. Causa raíz aislada por auditoría adversarial
+   independiente (P4.1.2, Fable): `FRAME FBP=0xE0` alias físicamente,
+   vía direccionamiento real de páginas GS (`FBW=8`, fila y=256 → página
+   `0xA0+8·8=0xE0`), las filas 256-447 del buffer de película/display
+   `FBP=0xA0` — cada frame en que el guest muestra ese buffer, su propio
+   sprite de fade/UI opaco negro se rasteriza sin querer sobre ese
+   `FRAME` erróneo y borra la mitad inferior del buffer que se está
+   mostrando, justo antes de la presentación. `ZBUF` no se ve afectado
+   (`ZMSK=1`, sin escrituras Z reales). Retracta la interpretación previa
+   de P4.1.1B ("el buffer 0xA0 nunca recibe la mitad inferior de la
+   subida") — la subida SÍ es completa y simétrica; lo que ocurre
+   después la destruye. Validado 3/3 (P4.1.3): 0 draws con
+   `FRAME=0xE0` en toda la corrida (antes: 100% de las presentaciones de
+   `FBP=0xA0` mostraban la mitad inferior en negro puro, 52/52 en
+   P4.1.1B); post-fix, 0/N corridas muestran ese patrón; entorno guest
+   confirmado (`draw11` slot1 `FRAME=0x000`, `draw01` slot0 `FRAME=0xA0`
+   sin cambio, `ZBUF=0xE0`/`ZMSK=1` sin cambio en ambos); `DISPFB2` de
+   P4.1 sigue alternando `0x000`/`0x0A0` sin regresión; camino síncrono
+   P3.14.2 confirmado activo en las 3 corridas. Checkpoint
+   `FIX_CHECKPOINT_WITH_KNOWN_CAVEATS` — la corrupción tardía
+   determinista de MPEG (≥picture 43) y el flicker general de UI (mismo
+   mecanismo estructural, mejora esperada pero sin comparación visual
+   A/B dedicada) quedan como residuales separados; no es un cierre
+   global de BLOCKER_004. Documentación (no duplicada aquí):
+   - `analysis/notes/BLOCKER_004_P411_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE.md`,
+     `BLOCKER_004_P411R_P314_BASELINE_REPRODUCIBILITY.md`,
+     `BLOCKER_004_P411B_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE_RETRY.md` —
+     cadena de localización dinámica del defecto (P4.1.1/R/B), incluido
+     el hallazgo y resolución de un bloqueo de entorno de lanzamiento
+     ajeno al propio bug.
+   - `analysis/notes/BLOCKER_004_P412_FABLE_FBPA0_PARTIAL_UPLOAD_ROOT_CAUSE_AUDIT.md` —
+     auditoría adversarial que identificó la causa raíz exacta (P4.1.2).
+   - `analysis/notes/BLOCKER_004_P413_SCEGSSETDEFDBUFFDC_DRAWENV_FRAME_FIX.md` —
+     implementación del fix de una línea y validación 3/3 (P4.1.3).
