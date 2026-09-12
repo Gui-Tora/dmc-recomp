@@ -18,7 +18,10 @@ project, not a playable port.
 - Title screen reached
 - Rendering is still incomplete/corrupted
 - Later game states (gameplay, missions) are not yet functional
-- Visible movie/PSS playback does not yet work
+- Movie/PSS frames now render as recognizable, legible imagery (logo
+  text, fire/smoke animation) after a GS double-buffer display
+  environment fix, but playback is not yet fully correct (see
+  BLOCKER_004)
 
 Do not read any of the above as "playable", "complete", "ported", or
 "remastered" — none of that is true yet.
@@ -200,8 +203,31 @@ video. **Open.** Validated so far:
   submission — is consistent; any remaining visual corruption is now
   understood to sit at or after the guest→runtime GIF/GS hardware
   boundary (exact pixel-format/layout semantics not yet audited), not in
-  MPEG decode or transport. Visible movie/PSS playback is still not
-  correct, and the project remains **not playable**.
+  MPEG decode or transport.
+- That guest→runtime GS boundary was then audited directly (an
+  independent causal baseline, reconciled against live measurements
+  taken on original PCSX2 hardware). The first EN1/"display circuit 1"
+  theory for the divergence was checked against those live measurements
+  and explicitly retracted — original hardware also runs with circuit 1
+  disabled during movie playback. The real divergence was isolated to
+  the guest-side double-buffer display environment construction
+  (`sceGsSetDefDBuffDc`, an HLE SDK stub): its `disp[0]` slot was
+  initialized with the Z-buffer address instead of the literal `0` used
+  correctly for `disp[1]`, traced and confirmed via exact numeric
+  reproduction of the original Z-buffer-address formula plus a
+  guest-code symmetry argument. A single-line fix was implemented,
+  validated 3/3 (identical executable hash, byte-exact guest-environment
+  match against the original's live-measured values in all three runs),
+  and shows a dramatic, reproducible visual improvement: legible cursive
+  logo text and coherent fire/smoke animation frames replace the
+  previous narrow banded/ghosted fragments — the first time this
+  project has rendered recognizable movie imagery beyond a single
+  warning-screen UI. A separate, already-identified `PMODE.AMOD` bit
+  mismatch was deliberately left unfixed in this change to isolate its
+  effect, and remains open, along with an unexplained pattern where
+  several post-fix frames only populate the upper half of the frame.
+  Visible movie/PSS playback is therefore substantially improved but
+  still not fully correct, and the project remains **not playable**.
 
 Full history: [`analysis/notes/BLOCKER_004_pss_video_output.md`](analysis/notes/BLOCKER_004_pss_video_output.md)
 (canonical, cumulative) and the independent audits/experiments referenced
@@ -215,7 +241,11 @@ from it (`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`,
 `BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md`,
 `BLOCKER_004_P315_GETPICTURE_PRESENTATION_CONTRACT.md`,
 `BLOCKER_004_P3151_GUEST_PRESENTATION_TRACE.md`,
-`BLOCKER_004_P3152_MOVIE_TAG_CHAIN_IMAGEADDR_DATAFLOW.md`).
+`BLOCKER_004_P3152_MOVIE_TAG_CHAIN_IMAGEADDR_DATAFLOW.md`,
+`BLOCKER_004_P40_FABLE_GS_PRESENTATION_CAUSAL_BASELINE.md`,
+`BLOCKER_004_P401_MOVIE_DISPLAY_ENV_RECONCILIATION.md`,
+`BLOCKER_004_P402_SCEGSSETDEFDBUFFDC_ROOT_CAUSE.md`,
+`BLOCKER_004_P41_SCEGSSETDEFDBUFFDC_DISPFB0_ZERO_FIX.md`).
 
 Known, currently out-of-scope limitations (not yet classified as blocking
 further progress):

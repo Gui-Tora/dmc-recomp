@@ -156,3 +156,38 @@ arriba). Los cuatro patches actualmente activos:
    - `analysis/notes/BLOCKER_004_P3142_VIBUF_CONSUMPTION_AND_OWNERSHIP.md` —
      diseño e implementación del Modelo B, ownership único de decode,
      validación 3/3 con imagen de película reconocible (P3.14.2).
+
+7. `BLOCKER_004_p41_scegssetdefdbuffdc_dispfb0_zero.patch` (convención
+   B). Cambio de una sola línea en `sceGsSetDefDBuffDc` (HLE del SDK,
+   `GS.cpp`): `disp[0].dispfb` (`FBP`) pasa de usar `zbufAddr` (valor de
+   dirección de Z-buffer, `0xE0`) a literal `0`, igual que `disp[1]`.
+   Root cause aislado y cerrado en P4.0.1/P4.0.2 (divergencia de
+   entorno de presentación de película guest vs. hardware original,
+   remontada hasta esta asignación incorrecta de campo dentro del HLE);
+   validado 3/3 en P4.1: entorno guest post-fix coincide exactamente
+   con las mediciones en vivo de PCSX2 original (`DISPFB2` alterna
+   `0x1000`/`0x10A0`), sin regresión en progresión MPEG (150 éxitos de
+   `GetPicture` en las 3 corridas), y mejora visual reproducible y
+   dramática (fotogramas completos y coherentes en vez de bandas/
+   fragmentos). Checkpoint `FIX_CHECKPOINT_WITH_KNOWN_CAVEATS` —
+   `AMOD` (bit6 de `PMODE`) permanece divergente (no tocado
+   deliberadamente en este patch, ver informe) y la semántica PSM/
+   formato de píxel de P3.15.2 sigue sin auditar; no es un cierre
+   global de BLOCKER_004. Documentación (no duplicada aquí):
+   - `analysis/notes/BLOCKER_004_P40_FABLE_GS_PRESENTATION_CAUSAL_BASELINE.md` —
+     baseline causal independiente que primero ubicó la divergencia en
+     el entorno de presentación GS (P4.0), con una teoría de EN1/
+     circuito-1 posteriormente retractada.
+   - `analysis/notes/BLOCKER_004_P401_MOVIE_DISPLAY_ENV_RECONCILIATION.md` —
+     reconciliación con mediciones directas de PCSX2 original,
+     retracción explícita de la teoría EN1, aislamiento del nodo de
+     divergencia en la construcción del entorno guest antes de la
+     escritura GS (P4.0.1).
+   - `analysis/notes/BLOCKER_004_P402_SCEGSSETDEFDBUFFDC_ROOT_CAUSE.md` —
+     cierre de causa raíz: cómputo exacto de `zbufAddr`, identificación
+     del escritor real de `disp[1].dispfb=0xA0` en código guest, y
+     prueba por simetría de que `disp[0].dispfb` debe inicializarse en
+     `0` (P4.0.2).
+   - `analysis/notes/BLOCKER_004_P41_SCEGSSETDEFDBUFFDC_DISPFB0_ZERO_FIX.md` —
+     implementación del fix de una línea y validación causal A/B 3/3
+     (P4.1).

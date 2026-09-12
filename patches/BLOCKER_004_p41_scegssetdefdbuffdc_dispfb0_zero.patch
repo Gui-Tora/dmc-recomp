@@ -1,0 +1,18 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 9c54919..f7c34c5 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -904,7 +904,12 @@ namespace ps2_stubs
+         }
+ 
+         const uint32_t fbp1 = zbufAddr;
+-        const uint64_t dispfb0 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
++        // P4.1 fix (BLOCKER_004_P402_SCEGSSETDEFDBUFFDC_ROOT_CAUSE.md): disp[0]'s
++        // DISPFB must default to FBP 0, matching disp[1]'s own literal below --
++        // not the Z-buffer address. Using zbufAddr here produced FBP 0xE0,
++        // proven (by direct original PCSX2 measurement + guest-code symmetry
++        // argument) to diverge from the real SDK default of 0.
++        const uint64_t dispfb0 = makeDispFb(0u, fbw, psm, 0u, 0u);
+         const uint64_t dispfb1 = makeDispFb(0u, fbw, psm, 0u, 0u);
+ 
+         GsDBuffDcMem db{};

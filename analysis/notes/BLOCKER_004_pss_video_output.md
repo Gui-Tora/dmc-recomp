@@ -2,6 +2,25 @@
 
 ## Estado
 
+`OPEN` (`RESOLVED_WITH_CAVEATS` para el sub-issue específico de
+inicialización del entorno de doble buffer GS — ver sección "P4 —
+GS presentation environment", al final de este documento, para la
+historia completa y actualizada P4.0→P4.1). El resto de este bloque
+"Estado" documenta el estado histórico anterior a P4; se preserva
+sin modificar por trazabilidad.
+
+**Resumen P4 (ver sección dedicada al final para detalle completo)**:
+la causa raíz de por qué el buffer de presentación de película (`disp[0]`)
+usaba una dirección de framebuffer incorrecta (`FBP=0xE0`, dirección de
+Z-buffer, en vez de `FBP=0`) fue localizada (P4.0.2) y corregida y
+validada 3/3 (P4.1), con mejora visual dramática y reproducible
+(texto/imágenes de película ahora legibles). `AMOD` (un bit de `PMODE`)
+sigue divergente frente al original y queda pendiente; la semántica
+PSM/formato de píxel no está auditada exhaustivamente. No se declara
+BLOCKER_004 cerrado globalmente.
+
+---
+
 `OPEN`. **Primera divergencia real localizada con precisión total**
 (demostrada dinámica Y estáticamente, ver sección 12): dentro de
 `dispatchGuestStreamCallback` (`MPEG.cpp`), el despacho de la invocación
@@ -4611,3 +4630,84 @@ Sin gameplay, cambios semánticos MPEG, commits, push ni builds masivos.
   `P4.0 — GS_GUEST_TO_RUNTIME_PRESENTATION_CONTRACT` — cualquier
   divergencia causal restante ya no parece estar del lado
   guest/MPEG.
+
+## P4 — GS presentation environment (entorno de doble buffer)
+
+Cadena completa desde el baseline causal independiente hasta el fix
+validado. Historia preservada íntegra, incluyendo la retracción
+explícita de la teoría inicial.
+
+- **P4.0** (informe: [BLOCKER_004_P40_FABLE_GS_PRESENTATION_CAUSAL_BASELINE.md](BLOCKER_004_P40_FABLE_GS_PRESENTATION_CAUSAL_BASELINE.md),
+  auditor independiente "Fable"): baseline causal que ubicó la
+  divergencia en el entorno de presentación GS (no en el pipeline MPEG,
+  ya cerrado como coherente por P3.15.2). Concluyó que `PMODE.EN1`
+  nunca llega a `1` en RECOMP como "primer nodo divergente probado",
+  infiriendo que el hardware original debía habilitar EN1/circuito 1
+  para mostrar la película.
+
+- **P4.0.1** (informe: [BLOCKER_004_P401_MOVIE_DISPLAY_ENV_RECONCILIATION.md](BLOCKER_004_P401_MOVIE_DISPLAY_ENV_RECONCILIATION.md)):
+  recibe dos muestras nuevas medidas en vivo en PCSX2 original durante
+  reproducción correcta de la película: `PMODE=0xFF66`,
+  `DISPFB1=DISPLAY1=0` (circuito 1 deshabilitado también en el
+  original), `DISPFB2` alternando `0x1000`/`0x10A0`. Decodificación de
+  bits independiente confirmó que tanto `0xFF26` (RECOMP) como `0xFF66`
+  (original) tienen `EN1=0` (bit0). **Se RETRACTA por completo la
+  teoría EN1/circuito-1 de P4.0** (no se acota, se retracta). Traza la
+  cadena guest real `Main_init → MainGsSetDefDBuffDc →
+  sceGsSetDefDBuffDc (HLE) → MainSetPalMovieEnv → MainGsSwapDBuffDc`,
+  confirma por disassembly que `MainGsSwapDBuffDc` copia `PMODE`/
+  `DISPFB2` literalmente (sin transformación) al registro privilegiado,
+  y ubica la divergencia real en la construcción del entorno guest
+  *antes* de esa escritura — específicamente en una asimetría dentro de
+  `sceGsSetDefDBuffDc` entre `disp[0]` y `disp[1]`. Deja dos UNKNOWN
+  explícitos (valor exacto de `zbufAddr`; origen del `0xA0` compartido
+  en `disp[1]`). `IMPLEMENTATION_READY: NO`.
+
+- **P4.0.2** (informe: [BLOCKER_004_P402_SCEGSSETDEFDBUFFDC_ROOT_CAUSE.md](BLOCKER_004_P402_SCEGSSETDEFDBUFFDC_ROOT_CAUSE.md)):
+  cierra ambos UNKNOWN de P4.0.1. Cómputo exacto y verificado de
+  `zbufAddr=0xE0` a partir de los parámetros reales (`w=512,h=448`) vía
+  la fórmula real de `sceGszbufaddr`. Identifica el escritor real de
+  `disp[1].dispfb=0xA0`: código guest real y sin modificar en
+  `Main_init` (dirección exacta confirmada), inmediatamente después de
+  la segunda llamada a `MainGsSetDefDBuffDc`. Por el mismo argumento de
+  simetría de código guest (nada parchea `disp[0].dispfb` de forma
+  equivalente), prueba que el valor inicial correcto de
+  `disp[0].dispfb` según el contrato real del SDK debe ser `FBP=0`, y
+  que el HLE de `sceGsSetDefDBuffDc` lo inicializa incorrectamente con
+  `zbufAddr` (`0xE0`) en su lugar — causa raíz. Identifica también,
+  como hallazgo secundario independiente y deliberadamente diferido, un
+  bug de `AMOD` hardcodeado a `0` en el mismo HLE (original mide
+  `AMOD=1`). `IMPLEMENTATION_READY: YES`.
+
+- **P4.1** (informe: [BLOCKER_004_P41_SCEGSSETDEFDBUFFDC_DISPFB0_ZERO_FIX.md](BLOCKER_004_P41_SCEGSSETDEFDBUFFDC_DISPFB0_ZERO_FIX.md),
+  patch: `patches/BLOCKER_004_p41_scegssetdefdbuffdc_dispfb0_zero.patch`):
+  implementa el fix de una sola línea (`disp[0].dispfb` usa literal `0`
+  en vez de `zbufAddr`), sin tocar `AMOD` ni ningún otro campo. Validado
+  3/3 (`RUN_044`/`RUN_045`/`RUN_046`, mismo hash de ejecutable): entorno
+  guest post-fix coincide exactamente, byte a byte, con la predicción
+  (`disp[0].dispfb=0x1000`, `disp[1].dispfb=0x10a0`, re-verificado
+  directamente sobre los RAM dumps) y con las mediciones en vivo del
+  original (`DISPFB2` alternando `0x1000`/`0x10A0`). Mejora visual
+  dramática y reproducible: texto cursivo "Devil"/"May" legible sobre
+  fondo de humo/fuego, y texturas de fuego a resolución completa,
+  reemplazando los fragmentos/bandas/ghosting del pre-fix. Sin
+  regresión en progresión MPEG (187-194 invocaciones de `GetPicture`
+  por corrida, sin deadlock ni error fatal en las 3). Caveat honesto no
+  resuelto: en varios frames post-fix solo la mitad superior del cuadro
+  contiene imagen (mitad inferior en negro sólido) — causa no
+  determinada, no bloquea la conclusión del fix pero queda como trabajo
+  futuro. `AMOD` permanece deliberadamente sin tocar y confirmado sin
+  cambio (`PMODE=0xFF26` en las 3 corridas). Clasificación:
+  `P4_SCEGSSETDEFDBUFFDC_DISPFB0_FIX_VALIDATED`, checkpoint
+  `FIX_CHECKPOINT_WITH_KNOWN_CAVEATS`. Vendor normalizado
+  deterministamente (`patched_commit` actualizado en
+  `upstream.lock.json`); commit local creado, no pusheado.
+
+**Estado consolidado tras P4.1**: la causa raíz original de "los datos
+de película PSS llegan a la EE pero no producen video visible" —en la
+parte de entorno de presentación GS que bloqueaba mostrar cualquier
+imagen coherente— está corregida y validada. BLOCKER_004 **no se cierra
+globalmente**: quedan pendientes el fix de `AMOD` (P4.1.x, ya
+localizado), auditoría exhaustiva de semántica PSM/formato de píxel, y
+la causa del patrón de "mitad de cuadro negra" observado en algunos
+frames post-fix.

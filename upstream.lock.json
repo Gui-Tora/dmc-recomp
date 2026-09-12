@@ -27,6 +27,10 @@
     {
       "path": "patches/BLOCKER_004_p314_sync_vibuf_redecode.patch",
       "sha256": "fb777714899b6425eb4f07092eaaa470488600ed6cbf506c6d27421f2c456765"
+    },
+    {
+      "path": "patches/BLOCKER_004_p41_scegssetdefdbuffdc_dispfb0_zero.patch",
+      "sha256": "08ca304e3f7ef28902f6e0435da2167e36fa92d1691a19f71eccfe6901adb155"
     }
   ],
   "patch_identity": {
@@ -35,5 +39,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "61a0977924148e018d66d42c30d7756db8084541"
+  "patched_commit": "16ef7ab8dc961c44921c3776705da6bc3b4806fb"
 }
