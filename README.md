@@ -251,8 +251,29 @@ video. **Open.** Validated so far:
   further improved but still not fully correct — a separate, already
   deterministic late-stream MPEG decode corruption (starting around
   picture 43 of a scene) remains open and unrelated to either of these
-  two presentation-environment fixes — and the project remains **not
-  playable**.
+  two presentation-environment fixes.
+- The same HLE stub (`sceGsSetDefDBuffDc`) was still missing one piece:
+  static disassembly of the original ELF recovered a conditional tail in
+  the real SDK function (never reached by the two fixes above, which only
+  covered the four preceding helper calls) that patches the *second*
+  display buffer's `dispfb`/draw-`FRAME` fields to the real "second
+  framebuffer" address whenever the game's fixed interlace/field-mode
+  parameters meet a specific condition — true for every frame DMC renders.
+  A live PCSX2 EE-debugger measurement (performed manually against the
+  exact breakpoints and addresses this project's own investigation had
+  already derived) confirmed the recovered tail byte-for-byte. Implementing
+  it — expressed purely in terms of the Z-buffer address and the same
+  fixed GS parameters the runtime already tracks, not a DMC-specific
+  special case — was validated 3/3 plus one additional run against the
+  clean production binary: byte-exact guest-environment match in all four
+  runs, zero draws targeting either the old broken framebuffer or the
+  SDK's unpatched pre-`Main_init` value, zero systematic corruption in
+  either half of the movie framebuffer across 164 raw-VRAM samples, and
+  the Memory Card / Language Select / warning-screen UI all fully legible.
+  A `PMODE.AMOD` bit mismatch remains deliberately unfixed, and the
+  project remains **not playable**: the deterministic late-stream MPEG
+  decode corruption noted above is independent of this presentation-layer
+  fix chain and still blocks full playback.
 
 Full history: [`analysis/notes/BLOCKER_004_pss_video_output.md`](analysis/notes/BLOCKER_004_pss_video_output.md)
 (canonical, cumulative) and the independent audits/experiments referenced
@@ -276,7 +297,11 @@ from it (`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`,
 `BLOCKER_004_P411R_P314_BASELINE_REPRODUCIBILITY.md`,
 `BLOCKER_004_P411B_MOVIE_FRAME_COMPLETENESS_BOUNDARY_TRACE_RETRY.md`,
 `BLOCKER_004_P412_FABLE_FBPA0_PARTIAL_UPLOAD_ROOT_CAUSE_AUDIT.md`,
-`BLOCKER_004_P413_SCEGSSETDEFDBUFFDC_DRAWENV_FRAME_FIX.md`).
+`BLOCKER_004_P413_SCEGSSETDEFDBUFFDC_DRAWENV_FRAME_FIX.md`,
+`BLOCKER_004_P418_ASTRA_VISUAL_REGRESSION_TIMELINE_COMPARATIVE_AUDIT.md`,
+`BLOCKER_004_P419_ASTRA_ORIGINAL_UI_DBUFF_CONDITIONAL_TAIL_ORACLE.md`,
+`BLOCKER_004_P419_ADDENDUM_MANUAL_ORACLE_COMPLETION.md`,
+`BLOCKER_004_P410_SCEGSSETDEFDBUFFDC_CONDITIONAL_TAIL_PARITY_FIX.md`).
 
 Known, currently out-of-scope limitations (not yet classified as blocking
 further progress):

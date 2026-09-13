@@ -232,3 +232,40 @@ arriba). Los cuatro patches actualmente activos:
      auditoría adversarial que identificó la causa raíz exacta (P4.1.2).
    - `analysis/notes/BLOCKER_004_P413_SCEGSSETDEFDBUFFDC_DRAWENV_FRAME_FIX.md` —
      implementación del fix de una línea y validación 3/3 (P4.1.3).
+
+9. `BLOCKER_004_p4110_scegssetdefdbuffdc_conditional_tail.patch`
+   (convención B). Implementa la cola condicional original de
+   `sceGsSetDefDBuffDc` (SDK real, ELF `0x101D70-0x101DF8`, recuperada por
+   desensamblado estático en P4.1.8 y confirmada por oracle en vivo de
+   PCSX2 original en P4.1.9): cuando `(interlace==1 && ffmode==1) ||
+   interlace==0` (siempre cierto para el `g_gparam` fijo de DMC), la SDK
+   parchea `disp[1].dispfb.FBP`, `draw01.FRAME.FBP` y `draw02.FRAME.FBP` a
+   `(zbufAddr>>1)&0x1FF`, preservando todos los bits no-FBP — la HLE previa
+   los dejaba siempre en `FBP=0` (el default de los helpers internos,
+   nunca parcheado). `disp[0]`/`draw11`/`draw12` (patches 7 y 8) no se
+   tocan: la cola original tampoco los toca. Regla expresada solo en
+   términos de `zbufAddr`/`g_gparam` (semántica del SDK, no un caso
+   especial de DMC). Validado 3/3 (P4.1.10) + 1 corrida adicional con el
+   binario de producción limpio (sin instrumentación de diagnóstico
+   compilada): contrato de RAM guest byte-exacto contra el oracle en las
+   4 corridas (UI `DISPLAY={0,0x38}`/`DRAW={0x38,0}`, película post-`Main_init`
+   `DISPLAY={0,0xA0}`/`DRAW={0xA0,0}`); 0 draws con `FBP=0xE0` (bug
+   anterior) o `FBP=0x70` (valor SDK sin parchear por `Main_init`) en las 3
+   corridas con traza; 0/164 muestras de VRAM cruda del buffer de película
+   (`dispFbp=0xa0`) con corrupción sistemática en ninguna mitad; Memory
+   Card, Language Select y video de advertencia (5 idiomas) completos y
+   legibles en las 3 corridas. Checkpoint `FIX_CHECKPOINT_WITH_KNOWN_CAVEATS`
+   — `PMODE`/`AMOD` sigue deferido, P4.2.1 (backpressure del ring ES de
+   MPEG) independiente y sigue abierto; no es un cierre global de
+   BLOCKER_004. Documentación (no duplicada aquí):
+   - `analysis/notes/BLOCKER_004_P418_ASTRA_VISUAL_REGRESSION_TIMELINE_COMPARATIVE_AUDIT.md` —
+     recuperación de la cola condicional por desensamblado estático (P4.1.8).
+   - `analysis/notes/BLOCKER_004_P419_ASTRA_ORIGINAL_UI_DBUFF_CONDITIONAL_TAIL_ORACLE.md` —
+     instrucciones de medición manual, oracle en vivo bloqueado en el
+     momento de escritura (P4.1.9).
+   - `analysis/notes/BLOCKER_004_P419_ADDENDUM_MANUAL_ORACLE_COMPLETION.md` —
+     adenda documentando la medición manual posterior del usuario que
+     completó el oracle sin reescribir el informe original.
+   - `analysis/notes/BLOCKER_004_P410_SCEGSSETDEFDBUFFDC_CONDITIONAL_TAIL_PARITY_FIX.md` —
+     implementación del fix, ledger de correcciones y validación 3/3+1
+     (P4.1.10).

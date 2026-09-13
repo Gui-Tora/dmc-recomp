@@ -1,0 +1,57 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 44e2ea9..7dc6904 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -914,14 +914,36 @@ namespace ps2_stubs
+         // lower half. ZBUF is unaffected (ZMSK=1, no Z writes occur); this was
+         // purely a COLOR FRAME addressing bug, the second instance of the same
+         // root-class defect P4.1 already fixed for the display env (dispfb0).
++        // draw11/draw12 (slot 1) and disp[0] are NEVER touched by the original
++        // SDK's conditional tail either (see below) -- they stay literal 0.
+         const uint32_t fbp1 = 0u;
++        // P4.1.10 fix (BLOCKER_004_P410_SCEGSSETDEFDBUFFDC_CONDITIONAL_TAIL_PARITY_FIX.md):
++        // the real sceGsSetDefDBuffDc (0x101B48-0x101E2C in the ELF) does not
++        // return with disp[1]/draw01/draw02 left at the helper defaults of
++        // FBP=0 -- it ends with a conditional tail (0x101D70-0x101DF8,
++        // recovered by static disassembly in P4.1.8 and confirmed by a live
++        // PCSX2 EE-debugger oracle in P4.1.9) that patches exactly those
++        // three fields' FBP to (zbufAddr>>1)&0x1FF -- the real "second
++        // framebuffer" address -- while leaving disp[0]/draw11/draw12 (and
++        // every non-FBP bit of disp[1]/draw01/draw02) untouched. The
++        // condition, read from the SAME gparam this runtime already tracks
++        // as g_gparam, is faithfully the original's:
++        //   (interlace == 1 && ffmode == 1) || (interlace == 0)
++        // which the original expresses as one 64-bit masked compare
++        // ((gparam & 0x0000FFFF0000FFFF) == 0x0000000100000001) with a
++        // halfword-interlace fallback branch when that first compare fails.
++        // This is an SDK semantic rule, not a DMC-specific special case: it
++        // does not reference width/height/address, only zbufAddr and gparam,
++        // exactly as the real function does.
++        const bool gsDBuffDcTailCondition =
++            (g_gparam.interlace == 1u && g_gparam.ffmode == 1u) || (g_gparam.interlace == 0u);
++        const uint32_t gsDBuffDcTailFbp = gsDBuffDcTailCondition ? ((zbufAddr >> 1) & 0x1FFu) : 0u;
+         // P4.1 fix (BLOCKER_004_P402_SCEGSSETDEFDBUFFDC_ROOT_CAUSE.md): disp[0]'s
+-        // DISPFB must default to FBP 0, matching disp[1]'s own literal below --
+-        // not the Z-buffer address. Using zbufAddr here produced FBP 0xE0,
+-        // proven (by direct original PCSX2 measurement + guest-code symmetry
+-        // argument) to diverge from the real SDK default of 0.
++        // DISPFB must default to FBP 0 -- not the Z-buffer address, and (per
++        // P4.1.10) not touched by the conditional tail either. disp[1]'s FBP
++        // below is the tail-patched value, matching the original SDK return.
+         const uint64_t dispfb0 = makeDispFb(0u, fbw, psm, 0u, 0u);
+-        const uint64_t dispfb1 = makeDispFb(0u, fbw, psm, 0u, 0u);
++        const uint64_t dispfb1 = makeDispFb(gsDBuffDcTailFbp, fbw, psm, 0u, 0u);
+
+         GsDBuffDcMem db{};
+         db.disp[0].pmode = pmode;
+@@ -934,8 +956,8 @@ namespace ps2_stubs
+
+         const bool seedClear = clear != 0u;
+         db.giftag0 = {makeGiftagAplusD(seedClear ? 22u : 16u), 0xEULL};
+-        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+-        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
++        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, gsDBuffDcTailFbp, fbw, psm, zbufAddr, zpsm, ztest, false);
++        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, gsDBuffDcTailFbp, fbw, psm, zbufAddr, zpsm, ztest, false);
+         db.giftag1 = db.giftag0;
+         seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+         seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);

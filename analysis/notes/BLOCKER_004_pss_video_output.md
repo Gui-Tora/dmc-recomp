@@ -4762,3 +4762,56 @@ comparación visual A/B dedicada), y — el residual mayor conocido — la
 corrupción determinista tardía de MPEG a partir de aproximadamente
 picture 43 (camino de feed/recirculación del ring, no tocado por
 ninguno de los prompts P4.1.x).
+
+- **P4.1.5 → P4.1.7 (intentos refutados, no comprometidos)**: P4.1.5
+  probó `fbp1=zbufAddr/2` para el slot1 (`draw11`/`draw12`) buscando el
+  "segundo framebuffer" — restauraba la UI pero invertía la corrupción
+  de película a la mitad superior (mismo mecanismo de aliasing de
+  páginas, desplazado); refutado y revertido. P4.1.7 intentó mover el
+  punto de latch de presentación host de polling por tick de host-loop a
+  un hook de guest-thread (`eeWaitVSyncTicks`); refutado — ese punto de
+  enganche casi nunca es ejercitado por el código generado real de DMC
+  (147/148 frames de traza visual resultaron en el marcador "sin frame
+  enganchado"); revertido. Ambos aplicaron correctamente la regla de
+  fallo del prompt correspondiente: detener y clasificar en vez de
+  apilar fixes especulativos.
+
+- **P4.1.8 → P4.1.9 (+ adenda) → P4.1.10** (informes:
+  [BLOCKER_004_P418_ASTRA_VISUAL_REGRESSION_TIMELINE_COMPARATIVE_AUDIT.md](BLOCKER_004_P418_ASTRA_VISUAL_REGRESSION_TIMELINE_COMPARATIVE_AUDIT.md),
+  [BLOCKER_004_P419_ASTRA_ORIGINAL_UI_DBUFF_CONDITIONAL_TAIL_ORACLE.md](BLOCKER_004_P419_ASTRA_ORIGINAL_UI_DBUFF_CONDITIONAL_TAIL_ORACLE.md),
+  [BLOCKER_004_P419_ADDENDUM_MANUAL_ORACLE_COMPLETION.md](BLOCKER_004_P419_ADDENDUM_MANUAL_ORACLE_COMPLETION.md),
+  [BLOCKER_004_P410_SCEGSSETDEFDBUFFDC_CONDITIONAL_TAIL_PARITY_FIX.md](BLOCKER_004_P410_SCEGSSETDEFDBUFFDC_CONDITIONAL_TAIL_PARITY_FIX.md),
+  patch: `patches/BLOCKER_004_p4110_scegssetdefdbuffdc_conditional_tail.patch`):
+  P4.1.8 recupera por desensamblado estático de bytes del ELF una **cola
+  condicional** del `sceGsSetDefDBuffDc` real (`0x101D70-0x101DF8`) que
+  P4.1/P4.1.3 no implementaban: bajo la condición `(interlace==1 &&
+  ffmode==1) || interlace==0` (siempre cierta para el `g_gparam` fijo de
+  DMC), la SDK parchea `disp[1].dispfb.FBP`/`draw01.FRAME.FBP`/
+  `draw02.FRAME.FBP` a `(zbufAddr>>1)&0x1FF`, dejando `disp[0]`/`draw11`/
+  `draw12` intocados (confirmando que P4.1/P4.1.3 seguían siendo
+  correctos para esos cuatro campos). P4.1.9 documentó correctamente que
+  el oracle en vivo estaba bloqueado en ese momento (sin acceso a
+  debugger); el usuario completó la medición manualmente después
+  (adenda, sin reescribir el informe original), confirmando los doce
+  campos byte a byte contra la predicción estática de P4.1.8. P4.1.10
+  implementa la cola condicional en la HLE (`GS.cpp`), expresada solo en
+  términos de `zbufAddr`/`g_gparam` (regla semántica del SDK, no un caso
+  especial de DMC). Validado 3/3 + 1 corrida adicional con el binario de
+  producción limpio: contrato de RAM guest byte-exacto en las 4 corridas;
+  0 draws con `FBP=0xE0` o `FBP=0x70` en las 3 corridas con traza; 0/164
+  muestras de VRAM cruda del buffer de película con corrupción
+  sistemática en ninguna mitad; Memory Card, Language Select y video de
+  advertencia completos y legibles en las 3 corridas. Clasificación
+  `FIX_CHECKPOINT_WITH_KNOWN_CAVEATS`. Vendor normalizado
+  deterministamente (`patched_commit` actualizado); commit local creado,
+  no pusheado.
+
+**Estado consolidado tras P4.1.10**: los tres campos de entorno de
+presentación GS con contrato original ahora reconstruido con precisión
+(`disp[0]`/`draw11`/`draw12` en `FBP=0` desde P4.1/P4.1.3; `disp[1]`/
+`draw01`/`draw02` con la cola condicional desde P4.1.10) están
+corregidos y validados 3/3+1 cada etapa. BLOCKER_004 **sigue sin
+cerrarse globalmente**: quedan pendientes el fix de `AMOD`, auditoría
+exhaustiva de semántica PSM/formato de píxel, y — el residual mayor
+conocido, independiente de esta cadena de fixes — el backpressure/
+recirculación del ring ES de MPEG (ver P4.2, `BLOCKER_004_P42_...md`).
