@@ -4815,3 +4815,65 @@ cerrarse globalmente**: quedan pendientes el fix de `AMOD`, auditoría
 exhaustiva de semántica PSM/formato de píxel, y — el residual mayor
 conocido, independiente de esta cadena de fixes — el backpressure/
 recirculación del ring ES de MPEG (ver P4.2, `BLOCKER_004_P42_...md`).
+
+## P4.2.x — investigación de la corrupción MPEG tardía (residual mayor, abierto)
+
+Cadena separada e independiente de la de presentación GS (P4.0-P4.1.10,
+arriba): ataca el residual de corrupción determinista de MPEG a partir
+de aproximadamente picture 43 de la película de apertura, ya señalado
+desde P4.1.3.
+
+- **P4.2** ([BLOCKER_004_P42_FABLE_MPEG_ES_RING_RECIRCULATION_ROOT_CAUSE.md](BLOCKER_004_P42_FABLE_MPEG_ES_RING_RECIRCULATION_ROOT_CAUSE.md)):
+  localiza la primera divergencia byte a byte entre el ES canónico
+  (extraído sin transcodificar del ISO) y lo que realmente llega a
+  FFmpeg: offset lógico **2.081.537 (0x1FC301)**, omisión limpia de
+  **4.063 bytes** (un payload PES de vídeo completo), con resync exacto
+  después — nunca datos obsoletos, duplicados, ni reordenados. Atribuye
+  la causa a que el demux HLE (`processPssBuffer`) no propaga
+  backpressure real: encola el callback de escritura al viBuf guest y
+  avanza el cursor PSS incondicionalmente, sin observar si el guest
+  (`viBufBeginPut`/`viBufEndPut`, código real no HLE) tuvo espacio.
+  Retracta la teoría histórica del "4º ciclo de wrap" como causa (los
+  wraps del ring son byte-perfectos).
+- **P4.2.1** ([BLOCKER_004_P421_MPEG_DEMUX_VIBUF_BACKPRESSURE_FIX.md](BLOCKER_004_P421_MPEG_DEMUX_VIBUF_BACKPRESSURE_FIX.md)):
+  implementa el backpressure que P4.2 recomendó (detener el parseo y
+  retener el payload en `pssBuffer` si el backlog propio del runtime
+  indica saturación). El mecanismo funciona correctamente para su
+  propio modelo (101/101 ciclos STALL→RETRY sin pérdida, extracción del
+  demux byte-perfecta) — pero la omisión histórica en el offset
+  2.081.537 **persiste sin cambios**, incluso confirmando que en ese
+  punto exacto el backlog modelado está muy por debajo de la capacidad
+  nominal. Refuta la saturación byte a byte simple como causa única.
+  `NO_COMMIT` (gate de éxito no satisfecho).
+- **P4.2.2** ([BLOCKER_004_P422_VIBUF_BLOCK_BYTE_ACCOUNTING_ROOT_CAUSE.md](BLOCKER_004_P422_VIBUF_BLOCK_BYTE_ACCOUNTING_ROOT_CAUSE.md),
+  localización pura, sin cambio de producción): desensambla por completo
+  `viBufBeginPut`/`viBufEndPut`/`StrM2vCallBack` del ELF original y
+  reconstruye su aritmética exacta. Localiza la causa raíz real:
+  **asincronía de callbacks** — el scheduler despacha ráfagas de ~14
+  callbacks `StrM2vCallBack` antes de que ninguno se ejecute en la CPU
+  guest emulada; al ejecutarse en orden de encolado, los primeros 13
+  comprometen sus bytes en `pendingBytes` antes de que el 14º alcance su
+  propio `viBufBeginPut` — momento en el que la capacidad real ya es
+  insuficiente, invisible para cualquier gate de admisión evaluado en el
+  instante de encolado (incluido el de P4.2.1). Confirmado con precisión
+  exacta en el punto histórico: 14 callbacks en vuelo en el payload
+  perdido, cayendo a 1 justo después. Exonera de nuevo la saturación
+  byte-a-byte simple, la discrepancia byte-vs-bloque, el wrap del ring, y
+  la aritmética de consumo de P3.14.2, como causa única o suficiente.
+  Clasificación `P422_ASYNC_CALLBACK_STALE_ACCOUNTING_ROOT_CAUSE`.
+
+**Estado P4.2.x**: causa raíz localizada con evidencia directa
+(P4.2.2), sin fix de producción implementado todavía. Próximo paso
+recomendado: **P4.2.3**, un fix que module la admisión/despacho por
+profundidad de callbacks de vídeo en vuelo, no por backlog de bytes en
+el instante de encolado.
+
+### Índice de secuencia (alto nivel)
+
+- **P4.1** — fix de `disp[0].dispfb` (display FBP).
+- **P4.1.3** — fix destructivo de `FRAME=0xE0` (draw-env del segundo slot).
+- **P4.1.8–P4.1.10** — recuperación/oracle/fix de la cola condicional
+  original del SDK para `sceGsSetDefDBuffDc`.
+- **P4.2** — primera omisión del ES localizada (offset 2.081.537, 4.063 bytes).
+- **P4.2.1** — modelo ingenuo de backpressure por bytes, refutado como causa suficiente.
+- **P4.2.2** — causa raíz localizada: contabilidad obsoleta por asincronía de callbacks.
