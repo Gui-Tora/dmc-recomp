@@ -1,0 +1,859 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 4852bf3..72441f8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -198,6 +198,14 @@ namespace ps2_stubs
+                 return ok;
+             }
+ 
++            // P4.2.4: whether EOF has already been signaled to the parser and
++            // codec via flush(). Used to gate the deferred end-of-stream flush
++            // (flush() itself is idempotent, this only avoids re-entering it).
++            bool drained() const
++            {
++                return m_drained;
++            }
++
+             void reset()
+             {
+                 if (m_swsCtx)
+@@ -479,6 +487,34 @@ namespace ps2_stubs
+             bool stream = false;
+         };
+ 
++        struct MpegStreamCallbackEvent
++        {
++            uint32_t mpegAddr = 0u;
++            uint32_t streamType = 0u;
++            uint32_t dataAddr = 0u;
++            uint32_t len = 0u;
++            uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
++            uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
++            size_t packetEnd = 0u;
++            size_t payloadStart = 0u;
++            bool video = false;
++            std::vector<MpegRegisteredCallback> callbacks;
++        };
++
++        struct MpegDemuxTransaction
++        {
++            bool active = false;
++            uint64_t id = 0u;
++            uint64_t cdStreamGeneration = 0u;
++            uint32_t requestedBytes = 0u;
++            size_t nonInputPrefixBytes = 0u;
++            size_t totalBufferBytes = 0u;
++            size_t packetEnd = 0u;
++            size_t payloadStart = 0u;
++            size_t acceptedCallbacks = 0u;
++            std::vector<MpegStreamCallbackEvent> events;
++        };
++
+         constexpr uint64_t kPictureClockOne = 1ull << 32u;
+         // NTSC-style fields at ~59.94 Hz to keep MPEG timing yet (29.97 fps).
+         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
+@@ -526,17 +562,13 @@ namespace ps2_stubs
+             // path (feedElementaryStream) must not touch decoder/decodedFrames
+             // -- only the P3.14 sync path in sceMpegGetPicture may.
+             bool syncGuestEsDecodeActive = false;
+-        };
+-
+-        struct MpegStreamCallbackEvent
+-        {
+-            uint32_t mpegAddr = 0u;
+-            uint32_t streamType = 0u;
+-            uint32_t dataAddr = 0u;
+-            uint32_t len = 0u;
+-            uint64_t pts = 0xFFFFFFFFFFFFFFFFull;
+-            uint64_t dts = 0xFFFFFFFFFFFFFFFFull;
+-            std::vector<MpegRegisteredCallback> callbacks;
++            // P4.2.3: a demux syscall remains logically suspended while the
++            // original guest stream callback owns the current PES. The state
++            // contains offsets and owned values only; no pointer into pssBuffer
++            // survives an async guest invocation.
++            MpegDemuxTransaction demuxTransaction;
++            bool demuxRetryPending = false;
++            size_t demuxRetryAcceptedCallbacks = 0u;
+         };
+ 
+         struct MpegStubState
+@@ -561,6 +593,7 @@ namespace ps2_stubs
+         std::mutex g_mpeg_stub_mutex;
+         constexpr uint32_t kMpegPictureWaitType = 1u;
+         MpegStubState g_mpeg_stub_state;
++        std::atomic<uint64_t> g_p423NextTransactionId{1u};
+ 
+         // TODO this resolution should follow runtime resolution
+         constexpr uint32_t kStubMovieWidth = 320u;
+@@ -923,6 +956,8 @@ namespace ps2_stubs
+             fresh.picturesServed = oldPlayback.picturesServed;
+             fresh.pssBuffer = oldPlayback.pssBuffer;
+             fresh.pssGuestAddrs = oldPlayback.pssGuestAddrs;
++            fresh.demuxRetryPending = oldPlayback.demuxRetryPending;
++            fresh.demuxRetryAcceptedCallbacks = oldPlayback.demuxRetryAcceptedCallbacks;
+             // fresh.cdStreamGeneration is already correct: makeFreshPlaybackState()
+             // set it from g_mpeg_stub_state.cdStreamGeneration, which by the time
+             // this runs has already been restored to its pre-reset value by
+@@ -1444,7 +1479,20 @@ namespace ps2_stubs
+                 {
+                     playback.streamEnded = true;
+                     playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+-                    flushDecoderIfEnded(playback);
++                    // P4.2.4: in sync-redecode mode the consumer may still owe
++                    // the decoder every accepted-but-unconsumed byte sitting in
++                    // guest viBuf (measured backlog ~471 KiB at source EOF).
++                    // Flushing here would signal parser+codec EOF *before*
++                    // those bytes are fed, truncating the tail of the movie
++                    // and producing the deterministic ac-tex/MV damage. Defer
++                    // the flush to the sync consumer, which performs it once
++                    // consumed == accepted. Async (non-sync) playback keeps
++                    // the immediate flush: its feed path has no guest-ring
++                    // backlog to drain.
++                    if (!playback.syncGuestEsDecodeActive)
++                    {
++                        flushDecoderIfEnded(playback);
++                    }
+                     erasePssPrefix(playback, buffer.size());
+                     return;
+                 }
+@@ -1546,6 +1594,7 @@ namespace ps2_stubs
+                     const size_t payloadStart = pes.payloadOffset;
+                     if (payloadStart < packetEnd)
+                     {
++                        const size_t callbackCountBefore = callbackEvents.size();
+                         if (payloadStart < playback.pssGuestAddrs.size())
+                         {
+                             queueStreamCallbackEvent(
+@@ -1557,6 +1606,19 @@ namespace ps2_stubs
+                                 pes.pts90k,
+                                 pes.dts90k);
+                         }
++                        if (callbackEvents.size() != callbackCountBefore)
++                        {
++                            for (size_t i = callbackCountBefore; i < callbackEvents.size(); ++i)
++                            {
++                                callbackEvents[i].packetEnd = packetEnd;
++                                callbackEvents[i].payloadStart = payloadStart;
++                                callbackEvents[i].video = true;
++                            }
++                            // P4.2.3: retain the complete PES until the guest
++                            // callback has returned. The continuation performs
++                            // decoder feed and prefix erase exactly once.
++                            return;
++                        }
+                         // P3.14.2: with P3.14 sync-decode ownership active for
+                         // this playback, the async path must still deliver the
+                         // guest-visible callback event above (queueStreamCallbackEvent
+@@ -1607,6 +1669,7 @@ namespace ps2_stubs
+                     const size_t payloadStart = pes.payloadOffset;
+                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                     {
++                        const size_t callbackCountBefore = callbackEvents.size();
+                         queueStreamCallbackEvent(
+                             mpegAddr,
+                             kMpegStrPCM,
+@@ -1623,6 +1686,21 @@ namespace ps2_stubs
+                             callbackEvents,
+                             pes.pts90k,
+                             pes.dts90k);
++                        if (callbackEvents.size() != callbackCountBefore)
++                        {
++                            for (size_t i = callbackCountBefore; i < callbackEvents.size(); ++i)
++                            {
++                                callbackEvents[i].packetEnd = packetEnd;
++                                callbackEvents[i].payloadStart = payloadStart;
++                                callbackEvents[i].video = false;
++                            }
++                            // Preserve the existing audio return policy while
++                            // retaining callback order. Audio callbacks already
++                            // parsed before the next video PES are carried in
++                            // that video's continuation sequence.
++                            erasePssPrefix(playback, packetEnd);
++                            continue;
++                        }
+                     }
+                 }
+ 
+@@ -1636,7 +1714,13 @@ namespace ps2_stubs
+             processPssBuffer(mpegAddr, playback, ignoredCallbacks, true);
+             playback.streamEnded = true;
+             playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+-            flushDecoderIfEnded(playback);
++            // P4.2.4: same deferral as the kMpegProgramEnd site -- in sync
++            // mode the accepted-ES backlog in guest viBuf must be fully fed
++            // before parser/codec EOF, so the sync consumer owns the flush.
++            if (!playback.syncGuestEsDecodeActive)
++            {
++                flushDecoderIfEnded(playback);
++            }
+         }
+ 
+         void finalizeCdStreamEofUnlocked(std::vector<uint32_t> &completedMpegIds, bool &changed)
+@@ -1728,7 +1812,60 @@ namespace ps2_stubs
+             {
+                 playback.pssGuestAddrs.push_back(guestAddr + static_cast<uint32_t>(i));
+             }
+-            processPssBuffer(mpegAddr, playback, callbackEvents);
++            if (std::none_of(callbackEvents.begin(), callbackEvents.end(), [](const MpegStreamCallbackEvent &event)
++                             { return event.video; }))
++            {
++                processPssBuffer(mpegAddr, playback, callbackEvents);
++            }
++        }
++
++        uint32_t p423InputGuestAddress(uint32_t dataAddr,
++                                       size_t offset,
++                                       uint32_t ringBaseAddr,
++                                       uint32_t ringSize)
++        {
++            const uint32_t base = ringBaseAddr & PS2_RAM_MASK;
++            const uint32_t data = dataAddr & PS2_RAM_MASK;
++            if (ringBaseAddr != 0u && ringSize != 0u && ringSize <= PS2_RAM_SIZE)
++            {
++                const uint32_t ringOffset = (data - base) & PS2_RAM_MASK;
++                if (ringOffset < ringSize)
++                {
++                    return base + static_cast<uint32_t>((ringOffset + offset) % ringSize);
++                }
++            }
++            return (dataAddr + static_cast<uint32_t>(offset)) & PS2_RAM_MASK;
++        }
++
++        size_t p423RetryOverlap(const MpegPlaybackState &playback,
++                                const uint8_t *rdram,
++                                uint32_t dataAddr,
++                                uint32_t byteCount,
++                                uint32_t ringBaseAddr,
++                                uint32_t ringSize)
++        {
++            if (!playback.demuxRetryPending)
++            {
++                return 0u;
++            }
++
++            const size_t overlap = std::min<size_t>(playback.pssBuffer.size(), byteCount);
++            if (playback.pssGuestAddrs.size() < overlap)
++            {
++                return 0u;
++            }
++            for (size_t i = 0; i < overlap; ++i)
++            {
++                const uint32_t expectedAddr = p423InputGuestAddress(dataAddr, i, ringBaseAddr, ringSize);
++                const uint8_t *source = getConstMemPtr(rdram, expectedAddr);
++                if (!source ||
++                    (playback.pssGuestAddrs[i] & PS2_RAM_MASK) != expectedAddr ||
++                    playback.pssBuffer[i] != *source)
++                {
++                    return 0u;
++                }
++            }
++            return overlap;
+         }
+ 
+         size_t appendGuestBytes(uint32_t mpegAddr,
+@@ -1967,6 +2104,304 @@ namespace ps2_stubs
+             dispatchStreamCallbacks(rdram, ctx, runtime, events);
+         }
+ 
++        size_t p423CallbackCount(const std::vector<MpegStreamCallbackEvent> &events)
++        {
++            size_t count = 0u;
++            for (const MpegStreamCallbackEvent &event : events)
++            {
++                count += event.callbacks.size();
++            }
++            return count;
++        }
++
++        bool p423HasVideoEvent(const std::vector<MpegStreamCallbackEvent> &events)
++        {
++            return std::any_of(events.begin(), events.end(), [](const MpegStreamCallbackEvent &event)
++                               { return event.video; });
++        }
++
++        bool p423CallbackAt(const std::vector<MpegStreamCallbackEvent> &events,
++                            size_t flatIndex,
++                            MpegStreamCallbackEvent &eventOut,
++                            MpegRegisteredCallback &callbackOut)
++        {
++            for (const MpegStreamCallbackEvent &event : events)
++            {
++                if (flatIndex < event.callbacks.size())
++                {
++                    eventOut = event;
++                    callbackOut = event.callbacks[flatIndex];
++                    return true;
++                }
++                flatIndex -= event.callbacks.size();
++            }
++            return false;
++        }
++
++        void continueP423DemuxTransaction(uint8_t *rdram,
++                                          R5900Context *parentCtx,
++                                          PS2Runtime *runtime,
++                                          uint32_t mpegAddr,
++                                          uint64_t transactionId,
++                                          bool hasCallbackResult,
++                                          uint32_t callbackV0);
++
++        void invokeP423StreamCallback(uint8_t *rdram,
++                                      R5900Context *parentCtx,
++                                      PS2Runtime *runtime,
++                                      uint32_t mpegAddr,
++                                      uint64_t transactionId,
++                                      const MpegStreamCallbackEvent &event,
++                                      const MpegRegisteredCallback &callback)
++        {
++            if (!rdram || !parentCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
++            {
++                continueP423DemuxTransaction(rdram, parentCtx, runtime, mpegAddr, transactionId, true, 0u);
++                return;
++            }
++
++            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++            if (cbDataAddr == 0u || !writeMpegCallbackData(rdram, cbDataAddr, event))
++            {
++                if (cbDataAddr != 0u)
++                {
++                    runtime->guestFree(cbDataAddr);
++                }
++                continueP423DemuxTransaction(rdram, parentCtx, runtime, mpegAddr, transactionId, true, 0u);
++                return;
++            }
++
++            R5900Context callbackCtx = *parentCtx;
++            SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
++            SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
++            SET_GPR_U32(&callbackCtx, 6, callback.data);
++            SET_GPR_U32(&callbackCtx, 7, 0u);
++            SET_GPR_U32(&callbackCtx, 29, 0u);
++            SET_GPR_U32(&callbackCtx, 31, 0u);
++            callbackCtx.pc = callback.func;
++
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::RpcCallback;
++            invocation.context = callbackCtx;
++            invocation.onComplete = [rdram, runtime, cbDataAddr, mpegAddr, transactionId](
++                                        const R5900Context &completed,
++                                        R5900Context &parent)
++            {
++                const uint32_t guestV0 = getRegU32(&completed, 2);
++                runtime->guestFree(cbDataAddr);
++                continueP423DemuxTransaction(rdram, &parent, runtime, mpegAddr, transactionId, true, guestV0);
++            };
++            runtime->eeScheduler().invokeCurrent(std::move(invocation));
++        }
++
++        void initializeP423PacketTransaction(MpegPlaybackState &playback,
++                                             std::vector<MpegStreamCallbackEvent> events)
++        {
++            MpegDemuxTransaction &transaction = playback.demuxTransaction;
++            transaction.events = std::move(events);
++            const auto videoIt = std::find_if(
++                transaction.events.begin(), transaction.events.end(), [](const MpegStreamCallbackEvent &event)
++                { return event.video; });
++            if (videoIt == transaction.events.end())
++            {
++                transaction.packetEnd = 0u;
++                transaction.payloadStart = 0u;
++                return;
++            }
++            transaction.packetEnd = videoIt->packetEnd;
++            transaction.payloadStart = videoIt->payloadStart;
++            transaction.acceptedCallbacks = playback.demuxRetryPending
++                                                ? playback.demuxRetryAcceptedCallbacks
++                                                : 0u;
++        }
++
++        void completeP423DemuxReturn(PS2Runtime *runtime,
++                                     R5900Context *parentCtx,
++                                     uint32_t consumed,
++                                     const std::vector<uint32_t> &completedMpegIds)
++        {
++            setReturnS32(parentCtx, static_cast<int32_t>(consumed));
++            for (const uint32_t completedMpegId : completedMpegIds)
++            {
++                runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, completedMpegId, KE_OK);
++            }
++        }
++
++        void continueP423DemuxTransaction(uint8_t *rdram,
++                                          R5900Context *parentCtx,
++                                          PS2Runtime *runtime,
++                                          uint32_t mpegAddr,
++                                          uint64_t transactionId,
++                                          bool hasCallbackResult,
++                                          uint32_t callbackV0)
++        {
++            MpegStreamCallbackEvent nextEvent{};
++            MpegRegisteredCallback nextCallback{};
++            bool dispatchNext = false;
++            bool completeReturn = false;
++            uint32_t returnedConsumed = 0u;
++            std::vector<uint32_t> completedMpegIds;
++            std::vector<MpegStreamCallbackEvent> asyncEventsToDispatch;
++
++            {
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                const auto playbackIt = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
++                if (playbackIt == g_mpeg_stub_state.playbackByMpeg.end() ||
++                    !playbackIt->second.demuxTransaction.active ||
++                    playbackIt->second.demuxTransaction.id != transactionId)
++                {
++                    setReturnS32(parentCtx, 0);
++                    return;
++                }
++
++                MpegPlaybackState &playback = playbackIt->second;
++                MpegDemuxTransaction &transaction = playback.demuxTransaction;
++                if (hasCallbackResult)
++                {
++                    MpegStreamCallbackEvent completedEvent{};
++                    MpegRegisteredCallback completedCallback{};
++                    const bool completedWasMapped = p423CallbackAt(
++                        transaction.events,
++                        transaction.acceptedCallbacks,
++                        completedEvent,
++                        completedCallback);
++                    const bool completedWasVideo = completedWasMapped && completedEvent.video;
++                    if (completedWasVideo && callbackV0 == 0u)
++                    {
++                        const size_t confirmedPhysical = transaction.totalBufferBytes >= playback.pssBuffer.size()
++                                                             ? transaction.totalBufferBytes - playback.pssBuffer.size()
++                                                             : 0u;
++                        const size_t confirmedInput = confirmedPhysical > transaction.nonInputPrefixBytes
++                                                          ? confirmedPhysical - transaction.nonInputPrefixBytes
++                                                          : 0u;
++                        returnedConsumed = static_cast<uint32_t>(std::min<size_t>(confirmedInput, transaction.requestedBytes));
++                        playback.demuxRetryPending = true;
++                        size_t callbacksBeforeVideoPacket = 0u;
++                        for (const MpegStreamCallbackEvent &event : transaction.events)
++                        {
++                            if (event.video)
++                            {
++                                break;
++                            }
++                            callbacksBeforeVideoPacket += event.callbacks.size();
++                        }
++                        playback.demuxRetryAcceptedCallbacks =
++                            transaction.acceptedCallbacks > callbacksBeforeVideoPacket
++                                ? transaction.acceptedCallbacks - callbacksBeforeVideoPacket
++                                : 0u;
++                        transaction.active = false;
++                        transaction.events.clear();
++                        bool eofChanged = false;
++                        recordCdStreamBytesDemuxedUnlocked(returnedConsumed, completedMpegIds, eofChanged);
++                        completeReturn = true;
++                    }
++                    else
++                    {
++                        ++transaction.acceptedCallbacks;
++                    }
++                }
++
++                while (!completeReturn)
++                {
++                    const size_t callbackCount = p423CallbackCount(transaction.events);
++                    if (transaction.acceptedCallbacks < callbackCount)
++                    {
++                        dispatchNext = p423CallbackAt(
++                            transaction.events,
++                            transaction.acceptedCallbacks,
++                            nextEvent,
++                            nextCallback);
++                        if (!dispatchNext)
++                        {
++                            returnedConsumed = 0u;
++                            transaction.active = false;
++                            transaction.events.clear();
++                            completeReturn = true;
++                            break;
++                        }
++
++                        break;
++                    }
++
++                    const auto committedVideoIt = std::find_if(
++                        transaction.events.begin(), transaction.events.end(), [](const MpegStreamCallbackEvent &event)
++                        { return event.video; });
++                    if (committedVideoIt == transaction.events.end())
++                    {
++                        returnedConsumed = 0u;
++                        transaction.active = false;
++                        transaction.events.clear();
++                        completeReturn = true;
++                        break;
++                    }
++                    const MpegStreamCallbackEvent committedEvent = *committedVideoIt;
++                    if (transaction.packetEnd > playback.pssBuffer.size() ||
++                        transaction.payloadStart > transaction.packetEnd)
++                    {
++                        returnedConsumed = 0u;
++                        transaction.active = false;
++                        transaction.events.clear();
++                        completeReturn = true;
++                        break;
++                    }
++
++                    if (committedEvent.video)
++                    {
++                        const uint8_t *payload = playback.pssBuffer.data() + transaction.payloadStart;
++                        const size_t payloadSize = transaction.packetEnd - transaction.payloadStart;
++                        if (!playback.syncGuestEsDecodeActive)
++                        {
++                            const int64_t pts = committedEvent.pts == 0xFFFFFFFFFFFFFFFFull
++                                                    ? -1
++                                                    : static_cast<int64_t>(committedEvent.pts);
++                            const int64_t dts = committedEvent.dts == 0xFFFFFFFFFFFFFFFFull
++                                                    ? -1
++                                                    : static_cast<int64_t>(committedEvent.dts);
++                            feedElementaryStream(playback, mpegAddr, payload, payloadSize, pts, dts);
++                        }
++                    }
++
++                    erasePssPrefix(playback, transaction.packetEnd);
++                    playback.demuxRetryPending = false;
++                    playback.demuxRetryAcceptedCallbacks = 0u;
++                    transaction.events.clear();
++                    transaction.acceptedCallbacks = 0u;
++
++                    std::vector<MpegStreamCallbackEvent> followingEvents;
++                    processPssBuffer(mpegAddr, playback, followingEvents);
++                    if (!followingEvents.empty())
++                    {
++                        if (p423HasVideoEvent(followingEvents))
++                        {
++                            initializeP423PacketTransaction(playback, std::move(followingEvents));
++                            continue;
++                        }
++                        asyncEventsToDispatch = std::move(followingEvents);
++                    }
++
++                    returnedConsumed = transaction.requestedBytes;
++                    transaction.active = false;
++                    bool eofChanged = false;
++                    recordCdStreamBytesDemuxedUnlocked(returnedConsumed, completedMpegIds, eofChanged);
++                    completeReturn = true;
++                }
++            }
++
++            if (completeReturn)
++            {
++                if (!asyncEventsToDispatch.empty())
++                {
++                    dispatchStreamCallbacksUnlocked(rdram, parentCtx, runtime, asyncEventsToDispatch);
++                }
++                completeP423DemuxReturn(runtime, parentCtx, returnedConsumed, completedMpegIds);
++                return;
++            }
++            if (dispatchNext)
++            {
++                invokeP423StreamCallback(rdram, parentCtx, runtime, mpegAddr, transactionId, nextEvent, nextCallback);
++            }
++        }
++
+         void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
+         {
+             if (!rdram || destAddr == 0u)
+@@ -2447,21 +2882,65 @@ namespace ps2_stubs
+         uint32_t traceIdx = 0u;
+         bool eofChanged = false;
+         bool backpressured = false;
++        bool retryMismatch = false;
++        bool suspendedForCallback = false;
++        uint64_t transactionId = 0u;
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+             decodedBefore = playback.decodedFrames.size();
+-            backpressured = mpegDemuxBackpressured(playback);
++            backpressured = mpegDemuxBackpressured(playback) || playback.demuxTransaction.active;
+             if (!backpressured)
+             {
+-                consumed = appendGuestBytes(mpegAddr, playback, rdram, dataAddr, byteCount, callbackEvents);
+-                recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
++                const size_t initialBuffered = playback.pssBuffer.size();
++                const size_t expectedOverlap = playback.demuxRetryPending
++                                                   ? std::min<size_t>(initialBuffered, byteCount)
++                                                   : 0u;
++                const size_t overlap = p423RetryOverlap(playback, rdram, dataAddr, byteCount, 0u, 0u);
++                retryMismatch = playback.demuxRetryPending && expectedOverlap != overlap;
++                if (!retryMismatch)
++                {
++                    const uint32_t appendAddr = p423InputGuestAddress(dataAddr, overlap, 0u, 0u);
++                    const size_t appended = appendGuestBytes(
++                        mpegAddr,
++                        playback,
++                        rdram,
++                        appendAddr,
++                        byteCount - overlap,
++                        callbackEvents);
++                    consumed = overlap + appended;
++                    const size_t totalBufferBytes = initialBuffered + appended;
++                    if (callbackEvents.empty())
++                    {
++                        processPssBuffer(mpegAddr, playback, callbackEvents);
++                    }
++                    if (p423HasVideoEvent(callbackEvents))
++                    {
++                        MpegDemuxTransaction transaction{};
++                        transaction.active = true;
++                        transaction.id = g_p423NextTransactionId.fetch_add(1u, std::memory_order_relaxed);
++                        transaction.cdStreamGeneration = playback.cdStreamGeneration;
++                        transaction.requestedBytes = static_cast<uint32_t>(consumed);
++                        transaction.nonInputPrefixBytes = initialBuffered - overlap;
++                        transaction.totalBufferBytes = totalBufferBytes;
++                        playback.demuxTransaction = std::move(transaction);
++                        initializeP423PacketTransaction(playback, std::move(callbackEvents));
++                        transactionId = playback.demuxTransaction.id;
++                        suspendedForCallback = true;
++                    }
++                    else
++                    {
++                        playback.demuxRetryPending = false;
++                        playback.demuxRetryAcceptedCallbacks = 0u;
++                        recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
++                    }
++                }
+             }
+             decodedCount = playback.decodedFrames.size();
+             traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
+         }
+ 
+-        if (backpressured)
++        if (backpressured || retryMismatch)
+         {
+             if (traceIdx < 32u)
+             {
+@@ -2472,6 +2951,11 @@ namespace ps2_stubs
+             setReturnS32(ctx, 0);
+             return;
+         }
++        if (suspendedForCallback)
++        {
++            continueP423DemuxTransaction(rdram, ctx, runtime, mpegAddr, transactionId, false, 0u);
++            return;
++        }
+         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
+         if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
+         {
+@@ -2530,29 +3014,68 @@ namespace ps2_stubs
+         uint32_t traceIdx = 0u;
+         bool eofChanged = false;
+         bool backpressured = false;
++        bool retryMismatch = false;
++        bool suspendedForCallback = false;
++        uint64_t transactionId = 0u;
+         {
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+             decodedBefore = playback.decodedFrames.size();
+-            backpressured = mpegDemuxBackpressured(playback);
++            backpressured = mpegDemuxBackpressured(playback) || playback.demuxTransaction.active;
+             if (!backpressured)
+             {
+-                consumed = appendGuestRingBytes(
+-                    mpegAddr,
+-                    playback,
+-                    rdram,
+-                    dataAddr,
+-                    availableBytes,
+-                    ringBaseAddr,
+-                    ringSize,
+-                    callbackEvents);
+-                recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
++                const size_t initialBuffered = playback.pssBuffer.size();
++                const size_t expectedOverlap = playback.demuxRetryPending
++                                                   ? std::min<size_t>(initialBuffered, availableBytes)
++                                                   : 0u;
++                const size_t overlap = p423RetryOverlap(
++                    playback, rdram, dataAddr, availableBytes, ringBaseAddr, ringSize);
++                retryMismatch = playback.demuxRetryPending && expectedOverlap != overlap;
++                if (!retryMismatch)
++                {
++                    const uint32_t appendAddr = p423InputGuestAddress(dataAddr, overlap, ringBaseAddr, ringSize);
++                    const size_t appended = appendGuestRingBytes(
++                        mpegAddr,
++                        playback,
++                        rdram,
++                        appendAddr,
++                        availableBytes - overlap,
++                        ringBaseAddr,
++                        ringSize,
++                        callbackEvents);
++                    consumed = overlap + appended;
++                    const size_t totalBufferBytes = initialBuffered + appended;
++                    if (callbackEvents.empty())
++                    {
++                        processPssBuffer(mpegAddr, playback, callbackEvents);
++                    }
++                    if (p423HasVideoEvent(callbackEvents))
++                    {
++                        MpegDemuxTransaction transaction{};
++                        transaction.active = true;
++                        transaction.id = g_p423NextTransactionId.fetch_add(1u, std::memory_order_relaxed);
++                        transaction.cdStreamGeneration = playback.cdStreamGeneration;
++                        transaction.requestedBytes = static_cast<uint32_t>(consumed);
++                        transaction.nonInputPrefixBytes = initialBuffered - overlap;
++                        transaction.totalBufferBytes = totalBufferBytes;
++                        playback.demuxTransaction = std::move(transaction);
++                        initializeP423PacketTransaction(playback, std::move(callbackEvents));
++                        transactionId = playback.demuxTransaction.id;
++                        suspendedForCallback = true;
++                    }
++                    else
++                    {
++                        playback.demuxRetryPending = false;
++                        playback.demuxRetryAcceptedCallbacks = 0u;
++                        recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
++                    }
++                }
+             }
+             decodedCount = playback.decodedFrames.size();
+             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
+         }
+ 
+-        if (backpressured)
++        if (backpressured || retryMismatch)
+         {
+             if (traceIdx < 32u)
+             {
+@@ -2565,6 +3088,11 @@ namespace ps2_stubs
+             setReturnS32(ctx, 0);
+             return;
+         }
++        if (suspendedForCallback)
++        {
++            continueP423DemuxTransaction(rdram, ctx, runtime, mpegAddr, transactionId, false, 0u);
++            return;
++        }
+         const bool currentStreamCompleted = std::find(completedMpegIds.begin(), completedMpegIds.end(), mpegAddr) != completedMpegIds.end();
+         if (decodedCount != decodedBefore || eofChanged || currentStreamCompleted)
+         {
+@@ -2718,9 +3246,14 @@ namespace ps2_stubs
+             // hardware register (kernel address 0x1000B410) that this HLE
+             // architecture does not emulate -- see the P3.14.2 report, Model
+             // A/B decision.
++            // P4.2.4: `!playback.streamEnded` was removed from this gate.
++            // streamEnded means the *source* (PSS producer) ended -- it says
++            // nothing about the accepted-ES backlog still sitting in guest
++            // viBuf (accepted - consumed, ~471 KiB at source EOF). The sync
++            // consumer must keep draining that backlog after source EOF, then
++            // perform the deferred decoder EOF flush itself (below).
+             if (playback.decodedFrames.empty() &&
+                 isP314SyncRedecodeEnabled() &&
+-                !playback.streamEnded &&
+                 !playback.decoderFailed)
+             {
+                 static std::atomic<uint32_t> s_diagP314Count{0u};
+@@ -2783,7 +3316,17 @@ namespace ps2_stubs
+                     uint32_t wrapsThisCall = 0u;
+                     bool feedFailed = false;
+                     static thread_local std::vector<uint8_t> s_wrapScratch;
+-                    while (playback.decodedFrames.empty() && fedBytes < available)
++                    // P4.2.4: after source EOF the guest's end-of-movie flush
++                    // loop only performs a bounded handful of GetPicture
++                    // calls (on real hardware the IPU drained viBuf at DMA
++                    // speed, so that sufficed). Stopping at the first decoded
++                    // frame would leave most of the backlog unconsumed when
++                    // the guest tears the playback down. So post-EOF this
++                    // loop drains the ENTIRE remaining backlog in one pass;
++                    // decoded frames accumulate in the deque and are handed
++                    // out by subsequent GetPicture calls as usual.
++                    while ((playback.decodedFrames.empty() || playback.streamEnded) &&
++                           fedBytes < available)
+                     {
+                         const uint32_t chunk = std::min(kP314ChunkBytes, available - fedBytes);
+                         const uint32_t physOffset = playback.p314ConsumedEsBytes % viBufCapacity;
+@@ -2958,6 +3501,24 @@ namespace ps2_stubs
+                     std::cerr << "[P314:GP] #" << p314Idx << " no guest ES available (available=0 or viBufBase=0) "
+                                  "-- falling back to waitExternal" << std::endl;
+                 }
++
++                // P4.2.4: deferred end-of-stream flush, owned by the sync
++                // consumer. Correct only after BOTH conditions hold: the
++                // source ended (streamEnded) AND every accepted byte has been
++                // consumed (backlog == accepted - consumed == 0; accepted is
++                // frozen after source EOF so this comparison is stable).
++                // flushDecoderIfEnded() is the same call the source-EOF sites
++                // used to make prematurely; it emits the parser's buffered
++                // final picture plus the codec's delayed frames and marks the
++                // decoder drained (idempotent afterwards).
++                if (playback.streamEnded &&
++                    playback.decoder &&
++                    !playback.decoder->drained() &&
++                    !playback.decoderFailed &&
++                    playback.p314ConsumedEsBytes >= videoBytesTotal)
++                {
++                    flushDecoderIfEnded(playback);
++                }
+             }
+ 
+             if (playback.decodedFrames.empty() &&
+@@ -3319,7 +3880,23 @@ namespace ps2_stubs
+         const bool producerEnded =
+             g_mpeg_stub_state.currentCdStreamEofSeen &&
+             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+-        const bool ended = producerEnded &&
++        // P4.2.4: in sync-redecode mode, source EOF (streamEnded) no longer
++        // implies decode is finished -- the accepted-ES backlog in guest viBuf
++        // is drained by GetPicture after EOF, and the decoder's EOF flush is
++        // deferred until backlog == 0. Do not report movie end while input is
++        // still owed to the decoder, or the tail of the movie would be cut.
++        bool syncInputDrained = true;
++        if (playback.syncGuestEsDecodeActive &&
++            playback.streamEnded &&
++            !playback.decoderFailed)
++        {
++            const uint32_t movieState = mpegAddr - 0x278u;
++            const uint32_t acceptedBytes = mpegGuestRead32(rdram, movieState + 0x28u);
++            syncInputDrained =
++                playback.p314ConsumedEsBytes >= acceptedBytes &&
++                (!playback.decoder || playback.decoder->drained());
++        }
++        const bool ended = producerEnded && syncInputDrained &&
+                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
+         const uint64_t presentationEnd = playback.presentationEndTickQ32;
+         const uint64_t currentTickQ32 = runtime != nullptr
+@@ -3344,7 +3921,8 @@ namespace ps2_stubs
+             ++g_mpeg_stub_state.isEndTraceCount;
+         }
+ 
+-        setReturnS32(ctx, (ended && playback.decodedFrames.empty() && presentationComplete) ? 1 : 0);
++        const bool isEndNow = ended && playback.decodedFrames.empty() && presentationComplete;
++        setReturnS32(ctx, isEndNow ? 1 : 0);
+     }
+ 
+     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -3354,7 +3932,29 @@ namespace ps2_stubs
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+         const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+-        setReturnS32(ctx, playback.decodedFrames.empty() ? 1 : 0);
++        bool refBuffEmpty = playback.decodedFrames.empty();
++        // P4.2.4: the guest's movie-finish path polls this ("isFlushed") and
++        // tears the playback down as soon as it returns 1. After source EOF in
++        // sync-redecode mode the accepted-ES backlog in guest viBuf still
++        // holds pictures the decoder has not produced yet, so the ref buffer
++        // is NOT empty: report 0 until every accepted byte is consumed and
++        // the deferred decoder EOF flush ran. This keeps the guest inside its
++        // flush loop (further GetPicture calls), which is what drains the
++        // backlog; progress is monotonic so the loop terminates.
++        if (refBuffEmpty &&
++            playback.syncGuestEsDecodeActive &&
++            playback.streamEnded &&
++            !playback.decoderFailed)
++        {
++            const uint32_t movieState = mpegAddr - 0x278u;
++            const uint32_t acceptedBytes = mpegGuestRead32(rdram, movieState + 0x28u);
++            if (playback.p314ConsumedEsBytes < acceptedBytes ||
++                (playback.decoder && !playback.decoder->drained()))
++            {
++                refBuffEmpty = false;
++            }
++        }
++        setReturnS32(ctx, refBuffEmpty ? 1 : 0);
+     }
+ 
+     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

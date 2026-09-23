@@ -39,6 +39,14 @@
     {
       "path": "patches/BLOCKER_004_p4110_scegssetdefdbuffdc_conditional_tail.patch",
       "sha256": "601b5c3ac4b779d057bfcdf6829ee78cc648b1130c6104a5a17fd55429be030d"
+    },
+    {
+      "path": "patches/BLOCKER_004_p423_p424_mpeg_movie_completion.patch",
+      "sha256": "1c059ac47c09c630cba6909bad18fdcb8e338a9fcadfe384a97fe8034ff6427a"
+    },
+    {
+      "path": "patches/BLOCKER_004_q101_field_presentation.patch",
+      "sha256": "c2de87fad4812cee55ddca190cb3e2e587d1be3d38d8f9b3310eb64a0d9d4bbb"
     }
   ],
   "patch_identity": {
@@ -47,5 +55,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "0efd17c3cdb834ac13c087dcb2bd947d9fc033b3"
+  "patched_commit": "fd7f2b4358689cbbc46e98ce1c78e3b8b2478963"
 }
