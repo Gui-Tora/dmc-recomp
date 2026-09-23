@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los cuatro patches actualmente activos:
+arriba). Los once patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -269,3 +269,19 @@ arriba). Los cuatro patches actualmente activos:
    - `analysis/notes/BLOCKER_004_P410_SCEGSSETDEFDBUFFDC_CONDITIONAL_TAIL_PARITY_FIX.md` —
      implementación del fix, ledger de correcciones y validación 3/3+1
      (P4.1.10).
+
+10. `BLOCKER_004_p423_p424_mpeg_movie_completion.patch` (convención B).
+    Hace que el demux MPEG espere la finalización del callback guest antes
+    de confirmar cada PES de vídeo (P4.2.3), y aplaza el flush del decoder
+    hasta consumir el viBuf pendiente tras el fin de la fuente (P4.2.4).
+    Contiene la lógica requerida por el baseline visual Q10.1. Las trazas
+    y capturas opt-in añadidas durante la investigación P4.2.3/P4.2.4 se
+    retiraron antes de crear el patch. Documentación:
+    `analysis/notes/BLOCKER_004_P423_MPEG_DEMUX_CALLBACK_COMPLETION_OWNERSHIP_FIX.md`
+    y `analysis/notes/BLOCKER_004_P424_MPEG_END_OF_STREAM_VIBUF_DRAIN_BEFORE_DECODER_FLUSH.md`.
+
+11. `BLOCKER_004_q101_field_presentation.patch` (convención B). El
+    presentador de memoria local ya construye todas las filas de DISPLAY;
+    elimina el bob dependiente de paridad que duplicaba filas y desplazaba
+    verticalmente el contenido completo. Validación objetiva y visual en
+    `analysis/notes/BLOCKER_004_Q10_1_FIELD_PRESENTATION_FIX.md`.
