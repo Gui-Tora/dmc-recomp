@@ -1,0 +1,31 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Devil May Cry",
+  "wikidata": "Q840889",
+  "system": "PS2",
+  "type": "recomp",
+  "original": {
+    "region": "PAL Europe",
+    "revision": "1.02",
+    "serial": "SLES-50358"
+  },
+  "project": "dmc-recomp",
+  "status": "in-progress",
+  "targets": [
+    "Windows"
+  ],
+  "toolchain": "PS2Recomp",
+  "approach": "Experimental static recompilation of the PAL Europe PS2 executable to native Windows using PS2Recomp, with project-specific HLE/runtime patches.",
+  "maintainers": [
+    {
+      "name": "Gui-Tora",
+      "link": "https://github.com/Gui-Tora"
+    }
+  ],
+  "tags": [
+    "ps2",
+    "recompilation",
+    "reverse-engineering"
+  ],
+  "notes": "Work in progress, not playable yet. Boots to Main Menu with working input and reproducible development checkpoints. NEW GAME currently reaches a pre-gameplay CPU hot loop in Eff_amm_set; the first playable frame has not been reached."
+}
