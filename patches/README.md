@@ -285,3 +285,49 @@ arriba). Los once patches actualmente activos:
     elimina el bob dependiente de paridad que duplicaba filas y desplazaba
     verticalmente el contenido completo. Validación objetiva y visual en
     `analysis/notes/BLOCKER_004_Q10_1_FIELD_PRESENTATION_FIX.md`.
+
+12. `DEVSTATE_003_main_menu_checkpoint_v1.patch` (convención B). Sistema
+    de checkpoint de desarrollo "Main Menu v1": formato de archivo de 12
+    secciones (CORE/MEM/MMIO/SCHED/GS/IOP/SIF_RPC/CD/MC/AUDIO/PAD/MPEG,
+    cada una versionada y con CRC-32 propio), validador de punto seguro en
+    el límite de `EeScheduler::run()`, arranque en frío vs. restauración
+    (`DMC_DEVSTATE_LOAD=<ruta>`) sin ejecutar código guest entre la
+    restauración y la reanudación del scheduler, solicitud de guardado real
+    vía F9 (diagnóstico de desarrollo, no un mecanismo de producción para el
+    jugador), e identidad de proceso (ELF SHA-256 + build id) para rechazar
+    checkpoints incompatibles. Incluye los self-tests de round-trip,
+    determinismo, orden de carga y rechazo de formato. Validado end-to-end
+    en una sesión en vivo real: SAVE completo (12/12 secciones, CRC válidos)
+    y LOAD en un proceso completamente nuevo con Main Menu visible,
+    interactivo y con continuidad de subsistemas confirmada; equivalencia
+    COLD vs. RESTORED verificada hasta el bloqueador preexistente de NEW
+    GAME (sin relación con este patch). Documentación completa (no
+    duplicada aquí):
+    - `analysis/notes/DEVSTATE_001_MAIN_MENU_CHECKPOINT.md` y
+      `DEVSTATE_001A_MAIN_MENU_SAFEPOINT_FEASIBILITY.md` — viabilidad y
+      elección del punto seguro de Main Menu.
+    - `analysis/notes/DEVSTATE_002_CHECKPOINT_SERIALIZATION_DESIGN.md` —
+      diseño del formato y clasificación de cada campo mutable
+      (SERIALIZE_EXACT/LOGICAL/RECONSTRUCT/RESET_SAFE/FORBIDDEN_HOST_STATE).
+    - `analysis/notes/DEVSTATE_003A_CHECKPOINT_CORE_IMPLEMENTATION.md` —
+      implementación de CORE/MEM/MMIO y el validador de punto seguro base.
+    - `analysis/notes/DEVSTATE_003B_SCHED_GS_SAVE_BOUNDARY.md` —
+      secciones SCHED/GS, mecanismo real de solicitud de guardado (F9) y
+      primer SAVE real validado.
+    - `analysis/notes/DEVSTATE_003C_COMPLETE_HLE_AND_COLD_LOAD.md` —
+      secciones IOP/SIF_RPC/CD/MC/AUDIO/PAD/MPEG, arranque en frío vs.
+      restauración, y la sesión de validación en vivo completa (TEST A-E).
+    - `analysis/notes/DEVSTATE_003_CHECKPOINT_PROMOTION.md` — nota de
+      promoción: cómo se aisló este patch del árbol de vendor (que
+      contenía además trabajo ya versionado en los patches 8/9/11 y
+      diagnóstico INPUT_001 no relacionado), verificación de reproducción
+      determinista desde el commit real de upstream, y estado final.
+
+    **Exclusión deliberada**: `Pad.cpp` en el árbol de desarrollo contiene
+    además instrumentación de diagnóstico `INPUT_001` (gateada por
+    `DMC_INPUT001_TRACE`, ya documentada como temporal en el propio código
+    — "Remove after input arbitration fix is validated"), no relacionada
+    con el checkpoint y no validada como parte de esta fase. Ese
+    diagnóstico se excluyó explícitamente de este patch a nivel de hunk;
+    permanece como cambio local no versionado, pendiente de su propia
+    decisión de promoción o retiro.
