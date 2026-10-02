@@ -1,0 +1,386 @@
+diff --git a/ps2xRuntime/include/runtime/checkpoint/checkpoint.h b/ps2xRuntime/include/runtime/checkpoint/checkpoint.h
+index 4e2cbb9..fda0abf 100644
+--- a/ps2xRuntime/include/runtime/checkpoint/checkpoint.h
++++ b/ps2xRuntime/include/runtime/checkpoint/checkpoint.h
+@@ -26,7 +26,8 @@ namespace ps2x::checkpoint
+     {
+         std::string gameId;              // "SLES_503.58"
+         uint8_t elfSha256[32]{};         // digest of the boot ELF
+-        uint8_t runtimeBuildId[32]{};    // digest identifying this build
++        uint8_t checkpointCompatId[32]{}; // strict serialized-state contract
++        uint8_t executableBuildId[32]{};  // exact executable provenance
+     };
+ 
+     // Result of the safe-point quiescence validation (DEVSTATE_001A contract
+diff --git a/ps2xRuntime/include/runtime/checkpoint/checkpoint_format.h b/ps2xRuntime/include/runtime/checkpoint/checkpoint_format.h
+index f256332..be98826 100644
+--- a/ps2xRuntime/include/runtime/checkpoint/checkpoint_format.h
++++ b/ps2xRuntime/include/runtime/checkpoint/checkpoint_format.h
+@@ -1,7 +1,8 @@
+ // DEVSTATE_003A: checkpoint on-disk format (framing only).
+ // Normative design: analysis/notes/DEVSTATE_002_CHECKPOINT_SERIALIZATION_DESIGN.md
+ //
+-// v1 policy: strict build identity (runtime_build_id must match), explicit
++// v2 policy: strict checkpoint ABI identity; executable identity is provenance.
++// Explicit
+ // integer widths everywhere, little-endian x86-64 only, no compression, and
+ // deterministic byte output (all payloads are written field-by-field or from
+ // containers with a defined order; no raw struct dumps of types that contain
+@@ -12,11 +13,15 @@
+ 
+ #include <cstdint>
+ #include <cstddef>
++#include <array>
+ 
+ namespace ps2x::checkpoint
+ {
+     inline constexpr uint32_t kMagic = 0x4B434D44u; // "DMCK" little-endian
+-    inline constexpr uint32_t kFormatVersion = 1u;
++    inline constexpr uint32_t kFormatVersion = 2u;
++    // Bump for checkpoint-relevant runtime semantics not covered by section
++    // versions (restore order, deadline reconstruction, persistent state meaning).
++    inline constexpr uint32_t kCheckpointRuntimeAbiVersion = 1u;
+     inline constexpr uint32_t kArchitectureId = 1u; // 1 = x86_64 little-endian
+     inline constexpr uint32_t kSafePointMainMenuV1 = 1u;
+ 
+@@ -49,13 +54,14 @@ namespace ps2x::checkpoint
+         uint32_t safePointId;
+         uint8_t gameId[32];        // NUL-padded ASCII, e.g. "SLES_503.58"
+         uint8_t elfSha256[32];     // raw digest bytes
+-        uint8_t runtimeBuildId[32]; // raw digest bytes (exe identity)
++        uint8_t checkpointCompatId[32]; // strict runtime checkpoint ABI identity
++        uint8_t executableBuildId[32];  // exact exe digest, provenance only
+         uint64_t savedAtUnixMs;    // informational ONLY; excluded from
+                                    // idempotency comparisons (design §8)
+         uint32_t sectionCount;
+         uint32_t headerCrc32;      // CRC of all header bytes with this field 0
+     };
+-    static_assert(sizeof(FileHeader) == 4u * 4u + 32u + 32u + 32u + 8u + 4u + 4u,
++    static_assert(sizeof(FileHeader) == 4u * 4u + 32u + 32u + 32u + 32u + 8u + 4u + 4u,
+                   "FileHeader must stay padding-free");
+ 
+     struct SectionEntry
+@@ -84,14 +90,63 @@ namespace ps2x::checkpoint
+     inline constexpr uint32_t kPadSectionVersion = 1u;
+     inline constexpr uint32_t kMpegSectionVersion = 1u;
+ 
+-    // DEVSTATE_003C: v1-complete required section set (12 sections). A
++    // DEVSTATE_003C: complete required section set (12 sections). A
+     // checkpoint missing any of these (e.g. the 5-section DEVSTATE_003B
+     // artifact) must be rejected explicitly, not partially restored.
+-    inline constexpr SectionId kRequiredSectionsV1[] = {
+-        SectionId::Core,  SectionId::Mem,    SectionId::Mmio, SectionId::Gs,
+-        SectionId::Sched, SectionId::Iop,    SectionId::SifRpc, SectionId::Cd,
+-        SectionId::Mc,    SectionId::Audio,  SectionId::Pad,  SectionId::Mpeg,
++    // One canonical mapping from required section IDs to their payload
++    // versions. The compatibility digest consumes this entire ordered set.
++    struct SectionContract
++    {
++        SectionId id;
++        uint32_t version;
+     };
++    inline constexpr std::array<SectionContract, 12> kRequiredSectionContracts = {{
++        {SectionId::Core, kCoreSectionVersion}, {SectionId::Mem, kMemSectionVersion},
++        {SectionId::Mmio, kMmioSectionVersion}, {SectionId::Gs, kGsSectionVersion},
++        {SectionId::Sched, kSchedSectionVersion}, {SectionId::Iop, kIopSectionVersion},
++        {SectionId::SifRpc, kSifRpcSectionVersion}, {SectionId::Cd, kCdSectionVersion},
++        {SectionId::Mc, kMcSectionVersion}, {SectionId::Audio, kAudioSectionVersion},
++        {SectionId::Pad, kPadSectionVersion}, {SectionId::Mpeg, kMpegSectionVersion},
++    }};
++
++    // 4 independent FNV-1a lanes over explicit little-endian metadata.
++    // This is an identity token, not a security digest. Callers can supply a
++    // modified contract to test every input's influence without changing code.
++    constexpr std::array<uint8_t, 32> calculateCheckpointCompatId(
++        uint32_t abiVersion, uint32_t formatVersion,
++        const std::array<SectionContract, 12> &sections)
++    {
++        uint64_t lanes[4] = {1469598103934665603ull ^ 0x11111111u,
++                             1469598103934665603ull ^ 0x22222222u,
++                             1469598103934665603ull ^ 0x33333333u,
++                             1469598103934665603ull ^ 0x44444444u};
++        size_t index = 0;
++        const auto add = [&](uint32_t value)
++        {
++            for (unsigned shift = 0; shift < 32; shift += 8)
++            {
++                const uint8_t byte = static_cast<uint8_t>(value >> shift);
++                uint64_t &lane = lanes[index++ & 3u];
++                lane = (lane ^ byte) * 1099511628211ull;
++            }
++        };
++        add(abiVersion);
++        add(formatVersion);
++        add(static_cast<uint32_t>(sections.size()));
++        for (const SectionContract &section : sections)
++        {
++            add(static_cast<uint32_t>(section.id));
++            add(section.version);
++            add(kSectionFlagRequired);
++        }
++        std::array<uint8_t, 32> result{};
++        for (size_t lane = 0; lane < 4; ++lane)
++            for (unsigned byte = 0; byte < 8; ++byte)
++                result[lane * 8 + byte] = static_cast<uint8_t>(lanes[lane] >> (byte * 8));
++        return result;
++    }
++    inline constexpr auto kCheckpointCompatId = calculateCheckpointCompatId(
++        kCheckpointRuntimeAbiVersion, kFormatVersion, kRequiredSectionContracts);
+ 
+     uint32_t crc32(const uint8_t *data, size_t size, uint32_t seed = 0u);
+ }
+diff --git a/ps2xRuntime/src/lib/checkpoint/checkpoint_io.cpp b/ps2xRuntime/src/lib/checkpoint/checkpoint_io.cpp
+index 67d529b..8b90e78 100644
+--- a/ps2xRuntime/src/lib/checkpoint/checkpoint_io.cpp
++++ b/ps2xRuntime/src/lib/checkpoint/checkpoint_io.cpp
+@@ -147,7 +147,10 @@ namespace ps2x::checkpoint
+                                      : sizeof(h.gameId);
+             std::memcpy(h.gameId, identity.gameId.data(), idLen);
+             std::memcpy(h.elfSha256, identity.elfSha256, sizeof(h.elfSha256));
+-            std::memcpy(h.runtimeBuildId, identity.runtimeBuildId, sizeof(h.runtimeBuildId));
++            std::memcpy(h.checkpointCompatId, identity.checkpointCompatId,
++                        sizeof(h.checkpointCompatId));
++            std::memcpy(h.executableBuildId, identity.executableBuildId,
++                        sizeof(h.executableBuildId));
+             h.savedAtUnixMs = savedAtUnixMs;
+             h.sectionCount = sectionCount;
+             h.headerCrc32 = 0u;
+@@ -258,8 +261,19 @@ namespace ps2x::checkpoint
+         const uint64_t fileSize = static_cast<uint64_t>(in.tellg());
+         in.seekg(0, std::ios::beg);
+ 
++        if (fileSize < 2u * sizeof(uint32_t))
++            return CheckpointError::failure("truncated: smaller than header prefix");
++        uint32_t prefix[2]{};
++        in.read(reinterpret_cast<char *>(prefix), sizeof(prefix));
++        if (!in.good())
++            return CheckpointError::failure("header prefix read failed");
++        if (prefix[0] != kMagic)
++            return CheckpointError::failure("bad magic");
++        if (prefix[1] != kFormatVersion)
++            return CheckpointError::failure("unsupported format version");
+         if (fileSize < sizeof(FileHeader))
+             return CheckpointError::failure("truncated: smaller than header");
++        in.seekg(0, std::ios::beg);
+         FileHeader header{};
+         in.read(reinterpret_cast<char *>(&header), sizeof(header));
+         if (!in.good())
+@@ -282,8 +296,10 @@ namespace ps2x::checkpoint
+             return CheckpointError::failure("game identity mismatch");
+         if (std::memcmp(header.elfSha256, expected.elfSha256, 32) != 0)
+             return CheckpointError::failure("ELF identity mismatch");
+-        if (std::memcmp(header.runtimeBuildId, expected.runtimeBuildId, 32) != 0)
+-            return CheckpointError::failure("runtime build mismatch (v1 strict policy)");
++        if (std::memcmp(header.checkpointCompatId, expected.checkpointCompatId, 32) != 0)
++            return CheckpointError::failure("checkpoint runtime ABI mismatch");
++        if (std::memcmp(header.executableBuildId, expected.executableBuildId, 32) != 0)
++            std::fprintf(stderr, "[CKPT:LOAD] executable build differs, checkpoint ABI compatible\n");
+ 
+         if (header.sectionCount == 0u || header.sectionCount > 64u)
+             return CheckpointError::failure("implausible section count");
+@@ -315,12 +331,14 @@ namespace ps2x::checkpoint
+         // file missing any of them (e.g. the DEVSTATE_003B 5-section
+         // artifact) is rejected explicitly here, before any payload is even
+         // checksum-verified -- never partially restored.
+-        for (SectionId required : kRequiredSectionsV1)
++        for (const SectionContract &required : kRequiredSectionContracts)
+         {
+             bool found = false;
+             for (const SectionEntry &e : table)
+             {
+-                if (static_cast<SectionId>(e.id) == required)
++                if (static_cast<SectionId>(e.id) == required.id &&
++                    e.version == required.version &&
++                    (e.flags & kSectionFlagRequired) != 0u)
+                 {
+                     found = true;
+                     break;
+@@ -329,8 +347,8 @@ namespace ps2x::checkpoint
+             if (!found)
+             {
+                 return CheckpointError::failure(
+-                    "required section missing: id=" +
+-                    std::to_string(static_cast<uint32_t>(required)));
++                    "required section missing or incompatible: id=" +
++                    std::to_string(static_cast<uint32_t>(required.id)));
+             }
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/checkpoint/checkpoint_selftest.cpp b/ps2xRuntime/src/lib/checkpoint/checkpoint_selftest.cpp
+index 5c645a8..b8232ad 100644
+--- a/ps2xRuntime/src/lib/checkpoint/checkpoint_selftest.cpp
++++ b/ps2xRuntime/src/lib/checkpoint/checkpoint_selftest.cpp
+@@ -39,7 +39,8 @@ namespace ps2x::checkpoint
+             id.gameId = "SLES_503.58";
+             for (int i = 0; i < 32; ++i)
+                 id.elfSha256[i] = static_cast<uint8_t>(i * 3 + 1);
+-            std::memcpy(id.runtimeBuildId, runtimeBuildId(), 32);
++            std::memcpy(id.checkpointCompatId, kCheckpointCompatId.data(), 32);
++            std::memcpy(id.executableBuildId, runtimeBuildId(), 32);
+             return id;
+         }
+ 
+@@ -92,13 +93,15 @@ namespace ps2x::checkpoint
+             std::vector<uint8_t> b(333);
+             for (size_t i = 0; i < b.size(); ++i)
+                 b[i] = static_cast<uint8_t>(255u - (i & 0xFFu));
+-            w.addSection(SectionId::Core, kCoreSectionVersion, kSectionFlagRequired, a);
+-            w.addSection(SectionId::Mmio, kMmioSectionVersion, kSectionFlagRequired, b);
+-            for (SectionId id2 : {SectionId::Mem, SectionId::Gs, SectionId::Sched, SectionId::Iop,
+-                                  SectionId::SifRpc, SectionId::Cd, SectionId::Mc, SectionId::Audio,
+-                                  SectionId::Pad, SectionId::Mpeg})
++            for (const SectionContract &section : kRequiredSectionContracts)
+             {
+-                w.addSection(id2, 1u, kSectionFlagRequired, std::vector<uint8_t>{1, 2, 3, 4});
++                if (section.id == SectionId::Core)
++                    w.addSection(section.id, section.version, kSectionFlagRequired, a);
++                else if (section.id == SectionId::Mmio)
++                    w.addSection(section.id, section.version, kSectionFlagRequired, b);
++                else
++                    w.addSection(section.id, section.version, kSectionFlagRequired,
++                                 std::vector<uint8_t>{1, 2, 3, 4});
+             }
+             expect(w.commit(file, 123456789ull).ok, "TEST1 write commit");
+         }
+@@ -171,11 +174,73 @@ namespace ps2x::checkpoint
+             other.elfSha256[0] ^= 0x01u;
+             expect(!parseOk(file, other), "TEST5 elf mismatch rejected");
+             other = id;
+-            other.runtimeBuildId[31] ^= 0x01u;
+-            expect(!parseOk(file, other), "TEST5 build mismatch rejected");
++            other.checkpointCompatId[31] ^= 0x01u;
++            expect(!parseOk(file, other), "TEST5 checkpoint ABI mismatch rejected");
+             expect(parseOk(file, id), "TEST5 control: correct identity accepted");
+         }
+ 
++        // DEVSTATE_003D: exact executable provenance differs without changing
++        // the serialized-state contract. All checks are parser-only: no
++        // runtime section can be mutated before validation succeeds.
++        {
++            writeAll(file, good);
++            CheckpointIdentity other = id;
++            other.executableBuildId[0] ^= 0x80u;
++            ParsedCheckpoint parsed;
++            const CheckpointError sameAbi =
++                CheckpointFileReader::parseAndValidate(file, other, parsed);
++            expect(sameAbi.ok && parsed.stage == CheckpointLoadStage::Parsed,
++                   "COMPAT-1 different executable ID accepted");
++            expect(std::memcmp(parsed.header.executableBuildId,
++                               id.executableBuildId, 32) == 0 &&
++                       std::memcmp(parsed.header.executableBuildId,
++                                   other.executableBuildId, 32) != 0,
++                   "COMPAT-7 exact executable ID preserved for provenance");
++
++            other = id;
++            other.checkpointCompatId[0] ^= 0x80u;
++            ParsedCheckpoint rejected;
++            const CheckpointError abiError =
++                CheckpointFileReader::parseAndValidate(file, other, rejected);
++            expect(!abiError.ok &&
++                       abiError.message == "checkpoint runtime ABI mismatch" &&
++                       rejected.stage == CheckpointLoadStage::None,
++                   "COMPAT-2 ABI mismatch rejected before restore");
++
++            other = id;
++            other.elfSha256[0] ^= 0x80u;
++            expect(!parseOk(file, other), "COMPAT-3 wrong ELF rejected");
++
++            auto damaged = good;
++            damaged.back() ^= 0x80u;
++            writeAll(file, damaged);
++            expect(!parseOk(file, id), "COMPAT-4 bad payload CRC rejected");
++
++            auto missing = good;
++            const size_t lastId = sizeof(FileHeader) +
++                                  (kRequiredSectionContracts.size() - 1u) * sizeof(SectionEntry);
++            missing[lastId] = static_cast<uint8_t>(SectionId::Core);
++            missing[lastId + 1] = missing[lastId + 2] = missing[lastId + 3] = 0u;
++            writeAll(file, missing);
++            expect(!parseOk(file, id), "COMPAT-5 missing required section rejected");
++            writeAll(file, good);
++
++            bool everyVersionChanges = true;
++            for (size_t i = 0; i < kRequiredSectionContracts.size(); ++i)
++            {
++                auto modified = kRequiredSectionContracts;
++                ++modified[i].version;
++                if (calculateCheckpointCompatId(kCheckpointRuntimeAbiVersion,
++                                                kFormatVersion, modified) == kCheckpointCompatId)
++                    everyVersionChanges = false;
++            }
++            expect(everyVersionChanges, "COMPAT-6 every section version changes ABI ID");
++            expect(calculateCheckpointCompatId(kCheckpointRuntimeAbiVersion + 1u,
++                                               kFormatVersion, kRequiredSectionContracts) !=
++                       kCheckpointCompatId,
++                   "COMPAT-6 runtime ABI version changes ID");
++        }
++
+         // Runtime-backed determinism tests (6-9) need a constructed runtime.
+         if (runtime != nullptr)
+         {
+@@ -239,10 +304,16 @@ namespace ps2x::checkpoint
+                     bool identical = a.size() == b.size();
+                     if (identical)
+                     {
+-                        // mask savedAtUnixMs (offset 112..119) and headerCrc32
+-                        // (offset 124..127) before comparing (design §8).
+-                        for (size_t off : {112u, 113u, 114u, 115u, 116u, 117u, 118u, 119u,
+-                                           124u, 125u, 126u, 127u})
++                        // Mask the informational timestamp and dependent CRC
++                        // before comparing (design §8).
++                        for (size_t off = offsetof(FileHeader, savedAtUnixMs);
++                             off < offsetof(FileHeader, savedAtUnixMs) + sizeof(FileHeader::savedAtUnixMs); ++off)
++                        {
++                            a[off] = 0;
++                            b[off] = 0;
++                        }
++                        for (size_t off = offsetof(FileHeader, headerCrc32);
++                             off < offsetof(FileHeader, headerCrc32) + sizeof(FileHeader::headerCrc32); ++off)
+                         {
+                             a[off] = 0;
+                             b[off] = 0;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 6a13e74..a4c99d1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2709,7 +2709,7 @@ void PS2Runtime::run(const std::filesystem::path &devstateLoadPath)
+                          // DEVSTATE_003C: new filename -- the 003B 5-section
+                          // artifact (dmc_checkpoint_mainmenu.dmck) is kept
+                          // untouched as a format-rejection test fixture.
+-                         std::filesystem::path("dmc_checkpoint_mainmenu_v1.dmck"),
++                         std::filesystem::path("dmc_checkpoint_mainmenu_v2.dmck"),
+                          ps2x::checkpoint::processIdentity()))
+             {
+                 std::cerr << "[CKPT:REQUEST] queued (F9); waiting for scheduler boundary"
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 2bbc205..eef0e28 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -15,6 +15,7 @@
+ #include <exception>
+ #include <algorithm>
+ #include <cstdlib>
++#include <cstdio>
+ 
+ #if defined(__ANDROID__)
+ #include <android/log.h>
+@@ -235,7 +236,18 @@ int main(int argc, char *argv[])
+             ps2x::checkpoint::CheckpointIdentity identity;
+             identity.gameId = elfName;
+             ps2x::checkpoint::computeFileDigest(pathObj, identity.elfSha256);
+-            std::memcpy(identity.runtimeBuildId, ps2x::checkpoint::runtimeBuildId(), 32);
++            std::memcpy(identity.checkpointCompatId,
++                        ps2x::checkpoint::kCheckpointCompatId.data(), 32);
++            std::memcpy(identity.executableBuildId, ps2x::checkpoint::runtimeBuildId(), 32);
++            std::fprintf(stderr, "[CKPT:IDENTITY] abi=%u format=%u compat=",
++                         ps2x::checkpoint::kCheckpointRuntimeAbiVersion,
++                         ps2x::checkpoint::kFormatVersion);
++            for (uint8_t b : identity.checkpointCompatId)
++                std::fprintf(stderr, "%02x", b);
++            std::fprintf(stderr, " executable=");
++            for (uint8_t b : identity.executableBuildId)
++                std::fprintf(stderr, "%02x", b);
++            std::fprintf(stderr, "\n");
+             ps2x::checkpoint::setProcessIdentity(identity);
+         }
+ 

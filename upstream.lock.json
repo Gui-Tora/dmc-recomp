@@ -51,6 +51,10 @@
     {
       "path": "patches/DEVSTATE_003_main_menu_checkpoint_v1.patch",
       "sha256": "261d78196be982c37822a65011f2d8998baa094a4e7f144310cfbd1a3f121243"
+    },
+    {
+      "path": "patches/DEVSTATE_003D_checkpoint_compatibility_id.patch",
+      "sha256": "865ca98a81d6b203b841be593cc11fe979aabcc95f11c21614ba23b8556340b7"
     }
   ],
   "patch_identity": {
@@ -59,5 +63,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "ae378ab333501ec76b8db16069f8ac616514f040"
+  "patched_commit": "dcd03052f7e8b43bac6dd9e598ea7237893f78c3"
 }

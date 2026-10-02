@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los once patches actualmente activos:
+arriba). Los trece patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -331,3 +331,11 @@ arriba). Los once patches actualmente activos:
     diagnóstico se excluyó explícitamente de este patch a nivel de hunk;
     permanece como cambio local no versionado, pendiente de su propia
     decisión de promoción o retiro.
+
+13. `DEVSTATE_003D_checkpoint_compatibility_id.patch` (convención B).
+    Introduce el formato v2 con `checkpointCompatId` estricto derivado de
+    versión ABI, formato e ID/versiones de las doce secciones requeridas;
+    conserva `executableBuildId` solo para procedencia. Valida el mismo
+    checkpoint tras un relink de diagnóstico no semántico, con Main Menu e
+    input funcionales. Causa, pruebas y límites:
+    `analysis/notes/DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md`.
