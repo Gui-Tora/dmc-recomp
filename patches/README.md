@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los trece patches actualmente activos:
+arriba). Los quince patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -339,3 +339,32 @@ arriba). Los trece patches actualmente activos:
     checkpoint tras un relink de diagnóstico no semántico, con Main Menu e
     input funcionales. Causa, pruebas y límites:
     `analysis/notes/DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md`.
+
+14. `GAMEPLAY_001D_001G_cdmodule_mode2_sound_abi2.patch` (convención B).
+    HLE de `CDMODULE.IRX` (`SLES_503.58`) derivado del binario del IRX, sin
+    constantes por recurso: `fno=2 mode&2` (cabecera + descriptores tipo 0/3
+    EE, tipo 1 IOP con copia secundaria a `SdtAddr+0x2000`, tipo 2 SPU con
+    registro VAB), `fno=1` (`SdtAddr`), `mode=1` no alineado con DMA y
+    respuesta redondeados a 16 (`0x118`), `mode&8` (`TsndPortInit` y selección
+    de slots, `0x1B9`), `fno=8` (`EE_TransSize`) y el segundo servidor
+    `sid=0x87654321 fno=0x100` (`SeReplaceProcess`). El estado persistente de
+    CDMODULE cambia, por lo que sube `kCheckpointRuntimeAbiVersion` y
+    `kIopSectionVersion` a 2: los checkpoints ABI 1 se rechazan. Validación
+    contra oráculos ORIGINAL (14/14 `recv`, cuatro efectos de `0x103`):
+    `analysis/notes/GAMEPLAY_001E_CDMODULE_MIXED_EE_IOP_SPU.md`,
+    `analysis/notes/GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md` y
+    `analysis/notes/GAMEPLAY_001_MAIN_MENU_TO_FIRST_PLAYABLE_FRAME.md` (001C/001D).
+
+15. `GAMEPLAY_001I_vif1_tte_all_tag_ids.patch` (convención B). Corrección
+    general de runtime, no específica de DMC: con `CHCR.TTE=1` el DMAC envía
+    al VIF los 64 bits altos (dos VIFcodes) de **cada** DMAtag antes de su
+    payload, también para REF/REFS/REFE. El runtime fijado solo los enviaba
+    para cnt/next/call/ret/end y sin consultar TTE. Además, `sceDmaSend`
+    conserva el `CHCR.TTE` configurado por el juego en el registro del canal.
+    Misma semántica que upstream `ran-j/PS2Recomp` `75d729c` (PR #244); solo
+    se porta esta corrección, sin actualizar el resto de upstream. Incluye
+    tests (`ps2xTest/src/ps2_memory_tests.cpp`): REF con TTE, TTE desactivado,
+    `sceDmaSend` conservando TTE; los tres tests VIF1 previos que dependían del
+    comportamiento anterior pasan a `CHCR=0x144`. Causa raíz, evidencia y
+    validación: `analysis/notes/GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md` y
+    `analysis/notes/GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md`.

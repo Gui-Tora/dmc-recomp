@@ -412,9 +412,8 @@ stubs = [
   "sceSifSyncIop@0x0020A128",
   "sceSifRebootIop@0x0020A170",
   "GetRomName@0x004F3518",
-  # --- Triage manual, ver analysis/notes/HUGE_GENERATED_FILES.md ---
+  # --- 17 ret0 pendientes; capVu0MulMatrix2 (RET0_FIRSTCALL) y capVu0Add/SubVectorXYZ (GAMEPLAY_001I) restauradas ---
   "ret0@0x0016B8E0", # Calc_md
-  "ret0@0x001A0080", # capVu0MulMatrix2
   "ret0@0x001A0180", # capVu0MulMatrix_r
   "ret0@0x0016D920", # Calc_scr_light
   "ret0@0x00132D20", # katVu0ViewVolumeClip
@@ -429,8 +428,6 @@ stubs = [
   "ret0@0x001A01F0", # capCopyMatrix
   "ret0@0x0019FC40", # capVu0ScaleVectorXYZ2
   "ret0@0x001A03C0", # _capVu0ecossin
-  "ret0@0x0019FBB0", # capVu0AddVectorXYZ
-  "ret0@0x0019FBD0", # capVu0SubVectorXYZ
   "ret0@0x0016D8E0", # Get_light_str
   "ret0@0x001A0300", # capVu0Compare
 ]

@@ -82,7 +82,7 @@ P4.0–P4.2.4 y Q6–Q10.1:
 | DEVSTATE_003 | promoción | parche `DEVSTATE_003_main_menu_checkpoint_v1` | **versionado** | [DEVSTATE_003_CHECKPOINT_PROMOTION.md](DEVSTATE_003_CHECKPOINT_PROMOTION.md) |
 | DEVSTATE_003D | un relink invalidaba el checkpoint v1 | formato v2: identidad de compatibilidad de estado frente a build ID de procedencia | **versionado** | [DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md](DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md) |
 
-## 4. GAMEPLAY_001 — de Main Menu al primer frame jugable (2026-10-02 – 10-13)
+## 4. GAMEPLAY_001 — de Main Menu al primer frame jugable (2026-10-02 – 10-14)
 
 | ID | Problema | Descubrimiento principal | Estado | Documento |
 |---|---|---|---|---|
@@ -97,7 +97,8 @@ P4.0–P4.2.4 y Q6–Q10.1:
 | GAMEPLAY_001G | CDMODULE restante + modo sombra | coincide con ORIGINAL hasta `0x32`; falta `0x232`; Add/Sub 400/400 EXACT | implementado (**local**) | [GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md](GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md) |
 | GAMEPLAY_001H | ¿por qué no se pide `0x232`? | **VIF1 CHCR.TTE**: etiquetas REF pierden VIFcodes → DIRECT falso → bloqueo GS; corrección validada 4/4; `vf0.w = 0` en hilos | causa raíz demostrada; corrección **experimental local** | [GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md](GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md) |
 | Seguimiento `ret0` | estado de las 20 funciones | tabla viva | vivo | [GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md) |
-| GAMEPLAY_001I | promoción TTE, experimento `vf0`, A/B Add/Sub | — | **no iniciada** | [GAMEPLAY_CURRENT_STATUS.md](GAMEPLAY_CURRENT_STATUS.md) §9 |
+| GAMEPLAY_001I | promoción TTE, A/B Add/Sub, origen de `vf0` | parche TTE en `patches/` + lock, tests +3; Add/Sub nativas (A/B 2+2 sin regresiones; 17 `ret0`); `vf0 = 0` por creación de contexto (`StartThread`/invocaciones); ecossin 600/600 con `DMC_VF0_FIX` | cerrada; **publicada en la rama `gameplay-001i`** (parches 14 CDMODULE/ABI 2 y 15 TTE, lock `6bea2eb0`) | [GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md) |
+| GAMEPLAY_001J | corrección general de `vf0`, ecossin, CLIP, evidencia visual | — | **propuesta, no iniciada** | [GAMEPLAY_CURRENT_STATUS.md](GAMEPLAY_CURRENT_STATUS.md) §9 |
 
 ### Fichas de fases sin documento propio (resumen; detalle en la nota GAMEPLAY_001)
 
@@ -116,7 +117,7 @@ P4.0–P4.2.4 y Q6–Q10.1:
   - Siguiente bloqueo: `0x103` tipo 1.
   - Ejecutable `38e6b964…166d0a`.
   - Evidencia local: `analysis/local/gameplay_001d/`.
-  - Código: `cdmodule.cpp` (local, no versionado).
+  - Código: `cdmodule.cpp`; desde 2026-10-14, parche 14 (`GAMEPLAY_001D_001G_cdmodule_mode2_sound_abi2.patch`).
 - **RET0_FIRSTCALL:**
   - Primera llamada `Md_jnt_info_set@0x252F40 → capVu0MulMatrix2@0x1A0080`.
   - El AFTER nativo (64 B) coincide con el oráculo ORIGINAL (SHA-256 `ddbdd3bb…9a47`).
@@ -135,6 +136,8 @@ P4.0–P4.2.4 y Q6–Q10.1:
 | Límites Ghidra de `SndSceneBgmStart` (16 B) frente a `.symtab` (628 B) | ídem |
 | Capturas PINE de IOP a cero en 001E → ruta de lectura PCSX2 inválida | [GAMEPLAY_001E_CDMODULE_MIXED_EE_IOP_SPU.md](GAMEPLAY_001E_CDMODULE_MIXED_EE_IOP_SPU.md) |
 | Capturas pasivas de ventana en 001G → escritorio, inválidas | [GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md](GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md) |
+| Parche TTE mínimo de 001H «suficiente» → requería también conservar TTE en `sceDmaSend` | [GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md) |
+| Origen de `vf0.w = 0` «`StartThread` o checkpoint (UNKNOWN)» → creación de contexto; el checkpoint solo lo perpetúa | ídem |
 
 ## 6. Política documental
 

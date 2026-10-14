@@ -5,20 +5,17 @@
 #include <cstdio>
 #include "p311_pad_test.inc"
 
-// Instrumented stand-ins for 20 addresses whose exported CSV/Ghidra boundaries were
-// bogus (1-3.6MB "functions" caused by Ghidra decoding COP2/VU0/MMI R5900 opcodes as
-// MIPS Release 6 instructions - language MIPS:LE:64:64-32R6addr has no R5900 support).
-// See analysis/notes/HUGE_GENERATED_FILES.md for full evidence. Static analysis found
-// zero real callers (no JAL/JALR, no lui+ori/addiu address construction anywhere in
-// ~180k scanned instructions); the only reference to these addresses anywhere in the
-// binary is inside the ".mwcats" Metrowerks CodeWarrior debug metadata section, not
-// game code. This does NOT prove they are dead - VU0 macro-mode prologues (LQC2 loads
-// seen in the PS2Recomp-decoded bytes) look like real matrix/vector math. This
-// instrumentation counts real calls at runtime to settle it empirically.
-//
-// Retire this file once either: (a) a proper R5900-aware Ghidra language lets us get
-// real function boundaries and recompile these normally, or (b) enough runtime
-// evidence (call counts over a real playthrough) shows they are truly unreachable.
+// Instrumented ret0 stand-ins for the 17 R5900/VU0 functions that are still not
+// restored (SLES_503.58). History: they were stubbed when Ghidra's R6 language
+// produced bogus 1-3.6MB boundaries (analysis/notes/HUGE_GENERATED_FILES.md); the
+// ELF .symtab now gives correct boundaries and their native bodies generate cleanly.
+// The old claim of "zero real callers" was RETRACTED: the ELF has 1544 JAL to the
+// original 20 entries (analysis/notes/GAMEPLAY_001_RET0_AUDIT.md).
+// Restored to their generated native bodies (no longer overridden):
+//   capVu0MulMatrix2   @0x001A0080 (RET0_FIRSTCALL, matches ORIGINAL oracle)
+//   capVu0AddVectorXYZ @0x0019FBB0, capVu0SubVectorXYZ @0x0019FBD0 (GAMEPLAY_001I)
+// Status and restoration order: analysis/notes/GAMEPLAY_001_RET0_RESTORATION_STATUS.md.
+// Keep recomp/symtabfirst.toml ret0@ entries and this list in sync.
 
 namespace
 {
@@ -51,7 +48,6 @@ namespace
     }
 
     DMC_INSTRUMENTED_RET0(dmcStub_Calc_md, 0x0016B8E0u)
-    DMC_INSTRUMENTED_RET0(dmcStub_capVu0MulMatrix2, 0x001A0080u)
     DMC_INSTRUMENTED_RET0(dmcStub_capVu0MulMatrix_r, 0x001A0180u)
     DMC_INSTRUMENTED_RET0(dmcStub_Calc_scr_light, 0x0016D920u)
     DMC_INSTRUMENTED_RET0(dmcStub_katVu0ViewVolumeClip, 0x00132D20u)
@@ -66,8 +62,6 @@ namespace
     DMC_INSTRUMENTED_RET0(dmcStub_capCopyMatrix, 0x001A01F0u)
     DMC_INSTRUMENTED_RET0(dmcStub_capVu0ScaleVectorXYZ2, 0x0019FC40u)
     DMC_INSTRUMENTED_RET0(dmcStub_capVu0ecossin, 0x001A03C0u)
-    DMC_INSTRUMENTED_RET0(dmcStub_capVu0AddVectorXYZ, 0x0019FBB0u)
-    DMC_INSTRUMENTED_RET0(dmcStub_capVu0SubVectorXYZ, 0x0019FBD0u)
     DMC_INSTRUMENTED_RET0(dmcStub_Get_light_str, 0x0016D8E0u)
     DMC_INSTRUMENTED_RET0(dmcStub_capVu0Compare, 0x001A0300u)
 
@@ -77,7 +71,6 @@ namespace
     {
         startP311PadTest();
         runtime.registerFunction(0x0016B8E0u, dmcStub_Calc_md);
-        runtime.registerFunction(0x001A0080u, dmcStub_capVu0MulMatrix2);
         runtime.registerFunction(0x001A0180u, dmcStub_capVu0MulMatrix_r);
         runtime.registerFunction(0x0016D920u, dmcStub_Calc_scr_light);
         runtime.registerFunction(0x00132D20u, dmcStub_katVu0ViewVolumeClip);
@@ -92,8 +85,6 @@ namespace
         runtime.registerFunction(0x001A01F0u, dmcStub_capCopyMatrix);
         runtime.registerFunction(0x0019FC40u, dmcStub_capVu0ScaleVectorXYZ2);
         runtime.registerFunction(0x001A03C0u, dmcStub_capVu0ecossin);
-        runtime.registerFunction(0x0019FBB0u, dmcStub_capVu0AddVectorXYZ);
-        runtime.registerFunction(0x0019FBD0u, dmcStub_capVu0SubVectorXYZ);
         runtime.registerFunction(0x0016D8E0u, dmcStub_Get_light_str);
         runtime.registerFunction(0x001A0300u, dmcStub_capVu0Compare);
     }

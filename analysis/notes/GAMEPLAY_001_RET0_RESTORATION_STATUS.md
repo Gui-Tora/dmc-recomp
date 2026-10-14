@@ -1,28 +1,31 @@
 # GAMEPLAY_001 — Estado de restauración de las 20 funciones `ret0`
 
-Documento de seguimiento permanente. Última verificación: 2026-10-14, contra el árbol de trabajo local y
-`HEAD = 6cc8ce8`.
+Documento de seguimiento permanente. Última verificación: 2026-10-14 (cierre de GAMEPLAY_001I), contra el
+árbol de trabajo local; `origin/master = 6cc8ce8`.
 
 Historia y metodología:
 
 - [GAMEPLAY_001_RET0_AUDIT.md](GAMEPLAY_001_RET0_AUDIT.md): inventario `.symtab` y RET0_FIRSTCALL.
 - [GAMEPLAY_001F_RET0_BATCH_AUDIT.md](GAMEPLAY_001F_RET0_BATCH_AUDIT.md): grupos y defectos del traductor.
 - [GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md](GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md): sombra e inventario v2.
-- [GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md](GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md): A/B Add/Sub, ecossin y `vf0`.
+- [GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md](GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md): A/B Add/Sub previo, ecossin y `vf0`.
+- [GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md): restauración permanente de Add/Sub y experimento `vf0`.
 
 ## Resumen verificado
 
 | Concepto | Local (árbol de trabajo) | GitHub (`origin/master` = `6cc8ce8`) |
 |---|---|---|
 | Funciones sustituidas originalmente | 20 | 20 |
-| `ret0@` en `recomp/symtabfirst.toml` | **19** | **20** |
-| `registerFunction` en `runtime/dmc_overrides.cpp` | 19 | 20 |
+| `ret0@` en `recomp/symtabfirst.toml` | **17** | **20** |
+| `registerFunction` en `runtime/dmc_overrides.cpp` | 17 | 20 |
 | `capVu0MulMatrix2` | nativa, validada contra ORIGINAL | todavía `ret0` |
+| `capVu0AddVectorXYZ`, `capVu0SubVectorXYZ` | nativas (001I) | todavía `ret0` |
 | Grupo A / B / C (inventario v2, 001G) | 9 / 8 / 2 | — (documentado aquí) |
 
-**HECHO:** la restauración de `capVu0MulMatrix2` existe **solo en local**: TOML y overrides sin commit, más el
-cuerpo regenerado sincronizado en el árbol generado local. Ninguna otra función ha sido restaurada de forma
-permanente.
+**HECHO:** las restauraciones de `capVu0MulMatrix2` (RET0_FIRSTCALL) y de `capVu0AddVectorXYZ` y
+`capVu0SubVectorXYZ` (GAMEPLAY_001I) están **versionadas** en la rama `gameplay-001i` (commit `5cee31b`: TOML
+con 17 `ret0@` y overrides con 17 stubs instrumentados), pendientes de merge a `master`. Los cuerpos nativos se
+regeneran desde el TOML. **`RET0_COUNT = 17`.**
 
 **Nota de historia:** la primera clasificación de 001F era A=10, B=7, C=2. 001G la corrigió a **A=9, B=8,
 C=2**, porque `Calc_scr_light` usa `vftoi0`.
@@ -31,8 +34,12 @@ C=2**, porque `Calc_scr_light` usa `vftoi0`.
 
 - **HECHO (hardware):** `vf0` es constante `(0, 0, 0, 1)`. Las escrituras a `vf0` se ignoran.
 - **HECHO (RECOMP, 001H):** en 600/600 llamadas shadow reales de `_capVu0ecossin` (hilo 12), `vf0.w = 0`.
-  - `StartThread` (`EeScheduler.cpp`) crea el contexto con `R5900Context{}` (`memset 0`) sin fijar `vf0`.
-  - **UNKNOWN:** si también influye el contexto restaurado del checkpoint.
+- **HECHO (001I, causa):** `StartThread` (`EeScheduler.cpp`) crea el contexto con `R5900Context{}` (`memset 0`) sin
+  fijar `vf0`, y lo mismo ocurre con las invocaciones `GuestInvocation`. Tras cargar el checkpoint solo el hilo 1
+  tiene `vf0 = (0,0,0,1)`. Los hilos creados después de la carga también nacen con `vf0 = 0`. El checkpoint
+  conserva el valor, pero no lo origina.
+- **HECHO (001I, experimento `DMC_VF0_FIX`):** con `vf0` forzado a la constante hardware, el cuerpo nativo de
+  ecossin coincide bit a bit con el modelo independiente en seno y coseno en 600/600 casos.
 - **HECHO (traductor, 001F, frente a `pcsx2/VUops.cpp`):**
 
 | Defecto | Comportamiento generado | Referencia PCSX2 |
@@ -54,9 +61,9 @@ máximos registrados con el experimento TTE (`ttefixC16`, granularidad 1/50) o e
 | # | Nombre | Dirección ELF | Grupo | Estado actual | Cuerpo nativo | Defectos del traductor / runtime | Resultado de pruebas | Evidencia ORIGINAL | Prioridad | Siguiente paso |
 |---:|---|---|:-:|---|---|---|---|---|:-:|---|
 | 1 | capVu0MulMatrix2 | `0x1A0080` | — | **NATIVA VALIDADA** (local; ret0 en GitHub) | sí, sincronizado en el árbol generado local | ninguno usado | primera llamada: AFTER de 64 B = oráculo (`oracle_compare.json`) | **sí**: 64 B BEFORE/AFTER, primera llamada | — | publicar TOML/overrides cuando se autorice código |
-| 2 | capVu0AddVectorXYZ | `0x19FBB0` | A | ret0 + sombra + `DMC_RET0_NATIVE` | sí | ninguno | sombra 200/200 EXACT; A/B sin diferencias hasta `0x32`; ≥8150 llamadas después de la película | no | 1 | A/B con TTE común en ambos brazos (001I) |
-| 3 | capVu0SubVectorXYZ | `0x19FBD0` | A | ret0 + sombra + `DMC_RET0_NATIVE` | sí | ninguno | sombra 200/200 EXACT; A/B sin diferencias; ≥6700 llamadas | no | 1 | ídem |
-| 4 | _capVu0ecossin | `0x1A03C0` | A* | ret0 + sombra VU0 | sí | **SQRT**; depende de **`vf0.w = 1`** | sombra 600/600: `vf0.w = 0` → `Q = 0`; con el runtime actual la nativa sería incorrecta | no | 2 | experimento independiente `vf0 = (0,0,0,1)`; repetir sombra contra `ecossin_ref_model.py` |
+| 2 | capVu0AddVectorXYZ | `0x19FBB0` | A | **NATIVA (001I, local)** | sí, sincronizado (SHA-256 `eb4d4c4c…`) | ninguno | sombra 200/200 EXACT; A/B 2+2 con TTE permanente: sin regresiones; diverge (de forma determinista) el camino de `Coat_matrix_calc`; exe final probado | no | — | publicar cuando se autorice código; oráculo ORIGINAL opcional |
+| 3 | capVu0SubVectorXYZ | `0x19FBD0` | A | **NATIVA (001I, local)** | sí, sincronizado (SHA-256 `78e5be78…`) | ninguno | sombra 200/200 EXACT; A/B 2+2 sin regresiones (6750 llamadas en ambos brazos); exe final probado | no | — | ídem |
+| 4 | _capVu0ecossin | `0x1A03C0` | A* | ret0 + sombra VU0 | sí | **SQRT**; depende de **`vf0.w = 1`** | sin corrección: coseno incorrecto (199/600). Con `DMC_VF0_FIX`: seno y coseno 600/600 bit a bit = modelo (001I); sin casos `1−s²<0` | no | 1 | hacer permanente la corrección `vf0` (cambio general); después A/B ret0 frente a nativa |
 | 5 | katVu0SetClip | `0x132D70` | A† | ret0 | sí | ninguno (8 `lqc2`) | ≥6150 llamadas por frame tras la película | no | 3 | restaurar junto a su consumidora `katVu0Clip_ld` |
 | 6 | katVu0Clip_ld | `0x132DA0` | B | ret0 | sí | **CLIP** | ≥251 550 llamadas (~5500/tick) | no | 3 | corregir `vclipw` en el traductor (parche general) y oráculo de una llamada |
 | 7 | Get_light_str | `0x16D8E0` | A | ret0 | sí | `vmaxx` no ejercitado en otro código | ≥20 600 llamadas; inicialización de escena normal | no | 4 | sombra con modelo de referencia |

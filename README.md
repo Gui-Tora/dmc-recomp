@@ -12,12 +12,19 @@ project, not a playable port.
 - BLOCKER_002 (missing CD-read IOP service): **RESOLVED**
 - BLOCKER_003 (movie/PSS CD streaming transport): **RESOLVED**
 - BLOCKER_004 (PSS movie data reaches the EE but produces no visible
-  video): **OPEN**
+  video): **OPEN** in its tracking note; movie playback was reported
+  visually stable at the known-good checkpoint
+  (`analysis/notes/BLOCKER_004_PRE_PERF_KNOWN_GOOD_CHECKPOINT.md`)
 - Real interactive boot reached
 - DualSense/gamepad input works well enough to navigate in-game menus
 - Title screen reached
 - Rendering is still incomplete/corrupted
-- Later game states (gameplay, missions) are not yet functional
+- Later game states (gameplay, missions) are not yet functional. Past
+  NEW GAME, the intro movie (`0x232`) is requested and plays to completion
+  with the current patchset (CDMODULE `mode&2`/`mode&8`, checkpoint ABI 2,
+  VIF1 TTE; see
+  [`analysis/notes/GAMEPLAY_CURRENT_STATUS.md`](analysis/notes/GAMEPLAY_CURRENT_STATUS.md));
+  a first playable frame has not been demonstrated
 - Movie/PSS frames now render as recognizable, legible imagery (logo
   text, fire/smoke animation) after a GS double-buffer display
   environment fix, but playback is not yet fully correct (see
@@ -313,8 +320,9 @@ from it (`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`,
 Known, currently out-of-scope limitations (not yet classified as blocking
 further progress):
 
-- `CdModuleService` only handles `mode=1`; `mode=2` is left explicitly
-  unsupported.
+- `CdModuleService` handles `mode=1`, `mode&2` and `mode&8` (patch
+  `GAMEPLAY_001D_001G_cdmodule_mode2_sound_abi2.patch`); IOP/SPU sound
+  effects are modelled as data only (no TSND playback backend).
 - Rendering is incomplete/corrupted past the title screen.
 - The boot flow after the title screen is still under investigation.
 
