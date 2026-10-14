@@ -292,3 +292,19 @@ Sin los archivos originales, el checkpoint y el build local, los volcados no pue
 - **Corrección:** `_capVu0ecossin` tiene **9** llamadores estáticos (`capVu0*RotMatrix*`). En ejecución se
   observaron 6 return addresses. Los resúmenes previos citaban solo `UnitRotMatrixX_r`/`RotMatrixY_r`.
 - **Refutada:** H5, «`processVIF1Data` no conserva estado parcial entre trozos».
+
+## ACTUALIZACIÓN — GAMEPLAY_001I (2026-10-14)
+
+Esta sección se añade sin modificar las anteriores.
+
+- La corrección TTE quedó **promovida** a `patches/GAMEPLAY_001I_vif1_tte_all_tag_ids.patch`, entrada 14 de
+  `upstream.lock.json` (`patched_commit` `b3cb0bd7…`), en el árbol local y **sin commit**.
+- El parche incluye además la conservación de TTE en `sceDmaSend` y tests.
+- Se retiraron el conmutador `DMC_VIF_TTE_FIX` y los diagnósticos de esta fase.
+- El origen de `vf0.w = 0` quedó resuelto: es la creación de contexto en `StartThread` y en las invocaciones.
+- Add/Sub se restauraron de forma permanente en local.
+- Ver [GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md).
+
+**Publicación (2026-10-14):** el parche TTE quedó como entrada **15** de `upstream.lock.json`, porque el trabajo
+CDMODULE/ABI 2 entró como parche 14. `patched_commit` final: `6bea2eb0…`. Está publicado en la rama
+`gameplay-001i` (commit `22088d0`).

@@ -1,11 +1,11 @@
 # Estado actual del proyecto — punto de entrada para nuevos agentes
 
-Última actualización: 2026-10-14, al cierre documental de GAMEPLAY_001H.
+Última actualización: 2026-10-14, publicación técnica de GAMEPLAY_001I en la rama `gameplay-001i` ([GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md)).
 Índice histórico completo: [RESEARCH_INDEX.md](RESEARCH_INDEX.md).
 Reglas del proyecto: [AGENTS.md](../../AGENTS.md) (obligatorias) y [README.md](../../README.md).
 
-> **Aviso:** el estado del **árbol de trabajo local** del mantenedor está bastante por delante de lo que hay en
-> Git/GitHub. Lee primero la sección «Estado remoto frente a estado local».
+> **Aviso:** el avance técnico de GAMEPLAY_001D–001I está publicado en la rama `gameplay-001i`, que aún no
+> está fusionada en `master`. Lee la sección «Estado remoto frente a estado local».
 > **El juego no es jugable.** El primer frame jugable **no** está demostrado.
 
 Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
@@ -18,7 +18,7 @@ Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
 | ELF | `SLES_503.58`; SHA-256 `d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`; CRC32 `0x77654AD2`; entry `0x00100008` |
 | `CDMODULE.IRX` | SHA-256 `9d51f16d1ed861e508daa1389e6aaf4fe597687b3f0cd5feb920e62a479b34fa` |
 | `TSNDDRVM.IRX` | SHA-256 `c00b17f07aa0dfed089a517498074eec251c7b571f58a7649414ef88be7f31fd` |
-| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + 13 parches (`upstream.lock.json`, `patched_commit` sintético `dcd03052…`) |
+| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master`: 13 parches (`patched_commit` `dcd03052…`). Rama `gameplay-001i`: 15 parches (`patched_commit` `6bea2eb0146c321903dc895a6290f36fa1803df4`) |
 | Límites de función | `.symtab` del ELF (*symtab-first*), no Ghidra. Ver [SYMTAB_BASELINE_PROMOTION.md](SYMTAB_BASELINE_PROMOTION.md) |
 | Herramientas | Rabbitizer (en ps2_recomp), Ghidra solo para navegación y xrefs, PCSX2 2.8.2 como oráculo (PINE de solo lectura + debugger manual del usuario) |
 | Repositorio | `https://github.com/Gui-Tora/dmc-recomp` (rama principal `master`) |
@@ -34,31 +34,36 @@ generales del runtime van en `patches/`.
 |---|---|
 | ELF → C++ (symtab-first) | funciona; build incremental |
 | Arranque, IOP base, memory card, idioma, PSS inicial, Main Menu | alcanzados (BLOCKER_001–004; [BLOCKER_004_PRE_PERF_KNOWN_GOOD_CHECKPOINT.md](BLOCKER_004_PRE_PERF_KNOWN_GOOD_CHECKPOINT.md)) |
-| Checkpoint de desarrollo Main Menu | versionado (formato v2, ABI 1); ABI 2 **solo local** |
-| CDMODULE `fno=2 mode=1/2/8/0xA`, `fno=1/8`, SeReplace | **implementado y validado localmente**; no versionado |
-| Película `0x232` tras NEW GAME | reproducida **solo con experimento local TTE** |
+| Checkpoint de desarrollo Main Menu | formato v2; runtime ABI 2 en el parche 14 (`gameplay-001i`) |
+| CDMODULE `fno=2 mode=1/2/8/0xA`, `fno=1/8`, SeReplace | validado; parche 14 (`gameplay-001i`) |
+| Película `0x232` tras NEW GAME | reproducida completa con los parches 14 + 15 |
 | Escena posterior a la película | ejecución por frames observada (INFERENCIA); **no validada visualmente** |
 | Audio | no audible en ningún punto del proyecto (observación del usuario) |
-| 20 `ret0` VU0 | 1 restaurada localmente; 19 pendientes ([GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md)) |
+| 20 `ret0` VU0 | 3 restauradas localmente (`capVu0MulMatrix2`, `capVu0AddVectorXYZ`, `capVu0SubVectorXYZ`); **17 pendientes** ([GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md)) |
 
-## 3. Última ejecución comprobada (local, 2026-10-13)
+## 3. Última ejecución comprobada (local, 2026-10-14)
 
-- **Ejecutable:** `860d7a055cab34a79c10c636f8ae5fc8e31cf9549481c1fc6e85f3353c0f5c78`.
-- **Condiciones:** checkpoint ABI 2 y `DMC_VIF_TTE_FIX=1`. Detalle en
-  [GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md](GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md).
+- **Ejecutable reproducible:** `7110206b429e20198cef6e7f436ae4e33465287c4dd52e47e28e62d0a218459e` (corrida `pubR1`).
+  - Construido con el vendor idéntico al replay de los 15 parches.
+  - 17 `ret0` y overrides limpios, sin diagnósticos ni experimentos.
+  - Selftests 97/0.
+- **Corrida anterior equivalente:** `finalF1` (exe `d80ac6f2…`).
+- **Condiciones:** checkpoint ABI 2. Detalle en
+  [GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md).
 
 Secuencia:
 
 1. Carga del checkpoint en Main Menu (`CKPT:LOAD` compatible) y Cross por archivo PAD (NEW GAME).
 2. CDMODULE carga 24 recursos, idénticos a ORIGINAL hasta `0x32`: `0x52 0x50 0x51 0x54 0x53 0xFE 0xFF 0x108 0x103 0x4F 0x118 0x14E 0x119 0x11A 0x5A 0x1B9 0x2E 0x31 0x36 0x3C 0x3A 0x33 0x44 0x32`.
 3. `SndSceneBgmStart → SdrGetState(0x80000006)`: RPC no manejado, RECOMP devuelve 0 y ORIGINAL 1.
-4. Película `0x232` (`MOVIE:start lba=0x215524 totalSize=0x490C004`): leída completa, más de 1350 fotogramas
-   MPEG decodificados, 0 errores VU1.
-5. Después de la película: `MPEG:delete`, inicialización de escena (`Get_light_str` ×20 000) y bucle por frame
-   del hilo 12 (~5500 `katVu0Clip_ld` por tick). Ritmo ~2 ticks/s al final de la ventana de 320 s.
+4. Película `0x232` (`MOVIE:start lba=0x215524 totalSize=0x490C004`), ~7,6 s después de `0x32`:
+   - 1169 trozos hasta `remaining=0x0` y 1550 fotogramas MPEG;
+   - 0 errores VU1/XGKICK.
+5. Después de la película: `MPEG:delete`, inicialización de escena (`Get_light_str` ×21 500) y bucle por frame
+   del hilo 12 (`Game_main`; ~346 600 `katVu0Clip_ld` en la ventana de 320 s).
 
-**Sin el experimento TTE:** después de `0x32` el GS se queda bloqueado en un paquete DIRECT falso de ~55 KiB y
-`0x232` nunca se solicita.
+**Sin el parche TTE:** después de `0x32` el GS se queda bloqueado en un paquete DIRECT falso de ~55 KiB y
+`0x232` nunca se solicita (001H).
 
 ## 4. Checkpoints
 
@@ -74,11 +79,11 @@ Secuencia:
   - un relink no semántico no invalida el checkpoint.
 - ABI 2 ([GAMEPLAY_001E_CDMODULE_MIXED_EE_IOP_SPU.md](GAMEPLAY_001E_CDMODULE_MIXED_EE_IOP_SPU.md)):
   `kCheckpointRuntimeAbiVersion = 2` y `kIopSectionVersion = 2`, porque el estado de CDMODULE incluye
-  `SdtAddr`. **Solo local.**
+  `SdtAddr`. Incluido en el parche 14.
 - Procedimiento:
   - cargar con `DMC_DEVSTATE_LOAD=<archivo.dmck>`;
   - guardar en Main Menu con F9 en una sesión de cold boot ([DEVSTATE_003D](DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md));
-  - autotests con `DMC_CHECKPOINT_SELFTEST=1` (97 PASS / 0 FAIL en el ejecutable `860d7a05…`).
+  - autotests con `DMC_CHECKPOINT_SELFTEST=1` (97 PASS / 0 FAIL en el ejecutable reproducible `7110206b…`).
 - **Regla:** cualquier cambio del estado serializado exige cambiar la ABI. No aceptar checkpoints antiguos con
   semántica nueva.
 
@@ -106,8 +111,11 @@ Secuencia:
   [GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md).
 - Defectos del traductor (sin parche): CLIP, MAC, escritura a `vf0`, DIV/0, SQRT, FTOI y redondeo. Ver
   [GAMEPLAY_001F_RET0_BATCH_AUDIT.md](GAMEPLAY_001F_RET0_BATCH_AUDIT.md).
-- Defecto de runtime: **`vf0.w = 0`** en contextos de hilo (`StartThread`). En hardware `vf0 = (0,0,0,1)`
-  es constante.
+- Defecto de runtime: **`vf0 = (0,0,0,0)`** en todos los hilos salvo el principal.
+  - Causa: `StartThread` e invocaciones `GsCallback` crean contextos con `memset 0` (HECHO, 001I).
+  - En hardware `vf0 = (0,0,0,1)` es constante.
+  - Con el experimento `DMC_VF0_FIX`, `_capVu0ecossin` coincide bit a bit con el modelo independiente
+    (600/600). La corrección sigue siendo **experimental**.
 
 ## 7. VIF1 / VU1 / GS
 
@@ -116,55 +124,70 @@ Secuencia:
   - El runtime descartaba los 64 bits altos (dos VIFcodes) de las etiquetas REF; 2271 de 2454 contenían
     comandos.
   - Parser independiente: 56 838 anomalías en el flujo del runtime y 0 en el flujo con semántica TTE.
-- **Corrección:** semántica de upstream `75d729c` (#244).
-  - Validada en 4/4 ejecuciones como experimento local (`DMC_VIF_TTE_FIX=1`).
-  - Parche propuesto `analysis/local/gameplay_001h/PROPOSED_VIF_TTE_ALL_TAG_IDS.patch`.
-  - **No promovido** a `patches/` ni a `upstream.lock.json`.
+- **Corrección permanente (001I):** `patches/GAMEPLAY_001I_vif1_tte_all_tag_ids.patch` (parche 15).
+  - Misma semántica que upstream `75d729c` (#244).
+  - Incluye la conservación de TTE en `sceDmaSend` y tests.
+  - Entrada 15 de `upstream.lock.json` (`patched_commit` `6bea2eb0…`, reproducido de forma limpia).
+  - `ps2x_tests`: +3 tests nuevos que pasan; mismo conjunto de fallos preexistentes que sin el parche.
+  - Se retiraron el conmutador `DMC_VIF_TTE_FIX` y los diagnósticos de 001H.
 - Sin desbordes XGKICK ni agotamiento de presupuesto VU1 con la corrección.
+- **HECHO:** 0 cadenas VIF1 con TTE=0 pierden datos con la semántica nueva (medición de la película más la
+  escena).
 - Residual UNKNOWN: `kMaxChainTags = 4096` trunca cadenas más largas.
 
 ## 8. Próximos bloqueadores (orden por evidencia)
 
-1. **Promover la corrección TTE.** Sin ella, la ejecución se bloquea en `0x32` (HECHO).
-2. **`vf0.w = 0` en hilos.** Afecta a todo código VU0 que use `vf0.w` (HECHO en ecossin; INFERENCIA general).
-3. **`ret0` en la ruta por frame:** `katVu0Clip_ld` (CLIP), `katVu0SetClip`, `_capVu0ecossin`, Add/Sub y
-   `Get_light_str`. Corrección visual o de lógica pendiente (INFERENCIA).
-4. **Defectos generales del traductor VU0** (CLIP/MAC/DIV/SQRT/FTOI/`vf0`): ya afectan a código nativo activo
-   (HECHO).
+1. **Pantalla oscura tras la fachada** (VISUAL_003, observación del usuario), que impide demostrar el primer
+   frame jugable. Fase GAMEPLAY_001J.
+2. **`vf0` en hilos:** convertir el experimento en cambio general (HECHO de causa; validado en ecossin).
+3. **`ret0` en la ruta por frame:**
+   - `katVu0Clip_ld` (CLIP) y `katVu0SetClip`;
+   - `_capVu0ecossin` (tras `vf0`);
+   - `Get_light_str`.
+
+   Corrección visual o de lógica pendiente (INFERENCIA).
+4. **Defectos generales del traductor VU0** (CLIP/MAC/DIV/SQRT/FTOI/escritura a `vf0`): ya afectan a código
+   nativo activo (HECHO).
 5. **SDRDRV `SdrGetState`:** divergencia abierta, no causal para `0x232` (HECHO).
-6. **Rendimiento de la escena posterior a la película** (~2 ticks/s en Debug) y verificación visual del primer
-   frame jugable (UNKNOWN).
+6. **Verificación visual del primer frame jugable y rendimiento de la escena** (UNKNOWN; el runtime no tiene
+   volcado de framebuffer).
 
-## 9. Próxima fase: GAMEPLAY_001I (propuesta, no iniciada)
+## 9. Próxima fase: GAMEPLAY_001J (propuesta, no iniciada)
 
-1. Promover el parche TTE a `patches/` + `upstream.lock.json` (cambio general documentado) y retirar los
-   diagnósticos temporales de 001H.
-2. Experimento independiente: `vf0 = (0,0,0,1)` en contextos `StartThread` y al restaurar el checkpoint.
-   Después, repetir la sombra de ecossin contra el modelo.
-3. A/B Add/Sub con TTE como base común en ambos brazos.
+1. Corrección general de `vf0`:
+   - inicializar en `StartThread` e invocaciones (o en el constructor si se justifica la recompilación);
+   - descartar escrituras a `vf0` en el traductor.
+2. Después, A/B de `_capVu0ecossin` (`ret0` frente a nativa) con la corrección común en ambos brazos.
+3. Parche general del traductor para CLIP (`katVu0Clip_ld`) y oráculo de una llamada.
+4. Mecanismo de evidencia visual (volcado de framebuffer) para poder evaluar el primer frame jugable.
 
-No mezclar 2 y 3 en la misma prueba experimental.
+GAMEPLAY_001I (TTE, Add/Sub, sonda `vf0`) está **cerrada**:
+[GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md).
 
-## 10. Estado remoto frente a estado local (verificado 2026-10-14)
+## 10. Estado remoto frente a estado local (verificado 2026-10-14, cierre de 001I)
 
-`HEAD = origin/master = 6cc8ce8`. Vendor `HEAD = 0efd17c`. El árbol vendor publicado equivale a
-baseline + 13 parches; se verificó reconstruyéndolo y comparándolo archivo por archivo.
+- `origin/master = 6cc8ce8`; la rama documental `docs/gameplay-001-history` (`da7ec4d`) está publicada pero no
+  integrada.
+- `master = 0cc5243` (PR #1 documental fusionado). El trabajo técnico de 001D–001I está publicado en la rama
+  `gameplay-001i` (`7e7e65b`, `22088d0`, `5cee31b` + documentación), **sin merge**.
+- Vendor `HEAD = 0efd17c`. El árbol vendor publicado equivale a baseline + 13 parches; se verificó
+  reconstruyéndolo y comparándolo archivo por archivo.
 
 | Elemento | Implementado localmente | Validado localmente | Versionado en Git | Publicado en GitHub |
 |---|---|---|---|---|
 | BLOCKER_001–004, checkpoint v1/v2 (DEVSTATE) | sí | sí | sí | sí |
-| Notas GAMEPLAY_001 (180 s, 001C, 001D, RET0, 001E, 001G) | sí | — | **solo con el commit documental de 2026-10-14** | **en la rama `docs/gameplay-001-history`** (pendiente de merge) |
-| CDMODULE `mode&2/8`, `0x103`, `0x118`, `fno=1/8`, SeReplace | sí (`cdmodule.cpp`, `builtin_profiles.cpp`, `module_factories.h`) | sí | **no** | **no** |
-| ABI 2 del checkpoint (`checkpoint_format.h`) | sí | sí (97/0) | **no** | **no** |
-| `capVu0MulMatrix2` nativa (TOML 19 `ret0@`, overrides) | sí | sí (oráculo) | **no** (en Git hay 20 `ret0`) | **no** |
-| Modo sombra / `DMC_RET0_NATIVE` / shadow ecossin | sí (`runtime/`) | diagnóstico | **no** | **no** |
-| Corrección VIF1 TTE | sí, experimental (`DMC_VIF_TTE_FIX`) | sí (4/4) | **no** | **no** |
-| Diagnósticos 001H (VU1STAT, heartbeat, watchdog GS, VIF1 dump) | sí, temporales | — | **no** (deben retirarse) | **no** |
-| Pendiente de promoción | parches CDMODULE/ABI2, TTE, `capVu0MulMatrix2` | | | |
+| Notas GAMEPLAY_001 a 001H | sí | — | sí (`da7ec4d`) | sí, en `master` (PR #1) |
+| Notas GAMEPLAY_001I y actualizaciones | sí | — | sí | rama `gameplay-001i` |
+| CDMODULE `mode&2/8`, `0x103`, `0x118`, `fno=1/8`, SeReplace + ABI 2 (parche 14) | sí | sí | sí (`7e7e65b`) | rama `gameplay-001i` |
+| Parche VIF1 TTE (parche 15) | sí | sí (tests, 7 ejecuciones completas) | sí (`22088d0`) | rama `gameplay-001i` |
+| `capVu0MulMatrix2`, `capVu0Add/SubVectorXYZ` nativas (TOML 17 `ret0@`, overrides 17) | sí | sí | sí (`5cee31b`) | rama `gameplay-001i` |
+| Modo sombra / `DMC_RET0_NATIVE` / sombra de ecossin | copia en `analysis/local/gameplay_001j/` | diagnóstico | **no** (excluido a propósito) | **no** |
+| Experimento `vf0` (`DMC_VF0_PROBE` / `DMC_VF0_FIX`) | retirado del vendor; diff en `analysis/local/gameplay_001i/` | sí (ecossin 600/600) | **no** | **no** |
+| Pendiente | merge de `gameplay-001i` a `master`; diseño general de `vf0` | | | |
 
-Consecuencia: un clon limpio de GitHub reproduce el estado de **Main Menu** (DEVSTATE/BLOCKER_004), **no** el
-avance de GAMEPLAY_001D–001H. Los hallazgos están documentados aquí; el código correspondiente debe promoverse
-mediante parches revisados.
+Consecuencia: un clon de la rama `gameplay-001i` reproduce el avance hasta la película `0x232` y la escena
+posterior. Verificado: el replay de los 15 parches coincide archivo por archivo con el vendor usado para el
+ejecutable `7110206b…`. El código generado se regenera desde `recomp/symtabfirst.toml`, que contiene 17 `ret0`.
 
 ## 11. Cómo reproducir
 
@@ -199,9 +222,14 @@ Pasos locales del mantenedor (scripts bajo `analysis/local/`, no versionados):
 | `DMC_P314_SYNC_REDECODE` | `1` |
 | `DMC_P311_PAD_FILE` | `<archivo de pad>` (máscara hexadecimal; Cross para NEW GAME) |
 
-- **Experimentos:** `DMC_VIF_TTE_FIX=1`, `DMC_RET0_NATIVE=<stubs>`, `DMC_RET0_SHADOW=<stubs>` con
-  `DMC_RET0_SHADOW_LOG` y `DMC_RET0_SHADOW_MAX`.
-- **Diagnósticos:** `DMC_VIF1_DIAG=<dir>`, `DMC_GS_WATCHDOG=1`, `DMC_HEARTBEAT`, `DMC_LOOP_PROFILE`.
+- **Experimentos:** ya no están en el código publicado. `DMC_RET0_NATIVE` y `DMC_RET0_SHADOW*` están en
+  `analysis/local/gameplay_001j/dmc_overrides.cpp.diag_001g_001i`; `DMC_VF0_PROBE` y `DMC_VF0_FIX`, en
+  `analysis/local/gameplay_001i/G001I_VF0_EXPERIMENT.diff`.
+- **Retirados en 001I:** `DMC_VIF_TTE_FIX` (el TTE ya es permanente) y los diagnósticos de 001H
+  (`DMC_VIF1_DIAG`, `DMC_GS_WATCHDOG`, `DMC_HEARTBEAT`, `DMC_LOOP_PROFILE`, `DMC_DIAG_VU1_SKIP`). Siguen
+  disponibles en `analysis/local/gameplay_001h/G001H_TEMP_INSTRUMENTATION.diff`.
+- **Reproducción del patchset:** `analysis/local/gameplay_001i/patch_replay.py` replica `apply_patchset` en un
+  clon aparte y verifica `patched_commit`, sin tocar `vendor/`.
 - **Selftests:** `DMC_CHECKPOINT_SELFTEST=1`.
 
 Evidencia no reproducible sin el entorno original: savestates y capturas PCSX2 (oráculos 001C/001E/RET0),
