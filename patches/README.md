@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los trece patches actualmente activos:
+arriba). Los catorce patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -339,3 +339,18 @@ arriba). Los trece patches actualmente activos:
     checkpoint tras un relink de diagnóstico no semántico, con Main Menu e
     input funcionales. Causa, pruebas y límites:
     `analysis/notes/DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md`.
+
+14. `GAMEPLAY_001D_001G_cdmodule_mode2_sound_abi2.patch` (convención B).
+    HLE de `CDMODULE.IRX` (`SLES_503.58`) derivado del binario del IRX, sin
+    constantes por recurso: `fno=2 mode&2` (cabecera + descriptores tipo 0/3
+    EE, tipo 1 IOP con copia secundaria a `SdtAddr+0x2000`, tipo 2 SPU con
+    registro VAB), `fno=1` (`SdtAddr`), `mode=1` no alineado con DMA y
+    respuesta redondeados a 16 (`0x118`), `mode&8` (`TsndPortInit` y selección
+    de slots, `0x1B9`), `fno=8` (`EE_TransSize`) y el segundo servidor
+    `sid=0x87654321 fno=0x100` (`SeReplaceProcess`). El estado persistente de
+    CDMODULE cambia, por lo que sube `kCheckpointRuntimeAbiVersion` y
+    `kIopSectionVersion` a 2: los checkpoints ABI 1 se rechazan. Validación
+    contra oráculos ORIGINAL (14/14 `recv`, cuatro efectos de `0x103`):
+    `analysis/notes/GAMEPLAY_001E_CDMODULE_MIXED_EE_IOP_SPU.md`,
+    `analysis/notes/GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md` y
+    `analysis/notes/GAMEPLAY_001_MAIN_MENU_TO_FIRST_PLAYABLE_FRAME.md` (001C/001D).

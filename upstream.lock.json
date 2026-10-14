@@ -55,6 +55,10 @@
     {
       "path": "patches/DEVSTATE_003D_checkpoint_compatibility_id.patch",
       "sha256": "865ca98a81d6b203b841be593cc11fe979aabcc95f11c21614ba23b8556340b7"
+    },
+    {
+      "path": "patches/GAMEPLAY_001D_001G_cdmodule_mode2_sound_abi2.patch",
+      "sha256": "9f497f7bf81a93f00716f917d8ca3b1ab9a552c3ac1b7b2559f5ab9e33469a84"
     }
   ],
   "patch_identity": {
@@ -63,5 +67,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "dcd03052f7e8b43bac6dd9e598ea7237893f78c3"
+  "patched_commit": "2fe81812224ad67427c4cab2ad25a370e115420b"
 }

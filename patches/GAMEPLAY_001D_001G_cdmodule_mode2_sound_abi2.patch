@@ -1,0 +1,1016 @@
+diff --git a/ps2xIOP/src/builtin_profiles.cpp b/ps2xIOP/src/builtin_profiles.cpp
+index 7f03e8d..a070c13 100644
+--- a/ps2xIOP/src/builtin_profiles.cpp
++++ b/ps2xIOP/src/builtin_profiles.cpp
+@@ -124,6 +124,16 @@ namespace ps2x::iop::detail
+                 .requestModeOffset = 0x14u,
+                 .minimumRequestBytes = 0x15u,
+                 .supportedMode = 1u,
++                // CDMODULE.IRX main_func2@0x19EC registers cdfunc2@0x1994
++                // with sid 0x87654321 (lui/ori at 0x1A0C/0x1A10).
++                .secondarySid = 0x87654321u,
++                .initFunction = 1u,
++                // CDMODULE.IRX SHA-256 9d51f16d...: .data at 0x3A60,
++                // 0x3A6C and 0x3A78 (see GAMEPLAY_001E_STATIC_AUDIT).
++                .soundSlotMap = {0u, 1u, 1u, 0u, 4u, 5u, 6u, 7u, 8u, 9u},
++                .soundSpuMap = {0u, 1u, 0u, 0u, 4u, 5u, 6u, 7u, 8u, 9u},
++                .soundSpuBase = {0x40000u, 0xDD700u, 0u, 0u, 0x103F80u,
++                                 0x129900u, 0x130E00u, 0x135C00u, 0x157F00u, 0x181740u},
+                 .movieStartFunction = 9u,
+                 .movieTransferFunction = 0xAu,
+                 .movieCloseFunction = 0xCu,
+diff --git a/ps2xIOP/src/module_factories.h b/ps2xIOP/src/module_factories.h
+index 16ef2a5..267a920 100644
+--- a/ps2xIOP/src/module_factories.h
++++ b/ps2xIOP/src/module_factories.h
+@@ -2,6 +2,7 @@
+ 
+ #include "iop_service.h"
+ 
++#include <array>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+@@ -163,12 +164,31 @@ namespace ps2x::iop::detail
+         uint32_t requestDestOffset = 0x0Cu;
+         uint32_t requestModeOffset = 0x14u;
+         uint32_t minimumRequestBytes = 0x15u;
+-        // Only this request.mode value is modeled (the plain EE-bound copy
+-        // path in CDMODULE.IRX's trans_process_tbl, header.type==0). Any
+-        // other mode (mode&2 header reads, mode&8 block/sound selection, IOP-
+-        // or SPU-bound transfer types) is left unhandled -- see FASE L in
+-        // BLOCKER_002_indirect_jump_top_of_ram.md and the Astra audit.
++        // CdReadProc reads request+0x10 as the mode&8 selection word: per port
++        // (0..modeSelectPortCount-1) TsndPortInit(port,0) when (word >> 8*port)
++        // is zero, and per descriptor slot (<4) a 0x80 select bit plus a pair
++        // skip count at bits 16+4*slot.
++        uint32_t requestSelectionOffset = 0x10u;
++        uint32_t modeSelectPortCount = 2u;
++        // Plain EE-bound copy mode. mode&2 uses the descriptor handler (with
++        // the mode&8 selection above when that bit is also set).
+         uint8_t supportedMode = 1u;
++        // cdfunc fno=8 returns EE_TransSize (bytes moved to EE by the last
++        // CdReadProc / CdMovieTransProc).
++        uint32_t transferSizeQueryFunction = 8u;
++        // Second RPC server (main_func2/cdfunc2). fno=seReplaceFunction runs
++        // SeReplaceProcess: request+requestDestOffset is an EE address holding a
++        // descriptor table; the u16 at requestSeIndexOffset selects a pair.
++        uint32_t secondarySid = 0u;
++        uint32_t seReplaceFunction = 0x100u;
++        uint32_t requestSeIndexOffset = 0x02u;
++        uint32_t initFunction = 1u;
++        // Values copied from the bound CDMODULE.IRX's .data tables. The
++        // descriptor slot selects these tables; no resource/stage address is
++        // embedded in the read handler.
++        std::array<uint8_t, 10> soundSlotMap{};
++        std::array<uint8_t, 10> soundSpuMap{};
++        std::array<uint32_t, 10> soundSpuBase{};
+         // Movie/PSS streaming protocol (BLOCKER_003, see
+         // analysis/notes/BLOCKER_003_cdmodule_movie_streaming.md in the
+         // consumer project). These reuse requestLbaOffset/requestSizeOffset/
+diff --git a/ps2xIOP/src/modules/cdmodule.cpp b/ps2xIOP/src/modules/cdmodule.cpp
+index 5e38dbc..4c58a4b 100644
+--- a/ps2xIOP/src/modules/cdmodule.cpp
++++ b/ps2xIOP/src/modules/cdmodule.cpp
+@@ -57,12 +57,25 @@ namespace ps2x::iop::detail
+             CdModuleService(IopHost &host, CdModuleBindings bindings)
+                 : m_host(host), m_bindings(std::move(bindings)), m_sids{m_bindings.sid}
+             {
++                if (m_bindings.secondarySid != 0u && m_bindings.secondarySid != m_bindings.sid)
++                    m_sids.push_back(m_bindings.secondarySid);
++                m_spuRam.resize(0x200000u);
+             }
+ 
+             [[nodiscard]] std::string_view name() const override { return m_bindings.serviceName; }
+             [[nodiscard]] std::span<const uint32_t> sids() const override { return m_sids; }
+ 
+-            void reset() override { m_movie = MovieStreamState{}; }
++            void reset() override
++            {
++                m_movie = MovieStreamState{};
++                m_soundDataAddress = 0u;
++                m_soundInitialized = false;
++                m_soundPorts = {};
++                m_spuTransfers.clear();
++                std::fill(m_spuRam.begin(), m_spuRam.end(), 0u);
++                m_eeTransSize = 0u;
++                m_eeTransSizeValid = false;
++            }
+ 
+             // DEVSTATE_003C checkpoint codec. MovieStreamState is a plain
+             // POD; Main Menu v1 requires it inactive (no open movie resource
+@@ -83,6 +96,26 @@ namespace ps2x::iop::detail
+                 appendU32(out, m_movie.lba);
+                 appendU64(out, m_movie.totalSize);
+                 appendU64(out, m_movie.bytesConsumed);
++                appendU8(out, m_soundInitialized ? 1u : 0u);
++                appendU32(out, m_soundDataAddress);
++                for (const SoundPort &port : m_soundPorts)
++                {
++                    appendU8(out, port.initialized ? 1u : 0u);
++                    appendU8(out, port.registered ? 1u : 0u);
++                    appendU32(out, port.written);
++                    appendU32(out, port.spuAddress);
++                    appendU32(out, static_cast<uint32_t>(port.header.size()));
++                    appendBytes(out, port.header.data(), port.header.size());
++                }
++                appendU32(out, static_cast<uint32_t>(m_spuTransfers.size()));
++                for (const SpuTransfer &transfer : m_spuTransfers)
++                {
++                    appendU32(out, transfer.address);
++                    appendU32(out, static_cast<uint32_t>(transfer.data.size()));
++                    appendBytes(out, transfer.data.data(), transfer.data.size());
++                }
++                appendU32(out, static_cast<uint32_t>(m_spuRam.size()));
++                appendBytes(out, m_spuRam.data(), m_spuRam.size());
+             }
+             bool deserializeCheckpointState(const uint8_t *data, size_t size, size_t &consumed,
+                                             std::string &error) override
+@@ -99,18 +132,121 @@ namespace ps2x::iop::detail
+                     return false;
+                 }
+                 s.active = active != 0u;
++                uint8_t soundInitialized = 0u;
++                uint32_t soundDataAddress = 0u;
++                std::array<SoundPort, 10> ports{};
++                std::vector<SpuTransfer> transfers;
++                if (!readU8(data, size, pos, soundInitialized) ||
++                    !readU32(data, size, pos, soundDataAddress))
++                {
++                    error = "cdmodule: truncated sound init state";
++                    consumed = pos;
++                    return false;
++                }
++                for (SoundPort &port : ports)
++                {
++                    uint8_t initialized = 0u, registered = 0u;
++                    uint32_t headerSize = 0u;
++                    if (!readU8(data, size, pos, initialized) ||
++                        !readU8(data, size, pos, registered) ||
++                        !readU32(data, size, pos, port.written) ||
++                        !readU32(data, size, pos, port.spuAddress) ||
++                        !readU32(data, size, pos, headerSize) ||
++                        headerSize > 0x4000u || port.written > headerSize)
++                    {
++                        error = "cdmodule: invalid sound port state";
++                        consumed = pos;
++                        return false;
++                    }
++                    port.header.resize(headerSize);
++                    if (!readBytes(data, size, pos, port.header.data(), headerSize))
++                    {
++                        error = "cdmodule: truncated sound header";
++                        consumed = pos;
++                        return false;
++                    }
++                    port.initialized = initialized != 0u;
++                    port.registered = registered != 0u;
++                }
++                uint32_t transferCount = 0u;
++                if (!readU32(data, size, pos, transferCount) || transferCount > 64u)
++                {
++                    error = "cdmodule: invalid SPU transfer count";
++                    consumed = pos;
++                    return false;
++                }
++                for (uint32_t i = 0; i < transferCount; ++i)
++                {
++                    SpuTransfer transfer{};
++                    uint32_t length = 0u;
++                    if (!readU32(data, size, pos, transfer.address) ||
++                        !readU32(data, size, pos, length) ||
++                        length > 0x200000u || transfer.address > 0x200000u - length)
++                    {
++                        error = "cdmodule: invalid SPU transfer range";
++                        consumed = pos;
++                        return false;
++                    }
++                    transfer.data.resize(length);
++                    if (!readBytes(data, size, pos, transfer.data.data(), length))
++                    {
++                        error = "cdmodule: truncated SPU transfer";
++                        consumed = pos;
++                        return false;
++                    }
++                    transfers.push_back(std::move(transfer));
++                }
++                uint32_t spuRamSize = 0u;
++                if (!readU32(data, size, pos, spuRamSize) || spuRamSize != 0x200000u)
++                {
++                    error = "cdmodule: invalid SPU RAM size";
++                    consumed = pos;
++                    return false;
++                }
++                std::vector<uint8_t> spuRam(spuRamSize);
++                if (!readBytes(data, size, pos, spuRam.data(), spuRam.size()))
++                {
++                    error = "cdmodule: truncated SPU RAM";
++                    consumed = pos;
++                    return false;
++                }
+                 m_movie = s;
++                m_soundInitialized = soundInitialized != 0u;
++                m_soundDataAddress = soundDataAddress;
++                m_soundPorts = std::move(ports);
++                m_spuTransfers = std::move(transfers);
++                m_spuRam = std::move(spuRam);
++                // EE_TransSize is not part of the ABI 2 IOP section. Every fno=2/7
++                // read and fno=0xA transfer rewrites it before the fno=8 queries
++                // observed so far; a query before that is logged (handleTransferSizeQuery).
++                m_eeTransSize = 0u;
++                m_eeTransSizeValid = false;
+                 consumed = pos;
+                 return true;
+             }
+ 
+             [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
+             {
++                if (m_bindings.secondarySid != 0u && request.sid == m_bindings.secondarySid)
++                {
++                    // cdfunc2: 0x100 SeReplaceProcess; 0x101 (CdReadCancel) not modeled.
++                    if (request.function == m_bindings.seReplaceFunction)
++                        return handleSeReplace(request);
++                    return RpcResult{};
++                }
+                 if (request.sid != m_bindings.sid)
+                 {
+                     return RpcResult{};
+                 }
++                if (request.function == m_bindings.transferSizeQueryFunction)
++                {
++                    return handleTransferSizeQuery(request);
++                }
+ 
++                if (request.function == m_bindings.initFunction)
++                {
++                    return handleInit(request);
++                }
+                 if (request.function == m_bindings.readFunction)
+                 {
+                     return handleRead(request);
+@@ -132,10 +268,8 @@ namespace ps2x::iop::detail
+                     return handleMovieStatus(request);
+                 }
+ 
+-                // Any other CDMODULE function (init, seek-only, EE_TransSize query,
+-                // etc.) is left to the existing generic RPC fallback: this service
+-                // only models the operations closed in FASE I/J (fno=2) and
+-                // BLOCKER_003 (fno 9/0xA/0xC/0xD).
++                // Other CDMODULE functions (seek-only, EE_TransSize query, etc.)
++                // remain with the existing generic RPC fallback.
+                 return RpcResult{};
+             }
+ 
+@@ -154,6 +288,571 @@ namespace ps2x::iop::detail
+                 uint64_t bytesConsumed = 0u;
+             };
+ 
++            struct SoundPort
++            {
++                bool initialized = false;
++                bool registered = false;
++                uint32_t written = 0u;
++                uint32_t spuAddress = 0u;
++                std::vector<uint8_t> header;
++            };
++
++            struct SpuTransfer
++            {
++                uint32_t address = 0u;
++                std::vector<uint8_t> data;
++            };
++
++            struct ReadBlock
++            {
++                uint32_t type = 0u;
++                uint32_t size = 0u;
++                uint32_t slot = 0u;
++                uint32_t sectorOffset = 0u;
++                uint64_t imageOffset = 0u;
++                uint32_t dmaSize = 0u;
++            };
++
++            [[nodiscard]] RpcResult handleInit(const RpcRequest &request)
++            {
++                RpcResult result;
++                uint32_t soundDataAddress = 0u;
++                uint32_t normalized = 0u;
++                if (request.send.address == 0u ||
++                    request.send.size < m_bindings.requestDestOffset + sizeof(uint32_t) ||
++                    !m_host.readGuest(request.send.address + m_bindings.requestDestOffset,
++                                      &soundDataAddress, sizeof(soundDataAddress)) ||
++                    soundDataAddress == 0u ||
++                    !m_host.normalizeGuestAddress(soundDataAddress, normalized) ||
++                    normalized >= kEeRamSize)
++                {
++                    logWarning("fno=1 sound data address missing or outside EE RAM");
++                    return result;
++                }
++                m_soundDataAddress = soundDataAddress;
++                m_soundInitialized = true;
++                m_soundPorts = {};
++                m_spuTransfers.clear();
++                for (size_t slot = 0u; slot < m_bindings.soundSlotMap.size(); ++slot)
++                {
++                    if (slot < 2u || slot >= 4u)
++                        m_soundPorts[m_bindings.soundSlotMap[slot]].header.resize(0x4000u);
++                }
++                // CdInit@0x300 returns 1 after successful initialization.
++                writeTransferCountResponse(request.receive, 1u);
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                m_host.log(LogLevel::Info, '[' + m_bindings.serviceName +
++                           "] fno=1 soundDataAddress=0x" + toHex(soundDataAddress) +
++                           " status=ok");
++                return result;
++            }
++
++            struct RawDescriptor
++            {
++                uint32_t type = 0u;
++                uint32_t size = 0u;
++                uint32_t slot = 0u;
++                uint32_t sectorOffset = 0u;
++            };
++
++            // TSNDDRVM.IRX TsndPortInit@0x6390: port_stop(port, state), DelayATick(1),
++            // then port_state[port] = value; returns 0 (ignored by CdReadProc). Only the
++            // port state is represented here; there is no TSND playback to stop.
++            void tsndPortInit(uint32_t port, uint32_t value, std::ostringstream &trace)
++            {
++                if (port >= m_soundPorts.size())
++                    return;
++                SoundPort &p = m_soundPorts[port];
++                trace << " portInit" << port << "(was init=" << (p.initialized ? 1 : 0)
++                      << ",reg=" << (p.registered ? 1 : 0) << ')';
++                p.initialized = value != 0u;
++                p.registered = false;
++            }
++
++            // CdReadProc descriptor walk: 0x91C-0x9F4 (mode&8 slot<4 selection) and
++            // 0xAF4-0xB58 (mode&8 slot-6 pair skip after a completed descriptor).
++            // Without mode&8 every descriptor up to the terminator is processed.
++            [[nodiscard]] static std::vector<size_t> selectDescriptors(
++                const std::vector<RawDescriptor> &raw, bool mode8, uint32_t selection,
++                std::ostringstream &trace)
++            {
++                std::vector<size_t> selected;
++                size_t i = 0u;
++                while (i < raw.size())
++                {
++                    if (mode8 && raw[i].type == 1u && raw[i].slot < 4u)
++                    {
++                        const uint32_t shift = raw[i].slot * 8u;
++                        if (((selection >> shift) & 0x80u) != 0u)
++                        {
++                            const uint32_t count = (selection >> (raw[i].slot * 4u + 16u)) & 0xFFu;
++                            trace << " select(slot=" << raw[i].slot << ",skipPairs=" << count << ')';
++                            i += static_cast<size_t>(count) * 2u;
++                            selection &= ~(0x80u << shift);
++                            if (i >= raw.size())
++                                break;
++                        }
++                        else
++                        {
++                            trace << " skipPair(slot=" << raw[i].slot << ')';
++                            i += 2u;
++                            continue;
++                        }
++                    }
++                    if (raw[i].type == 0xFFFFFFFFu)
++                        break;
++                    selected.push_back(i);
++                    ++i;
++                    if (mode8 && i < raw.size() && raw[i].type == 1u && raw[i].slot == 6u)
++                    {
++                        while (i < raw.size() && raw[i].type == 1u)
++                        {
++                            trace << " skipSlot6Pair";
++                            i += 2u;
++                        }
++                    }
++                }
++                return selected;
++            }
++
++            // trans_mem_to_iop (type 1: IOP sound header + secondary EE DMA for ports
++            // >= 4) and trans_mem_to_spu (type 2: SPU upload + VAB registration).
++            // Shared by CdReadProc (source: CD image) and SeReplaceProc (source: EE).
++            [[nodiscard]] bool applySoundBlock(uint32_t type, uint32_t slot,
++                                               std::vector<uint8_t> &&payload,
++                                               const std::string &origin)
++            {
++                const uint32_t blockSize = static_cast<uint32_t>(payload.size());
++                const uint32_t mappedSlot = m_bindings.soundSlotMap[slot];
++                SoundPort &port = m_soundPorts[mappedSlot];
++                if (type == 1u)
++                {
++                    if (port.header.empty() || blockSize > port.header.size() || blockSize < 20u)
++                    {
++                        logWarning(origin + " IOP sound header exceeds allocated buffer");
++                        return false;
++                    }
++                    std::fill(port.header.begin(), port.header.end(), 0u);
++                    std::copy(payload.begin(), payload.end(), port.header.begin());
++                    port.written = blockSize;
++                    port.initialized = true; // TsndPortLoadInit invoked after first copy.
++                    port.registered = false;
++                    uint32_t secondarySize = 0u;
++                    if (mappedSlot >= 4u)
++                    {
++                        const auto headerWord = [&port](size_t at) -> uint32_t
++                        {
++                            const uint8_t *p = port.header.data() + at;
++                            return uint32_t(p[0]) | uint32_t(p[1]) << 8u |
++                                   uint32_t(p[2]) << 16u | uint32_t(p[3]) << 24u;
++                        };
++                        const uint32_t start = headerWord(8u);
++                        const uint32_t end = headerWord(16u);
++                        if (end < start || end > port.written)
++                        {
++                            logWarning(origin + " secondary sound slice outside IOP header");
++                            return false;
++                        }
++                        secondarySize = end - start;
++                        const uint64_t target64 = static_cast<uint64_t>(m_soundDataAddress) +
++                                                  (static_cast<uint64_t>(mappedSlot) - 4u) * 0x2000u;
++                        uint32_t targetNorm = 0u;
++                        if (target64 > UINT32_MAX ||
++                            !m_host.normalizeGuestAddress(static_cast<uint32_t>(target64), targetNorm) ||
++                            targetNorm > kEeRamSize || secondarySize > kEeRamSize - targetNorm ||
++                            !m_host.writeGuest(static_cast<uint32_t>(target64),
++                                               port.header.data() + start, secondarySize))
++                        {
++                            logWarning(origin + " secondary EE sound DMA failed");
++                            return false;
++                        }
++                        std::vector<uint8_t> copiedBack(secondarySize);
++                        if (!m_host.readGuest(static_cast<uint32_t>(target64),
++                                              copiedBack.data(), copiedBack.size()) ||
++                            !std::equal(copiedBack.begin(), copiedBack.end(),
++                                        port.header.begin() + start))
++                        {
++                            logWarning(origin + " secondary EE sound DMA readback mismatch");
++                            return false;
++                        }
++                    }
++                    m_host.log(LogLevel::Info, '[' + m_bindings.serviceName + '/' + origin +
++                               ":IOP] slot=" + std::to_string(mappedSlot) +
++                               " bytes=0x" + toHex(blockSize) +
++                               " secondaryEE=0x" + toHex(secondarySize));
++                    return true;
++                }
++
++                const uint32_t spuSlot = m_bindings.soundSpuMap[slot];
++                const uint32_t spuAddress = m_bindings.soundSpuBase[spuSlot];
++                if (!port.initialized || port.written < 8u ||
++                    spuAddress == 0u || spuAddress > 0x200000u ||
++                    blockSize > 0x200000u - spuAddress)
++                {
++                    logWarning(origin + " SPU transfer lacks header or valid destination");
++                    return false;
++                }
++                const uint32_t vabHeaderOffset =
++                    uint32_t(port.header[4]) | uint32_t(port.header[5]) << 8u |
++                    uint32_t(port.header[6]) << 16u | uint32_t(port.header[7]) << 24u;
++                if (vabHeaderOffset >= port.written)
++                {
++                    logWarning(origin + " VAB registration header invalid");
++                    return false;
++                }
++                // Keep one record per SPU destination: SeReplace re-uploads the same
++                // slot repeatedly; SPU RAM itself holds the current bytes.
++                auto existing = std::find_if(m_spuTransfers.begin(), m_spuTransfers.end(),
++                                             [spuAddress](const SpuTransfer &t)
++                                             { return t.address == spuAddress; });
++                if (existing == m_spuTransfers.end())
++                {
++                    if (m_spuTransfers.size() >= 64u)
++                    {
++                        logWarning(origin + " SPU transfer record table full");
++                        return false;
++                    }
++                    m_spuTransfers.push_back(SpuTransfer{spuAddress, {}});
++                    existing = m_spuTransfers.end() - 1;
++                }
++                existing->data = std::move(payload);
++                std::copy(existing->data.begin(), existing->data.end(), m_spuRam.begin() + spuAddress);
++                if (!std::equal(existing->data.begin(), existing->data.end(),
++                                m_spuRam.begin() + spuAddress))
++                {
++                    logWarning(origin + " SPU RAM readback mismatch");
++                    return false;
++                }
++                port.spuAddress = spuAddress;
++                port.registered = true;
++                m_host.log(LogLevel::Info, '[' + m_bindings.serviceName + '/' + origin +
++                           ":SPU] slot=" + std::to_string(mappedSlot) +
++                           " dest=0x" + toHex(spuAddress) +
++                           " bytes=0x" + toHex(blockSize) +
++                           " vabHeaderOffset=0x" + toHex(vabHeaderOffset));
++                return true;
++            }
++
++            [[nodiscard]] bool soundSlotUsable(uint32_t slot) const
++            {
++                return m_soundInitialized && slot < m_bindings.soundSlotMap.size() &&
++                       m_bindings.soundSlotMap[slot] < m_soundPorts.size() &&
++                       m_bindings.soundSpuMap[slot] < m_bindings.soundSpuBase.size();
++            }
++
++            [[nodiscard]] RpcResult handleBlockRead(const RpcRequest &request,
++                                                    uint32_t resourceId, uint32_t lba,
++                                                    uint32_t resourceSize, uint32_t dest, uint8_t mode)
++            {
++                RpcResult result;
++                // CdReadProc reads one sector into its block descriptor table when
++                // request.mode & 2; mode & 8 adds TsndPortInit and slot selection.
++                if (m_bindings.sectorSize < 32u ||
++                    m_bindings.sectorSize > 65536u || resourceSize < m_bindings.sectorSize)
++                {
++                    logUnsupported(mode, resourceSize);
++                    return result;
++                }
++                const bool mode8 = (mode & 8u) != 0u;
++                uint32_t selection = 0u;
++                if (mode8 &&
++                    (request.send.size < m_bindings.requestSelectionOffset + sizeof(selection) ||
++                     !m_host.readGuest(request.send.address + m_bindings.requestSelectionOffset,
++                                       &selection, sizeof(selection))))
++                {
++                    logWarning("mode&8 selection word unreadable");
++                    return result;
++                }
++
++                uint32_t normalizedDest = 0u;
++                if (dest == 0u || !m_host.normalizeGuestAddress(dest, normalizedDest) ||
++                    normalizedDest >= kEeRamSize)
++                {
++                    logWarning("block read destination outside EE RAM");
++                    return result;
++                }
++
++                const std::string imagePath = m_host.hostPath(HostPathKind::CdImage);
++                const uint64_t handle = imagePath.empty() ? 0u : m_host.openHostFile(imagePath);
++                if (handle == 0u)
++                {
++                    logWarning("block read has no readable CD image");
++                    return result;
++                }
++                const auto close = [this, handle]() { m_host.closeHostFile(handle); };
++                uint64_t imageSize = 0u;
++                const uint64_t base = static_cast<uint64_t>(lba) * m_bindings.sectorSize;
++                if (!m_host.hostFileSize(handle, imageSize) || base > imageSize ||
++                    resourceSize > imageSize - base)
++                {
++                    close();
++                    logWarning("block read resource exceeds CD image");
++                    return result;
++                }
++
++                std::vector<uint8_t> header(m_bindings.sectorSize);
++                size_t got = 0u;
++                if (!m_host.readHostFile(handle, base, header.data(), header.size(), got) ||
++                    got != header.size())
++                {
++                    close();
++                    logWarning("block read header sector was incomplete");
++                    return result;
++                }
++                const auto word = [&header](size_t offset) -> uint32_t
++                {
++                    return uint32_t(header[offset]) | (uint32_t(header[offset + 1u]) << 8u) |
++                           (uint32_t(header[offset + 2u]) << 16u) |
++                           (uint32_t(header[offset + 3u]) << 24u);
++                };
++
++                std::vector<RawDescriptor> raw;
++                bool terminated = false;
++                for (size_t offset = 0u; offset + 32u <= header.size(); offset += 32u)
++                {
++                    RawDescriptor d{word(offset), word(offset + 4u), word(offset + 8u), word(offset + 12u)};
++                    raw.push_back(d);
++                    if (d.type == 0xFFFFFFFFu)
++                    {
++                        terminated = true;
++                        break;
++                    }
++                }
++                if (!terminated)
++                {
++                    close();
++                    logWarning("block read descriptor terminator missing");
++                    return result;
++                }
++
++                std::ostringstream selectionTrace;
++                const std::vector<size_t> selected = selectDescriptors(raw, mode8, selection, selectionTrace);
++
++                std::vector<ReadBlock> blocks;
++                uint32_t transferCount = 0u;
++                for (size_t index : selected)
++                {
++                    const RawDescriptor &d = raw[index];
++                    // CDMODULE.IRX trans_process_tbl: 0/3 EE, 1 IOP sound
++                    // header plus secondary EE DMA, 2 SPU transfer/registration.
++                    if (d.type > 3u)
++                    {
++                        close();
++                        std::ostringstream warning;
++                        warning << "block read unsupported descriptor type=" << d.type
++                                << " resourceId=0x" << std::hex << resourceId
++                                << " lba=0x" << lba << " size=0x" << resourceSize
++                                << " dest=0x" << dest << " mode=0x"
++                                << static_cast<uint32_t>(mode) << " blockSize=0x" << d.size
++                                << " blockSector=0x" << d.sectorOffset;
++                        logWarning(warning.str());
++                        return result;
++                    }
++                    if ((d.type == 1u || d.type == 2u) && !soundSlotUsable(d.slot))
++                    {
++                        close();
++                        logWarning("block read needs fno=1 sound initialization or valid IRX slot mapping");
++                        return result;
++                    }
++                    if (d.size > UINT32_MAX - 15u)
++                    {
++                        close();
++                        logWarning("block read descriptor size overflow");
++                        return result;
++                    }
++                    const uint32_t dmaSize = (d.size + 15u) & ~15u;
++                    const uint64_t relative = static_cast<uint64_t>(d.sectorOffset) * m_bindings.sectorSize;
++                    if (relative > resourceSize || dmaSize > resourceSize - relative ||
++                        ((d.type == 0u || d.type == 3u) &&
++                         (transferCount > kEeRamSize - normalizedDest ||
++                          dmaSize > kEeRamSize - normalizedDest - transferCount ||
++                          dmaSize > UINT32_MAX - transferCount)))
++                    {
++                        close();
++                        logWarning("block read descriptor range invalid");
++                        return result;
++                    }
++                    blocks.push_back(ReadBlock{d.type, d.size, d.slot, d.sectorOffset, base + relative, dmaSize});
++                    if (d.type == 0u || d.type == 3u)
++                        transferCount += dmaSize;
++                }
++
++                if (mode8)
++                {
++                    // CdReadProc 0x8B8-0x8DC: before any transfer.
++                    for (uint32_t port = 0u; port < m_bindings.modeSelectPortCount; ++port)
++                    {
++                        if ((selection >> (8u * port)) == 0u)
++                            tsndPortInit(port, 0u, selectionTrace);
++                    }
++                }
++
++                uint32_t eeOffset = 0u;
++                for (const ReadBlock &block : blocks)
++                {
++                    if (block.type == 0u || block.type == 3u)
++                    {
++                        if (!copyHostRangeToGuest(handle, block.imageOffset, dest + eeOffset,
++                                                  block.dmaSize))
++                        {
++                            close();
++                            logWarning("block read EE payload copy failed");
++                            return result;
++                        }
++                        eeOffset += block.dmaSize;
++                        continue;
++                    }
++                    std::vector<uint8_t> payload(block.size);
++                    size_t gotPayload = 0u;
++                    if (!m_host.readHostFile(handle, block.imageOffset, payload.data(),
++                                             payload.size(), gotPayload) ||
++                        gotPayload != payload.size())
++                    {
++                        close();
++                        logWarning("block read IOP/SPU source incomplete");
++                        return result;
++                    }
++                    if (!applySoundBlock(block.type, block.slot, std::move(payload), "mode2"))
++                    {
++                        close();
++                        return result;
++                    }
++                }
++
++                close();
++
++                m_eeTransSize = transferCount;
++                m_eeTransSizeValid = true;
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                writeTransferCountResponse(request.receive, transferCount);
++                std::ostringstream out;
++                out << '[' << m_bindings.serviceName << "] fno=" << m_bindings.readFunction
++                    << " resourceId=0x" << std::hex << resourceId << " lba=0x" << lba
++                    << " size=0x" << resourceSize << " dest=0x" << dest
++                    << " mode=" << std::dec << static_cast<uint32_t>(mode)
++                    << " blocks=" << blocks.size() << " bytesRead=0x" << std::hex
++                    << transferCount << " status=ok";
++                if (mode8)
++                    out << " selection=0x" << selection << selectionTrace.str();
++                uint32_t receiveValue = 0u;
++                if (request.receive.address != 0u && request.receive.size >= sizeof(receiveValue) &&
++                    m_host.readGuest(request.receive.address, &receiveValue, sizeof(receiveValue)))
++                    out << " recv=0x" << receiveValue;
++                m_host.log(LogLevel::Info, out.str());
++                return result;
++            }
++
++            // cdfunc fno=8 (0x18CC): returns EE_TransSize.
++            [[nodiscard]] RpcResult handleTransferSizeQuery(const RpcRequest &request)
++            {
++                RpcResult result;
++                if (!m_eeTransSizeValid)
++                    logWarning("fno=8 EE_TransSize queried before any EE transfer since reset/restore");
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                writeTransferCountResponse(request.receive, m_eeTransSize);
++                m_host.log(LogLevel::Info, '[' + m_bindings.serviceName + "] fno=" +
++                           std::to_string(m_bindings.transferSizeQueryFunction) +
++                           " EE_TransSize=0x" + toHex(m_eeTransSize));
++                return result;
++            }
++
++            // cdfunc2 fno=0x100 -> SeReplaceProcess@0x16E4 / SeReplaceProc@0x14E4.
++            // Copies the 0x800-byte descriptor table from EE request+0xC, selects
++            // the pair at (u16 request+2)*2 (entry +2 is forced to the terminator),
++            // pulls each descriptor's data from EE request+0xC + sector*0x800 and
++            // runs the same trans_process_tbl handlers with call slot 1. Returns
++            // EE_TransSize, which it does not modify.
++            [[nodiscard]] RpcResult handleSeReplace(const RpcRequest &request)
++            {
++                RpcResult result;
++                uint16_t pairIndex = 0u;
++                uint32_t source = 0u;
++                if (request.send.address == 0u ||
++                    request.send.size < m_bindings.requestDestOffset + sizeof(source) ||
++                    request.send.size < m_bindings.requestSeIndexOffset + sizeof(pairIndex) ||
++                    !m_host.readGuest(request.send.address + m_bindings.requestSeIndexOffset,
++                                      &pairIndex, sizeof(pairIndex)) ||
++                    !m_host.readGuest(request.send.address + m_bindings.requestDestOffset,
++                                      &source, sizeof(source)))
++                {
++                    logWarning("SeReplace: malformed request");
++                    return result;
++                }
++                uint32_t sourceNorm = 0u;
++                if (!m_soundInitialized || source == 0u ||
++                    !m_host.normalizeGuestAddress(source, sourceNorm) ||
++                    sourceNorm >= kEeRamSize || m_bindings.sectorSize > kEeRamSize - sourceNorm)
++                {
++                    logWarning("SeReplace: sound not initialized or source table outside EE RAM");
++                    return result;
++                }
++                std::vector<uint8_t> table(m_bindings.sectorSize);
++                if (!m_host.readGuest(source, table.data(), table.size()))
++                {
++                    logWarning("SeReplace: descriptor table unreadable");
++                    return result;
++                }
++                const size_t entries = table.size() / 32u;
++                const size_t first = static_cast<size_t>(pairIndex) * 2u;
++                if (first + 2u > entries)
++                {
++                    logWarning("SeReplace: pair index outside descriptor table");
++                    return result;
++                }
++                const auto word = [&table](size_t offset) -> uint32_t
++                {
++                    return uint32_t(table[offset]) | (uint32_t(table[offset + 1u]) << 8u) |
++                           (uint32_t(table[offset + 2u]) << 16u) |
++                           (uint32_t(table[offset + 3u]) << 24u);
++                };
++                std::vector<RawDescriptor> pair;
++                for (size_t e = first; e < first + 2u; ++e)
++                {
++                    RawDescriptor d{word(e * 32u), word(e * 32u + 4u), word(e * 32u + 8u), word(e * 32u + 12u)};
++                    if (d.type == 0xFFFFFFFFu)
++                        break;
++                    if ((d.type != 1u && d.type != 2u) || !soundSlotUsable(d.slot))
++                    {
++                        logWarning("SeReplace: descriptor type=" + std::to_string(d.type) +
++                                   " slot=" + std::to_string(d.slot) + " not supported");
++                        return result;
++                    }
++                    const uint64_t offset = static_cast<uint64_t>(d.sectorOffset) * m_bindings.sectorSize;
++                    if (offset > kEeRamSize - sourceNorm || d.size > kEeRamSize - sourceNorm - offset)
++                    {
++                        logWarning("SeReplace: descriptor source outside EE RAM");
++                        return result;
++                    }
++                    pair.push_back(d);
++                }
++                std::ostringstream summary;
++                for (const RawDescriptor &d : pair)
++                {
++                    std::vector<uint8_t> payload(d.size);
++                    const uint32_t from = source + d.sectorOffset * m_bindings.sectorSize;
++                    if (!m_host.readGuest(from, payload.data(), payload.size()))
++                    {
++                        logWarning("SeReplace: EE source unreadable");
++                        return result;
++                    }
++                    if (!applySoundBlock(d.type, d.slot, std::move(payload), "SeReplace"))
++                        return result;
++                    summary << " type" << d.type << "(slot=" << d.slot << ",size=0x" << std::hex
++                            << d.size << ",from=0x" << from << std::dec << ')';
++                }
++                result.handled = true;
++                result.resultAddress = request.receive.address;
++                writeTransferCountResponse(request.receive, m_eeTransSize);
++                m_host.log(LogLevel::Info, '[' + m_bindings.serviceName + "/SeReplace] sid=0x" +
++                           toHex(m_bindings.secondarySid) + " pair=" + std::to_string(pairIndex) +
++                           " table=0x" + toHex(source) + summary.str() +
++                           " ret(EE_TransSize)=0x" + toHex(m_eeTransSize));
++                return result;
++            }
++
+             [[nodiscard]] RpcResult handleRead(const RpcRequest &request)
+             {
+                 RpcResult result;
+@@ -185,6 +884,11 @@ namespace ps2x::iop::detail
+                     return result;
+                 }
+ 
++                if ((mode & 2u) != 0u)
++                {
++                    return handleBlockRead(request, resourceId, lba, size, dest, mode);
++                }
++
+                 if (mode != m_bindings.supportedMode)
+                 {
+                     // Only mode==1 (the plain EE-bound copy CDMODULE.IRX's
+@@ -210,25 +914,26 @@ namespace ps2x::iop::detail
+                     return result;
+                 }
+ 
+-                if ((size % 16u) != 0u)
++                // cdfunc fno=2 calls CdReadProcess(fno, request, 0), which stores
++                // request[0x16]=0, so CdReadProc synthesizes one type-0 (EE)
++                // descriptor. trans_mem_to_ee (0x6C0-0x6EC, 0x750-0x78C) DMAs
++                // round_up(chunk,16) bytes per 0x60000-byte chunk from the CD read
++                // buffer and adds that rounded size to EE_TransSize, which
++                // CdReadProcess returns. Chunks are 16-aligned, so the total is
++                // round_up(size,16); the extra tail bytes are the image bytes that
++                // follow the resource in the same CD read.
++                if (size > UINT32_MAX - 15u)
+                 {
+-                    // The real IRX DMAs in 16-byte units (dma.size =
+-                    // round_up(size, 16)), so a non-aligned request would have
+-                    // the IOP-side transfer write up to 15 bytes past `size`
+-                    // into EE RAM. Every request observed so far (FASE J/L) is
+-                    // 16-aligned; reproducing the rounded-up tail read is not
+-                    // implemented, so an unaligned size is left unhandled rather
+-                    // than silently under-copying relative to the original.
+-                    logWarning("size 0x" + toHex(size) + " not 16-byte aligned "
+-                               "(DMA rounding tail not modeled), leaving unhandled");
++                    logWarning("size overflow");
+                     return result;
+                 }
++                const uint32_t dmaSize = (size + 15u) & ~15u;
+ 
+                 uint32_t normalizedDest = 0u;
+                 if (dest == 0u ||
+                     !m_host.normalizeGuestAddress(dest, normalizedDest) ||
+                     normalizedDest >= kEeRamSize ||
+-                    size > kEeRamSize - normalizedDest)
++                    dmaSize > kEeRamSize - normalizedDest)
+                 {
+                     logWarning("destination address/size out of EE RAM bounds");
+                     return result;
+@@ -258,31 +963,53 @@ namespace ps2x::iop::detail
+                 }
+ 
+                 const uint64_t byteOffset = static_cast<uint64_t>(lba) * m_bindings.sectorSize;
+-                if (byteOffset > imageSize || (imageSize - byteOffset) < size)
++                if (byteOffset > imageSize || (imageSize - byteOffset) < dmaSize)
+                 {
+                     m_host.closeHostFile(handle);
+-                    logWarning("request LBA/size exceeds CD image bounds");
++                    logWarning("request LBA/size (DMA-rounded) exceeds CD image bounds");
+                     return result;
+                 }
+ 
+-                const bool copied = copyHostRangeToGuest(handle, byteOffset, dest, size);
++                bool copied = copyHostRangeToGuest(handle, byteOffset, dest, dmaSize);
++                std::string tailNote;
++                if (copied && dmaSize != size)
++                {
++                    // Verify the rounded tail now in EE against the image bytes.
++                    const uint32_t tailSize = dmaSize - size;
++                    std::array<uint8_t, 16> fromImage{};
++                    std::array<uint8_t, 16> inGuest{};
++                    size_t gotTail = 0u;
++                    copied = m_host.readHostFile(handle, byteOffset + size, fromImage.data(), tailSize, gotTail) &&
++                             gotTail == tailSize &&
++                             m_host.readGuest(dest + size, inGuest.data(), tailSize) &&
++                             std::equal(fromImage.begin(), fromImage.begin() + tailSize, inGuest.begin());
++                    std::ostringstream t;
++                    t << " dmaSize=0x" << std::hex << dmaSize << " tail=";
++                    for (uint32_t i = 0; i < tailSize; ++i)
++                    {
++                        char buf[3];
++                        std::snprintf(buf, sizeof(buf), "%02x", inGuest[i]);
++                        t << buf;
++                    }
++                    t << (copied ? " tailVerify=image-exact" : " tailVerify=MISMATCH");
++                    tailNote = t.str();
++                }
+                 m_host.closeHostFile(handle);
+                 if (!copied)
+                 {
+-                    logWarning("short read or guest write failure while servicing read");
++                    logWarning("short read, guest write failure or tail mismatch while servicing read");
+                     return result;
+                 }
+ 
+                 result.handled = true;
+                 result.resultAddress = request.receive.address;
+-                // The real CdReadProcess returns the transferred byte count
+-                // (EE_TransSize), not a fixed "0 = success" status (Astra audit
+-                // finding 2 / IRX 0x3B68). `size` is guaranteed 16-aligned at
+-                // this point, so it already equals the real transferCount for
+-                // every request this service accepts.
+-                writeTransferCountResponse(request.receive, size);
+-
+-                logSuccess(resourceId, lba, size, dest, mode);
++                // CdReadProcess returns EE_TransSize: the DMA-rounded byte count
++                // (Astra audit finding 2 / IRX 0x3B68, trans_mem_to_ee 0x6EC).
++                m_eeTransSize = dmaSize;
++                m_eeTransSizeValid = true;
++                writeTransferCountResponse(request.receive, dmaSize);
++
++                logSuccess(resourceId, lba, size, dest, mode, tailNote);
+                 return result;
+             }
+ 
+@@ -452,6 +1179,9 @@ namespace ps2x::iop::detail
+                 // `toCopy` (which may be less than `requested` near EOF) is only
+                 // used internally to bound the host read/guest write; it is
+                 // deliberately NOT what gets echoed back.
++                // CdMovieTransProc@0x1060 also stores it as EE_TransSize (fno=8).
++                m_eeTransSize = requested;
++                m_eeTransSizeValid = true;
+                 writeTransferCountResponse(request.receive, requested);
+                 return result;
+             }
+@@ -556,7 +1286,8 @@ namespace ps2x::iop::detail
+                                " size=0x" + toHex(size));
+             }
+ 
+-            void logSuccess(uint32_t resourceId, uint32_t lba, uint32_t size, uint32_t dest, uint8_t mode) const
++            void logSuccess(uint32_t resourceId, uint32_t lba, uint32_t size, uint32_t dest, uint8_t mode,
++                            const std::string &extra = {}) const
+             {
+                 std::ostringstream out;
+                 out << '[' << m_bindings.serviceName << "] fno=" << m_bindings.readFunction
+@@ -578,13 +1309,21 @@ namespace ps2x::iop::detail
+                         out << buf;
+                     }
+                 }
++                out << extra;
+                 m_host.log(LogLevel::Info, out.str());
+             }
+ 
+             IopHost &m_host;
+             CdModuleBindings m_bindings;
+-            std::array<uint32_t, 1> m_sids;
++            std::vector<uint32_t> m_sids;
+             MovieStreamState m_movie;
++            bool m_soundInitialized = false;
++            uint32_t m_soundDataAddress = 0u;
++            std::array<SoundPort, 10> m_soundPorts{};
++            std::vector<SpuTransfer> m_spuTransfers;
++            std::vector<uint8_t> m_spuRam;
++            uint32_t m_eeTransSize = 0u;
++            bool m_eeTransSizeValid = false;
+         };
+     }
+ 
+diff --git a/ps2xRuntime/include/runtime/checkpoint/checkpoint_format.h b/ps2xRuntime/include/runtime/checkpoint/checkpoint_format.h
+index be98826..b7cada4 100644
+--- a/ps2xRuntime/include/runtime/checkpoint/checkpoint_format.h
++++ b/ps2xRuntime/include/runtime/checkpoint/checkpoint_format.h
+@@ -21,7 +21,7 @@ namespace ps2x::checkpoint
+     inline constexpr uint32_t kFormatVersion = 2u;
+     // Bump for checkpoint-relevant runtime semantics not covered by section
+     // versions (restore order, deadline reconstruction, persistent state meaning).
+-    inline constexpr uint32_t kCheckpointRuntimeAbiVersion = 1u;
++    inline constexpr uint32_t kCheckpointRuntimeAbiVersion = 2u;
+     inline constexpr uint32_t kArchitectureId = 1u; // 1 = x86_64 little-endian
+     inline constexpr uint32_t kSafePointMainMenuV1 = 1u;
+ 
+@@ -82,7 +82,7 @@ namespace ps2x::checkpoint
+     inline constexpr uint32_t kMmioSectionVersion = 1u;
+     inline constexpr uint32_t kSchedSectionVersion = 1u;
+     inline constexpr uint32_t kGsSectionVersion = 1u;
+-    inline constexpr uint32_t kIopSectionVersion = 1u;
++    inline constexpr uint32_t kIopSectionVersion = 2u;
+     inline constexpr uint32_t kSifRpcSectionVersion = 1u;
+     inline constexpr uint32_t kCdSectionVersion = 1u;
+     inline constexpr uint32_t kMcSectionVersion = 1u;
