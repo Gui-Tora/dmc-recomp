@@ -1,0 +1,236 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index a7fae20..7d35b69 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1360,7 +1360,10 @@ namespace
+         uint32_t madr = 0;
+         uint32_t qwc = 0;
+         uint32_t tadr = payloadPhys;
+-        uint32_t chcr = 0x00000181u; // DIR=1, TIE=1, STR=1 (normal mode).
++        // Keep the guest-configured CHCR.TTE: libdma channels are the hardware
++        // registers and games set TTE there before sceDmaSend (upstream 75d729c).
++        const uint32_t transferTagEnable = runtime->memory().readIORegister(channelBase + 0x00u) & 0x00000040u;
++        uint32_t chcr = 0x00000181u | transferTagEnable; // DIR=1, TIE=1, STR=1 (normal mode).
+ 
+         if (preferNormalCount)
+         {
+@@ -1369,7 +1372,7 @@ namespace
+         }
+         else
+         {
+-            chcr = 0x00000185u; // MODE=1 chain, DIR=1, TIE=1, STR=1.
++            chcr = 0x00000185u | transferTagEnable; // MODE=1 chain, DIR=1, TIE=1, STR=1.
+         }
+ 
+         PS2Memory &mem = runtime->memory();
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 7cb2ba4..9fa48f0 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1477,19 +1477,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                         }
+ 
+-                        const bool compactVifLocalTag =
+-                            (channelBase == 0x10009000u || channelBase == 0x10008000u) &&
+-                            (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
+-                        if (compactVifLocalTag)
++                        // CHCR.TTE sends the DMAtag's upper 64 bits (two VIFcodes) to the VIF
++                        // before the tag payload, for every tag ID (REF/REFS/REFE included).
++                        // Same semantics as upstream ran-j/PS2Recomp 75d729c (#244).
++                        const bool transferTagData =
++                            (channelBase == 0x10009000u || channelBase == 0x10008000u) && (chcr & 0x40u) != 0u;
++                        if (transferTagData)
+                             appendCompactVif1TagData(currentTagAddr, 0u);
+ 
+                         if (hasPayload)
+-                        {
+-                            if (compactVifLocalTag)
+-                                appendData(currentTagAddr + 16u, tagQwc);
+-                            else
+-                                appendData(dataAddr, tagQwc);
+-                        }
++                            appendData(dataAddr, tagQwc);
+                         if (irq && tieEnabled)
+                             endChain = true;
+                         if (endChain)
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 7c3e8ea..00e97a6 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -1,6 +1,7 @@
+ #include "MiniTest.h"
+ #include "runtime/ps2_memory.h"
+ #include "runtime/gs/gs_frontend.h"
++#include "runtime/ee_scheduler.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "ps2_runtime.h"
+ #include "ps2_runtime_macros.h"
+@@ -1381,7 +1382,8 @@ void register_ps2_memory_tests()
+             const uint64_t endTag = makeDmaTag(1u, 7u, 0u, false);
+             std::memcpy(rdram + kTag, &endTag, sizeof(endTag));
+ 
+-            // Compact VIF1 packet helpers place the DIRECT command in the tag's upper 64 bits.
++            // Compact VIF1 packet helpers place the DIRECT command in the tag's upper 64 bits;
++            // those bytes reach the VIF only when CHCR.TTE is set.
+             const uint32_t directCmd = makeVifCmd(0x50u, 0u, 1u);
+             std::memcpy(rdram + kTag + 12u, &directCmd, sizeof(directCmd));
+             for (uint32_t i = 0; i < 16u; ++i)
+@@ -1396,7 +1398,8 @@ void register_ps2_memory_tests()
+             });
+ 
+             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
+-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x104u), "write VIF1 CHCR STR|CHAIN should succeed");
++            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
++                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
+ 
+             mem.processPendingTransfers();
+ 
+@@ -1435,7 +1438,8 @@ void register_ps2_memory_tests()
+             std::memcpy(rdram + kTag + 12u, &itopCmd, sizeof(itopCmd));
+ 
+             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
+-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x104u), "write VIF1 CHCR STR|CHAIN should succeed");
++            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
++                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
+ 
+             mem.processPendingTransfers();
+ 
+@@ -1445,6 +1449,86 @@ void register_ps2_memory_tests()
+                      "qwc-zero compact VIF1 chain should clear the STR bit after drain");
+         });
+ 
++        tc.Run("VIF1 DMA chain transfers REF tag high bytes when TTE is enabled", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kVif1Ch = 0x10009000u;
++            constexpr uint32_t kTag0 = 0x00025200u;
++            constexpr uint32_t kTag1 = kTag0 + 0x10u;
++            constexpr uint32_t kRefPayload = 0x00025300u;
++
++            uint8_t *rdram = mem.getRDRAM();
++            writeDmaTag(rdram, kTag0, makeDmaTag(1u, 3u, kRefPayload, false)); // REF
++            writeDmaTag(rdram, kTag1, makeDmaTag(0u, 7u, 0u, false));         // END
++
++            // With CHCR.TTE set, both VIFcodes stored in every DMAtag's upper half
++            // precede that tag's payload, including tags whose payload is referenced
++            // (Devil May Cry SLES_503.58 VIF1 chains: CHCR=0x145, REF tags carrying
++            // DIRECT/UNPACK headers; see analysis/notes/GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md).
++            const uint32_t directCmd = makeVifCmd(0x50u, 0u, 1u);
++            std::memcpy(rdram + kTag0 + 12u, &directCmd, sizeof(directCmd));
++            for (uint32_t i = 0; i < 16u; ++i)
++            {
++                rdram[kRefPayload + i] = static_cast<uint8_t>(0xA0u + i);
++            }
++
++            std::vector<std::vector<uint8_t>> captured;
++            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
++            {
++                captured.emplace_back(data, data + sizeBytes);
++            });
++
++            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag0), "write VIF1 TADR should succeed");
++            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
++                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
++
++            mem.processPendingTransfers();
++
++            t.Equals(captured.size(), static_cast<size_t>(1u),
++                     "REF tag high-half DIRECT should emit one GIF packet");
++            if (!captured.empty())
++            {
++                t.Equals(captured[0].size(), static_cast<size_t>(16u),
++                         "REF tag high-half DIRECT packet should be 1 QW");
++
++                bool payloadOk = true;
++                for (uint32_t i = 0; i < 16u; ++i)
++                {
++                    if (captured[0][i] != static_cast<uint8_t>(0xA0u + i))
++                    {
++                        payloadOk = false;
++                        break;
++                    }
++                }
++                t.IsTrue(payloadOk, "REF payload should reach the GIF callback without VIF desynchronization");
++            }
++        });
++
++        tc.Run("VIF1 DMA chain ignores tag high bytes when TTE is disabled", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kVif1Ch = 0x10009000u;
++            constexpr uint32_t kTag = 0x00025400u;
++
++            uint8_t *rdram = mem.getRDRAM();
++            writeDmaTag(rdram, kTag, makeDmaTag(0u, 7u, 0u, false)); // END
++            const uint32_t itopCmd = makeVifCmd(0x04u, 0u, 0x55u);
++            std::memcpy(rdram + kTag + 12u, &itopCmd, sizeof(itopCmd));
++
++            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
++            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x104u),
++                     "write VIF1 CHCR STR|CHAIN without TTE should succeed");
++
++            mem.processPendingTransfers();
++
++            t.Equals(mem.vif1_regs.itops, 0u,
++                     "tag high-half VIFcodes must stay hidden when CHCR.TTE is clear");
++        });
++
+         tc.Run("VIF1 packet builders keep chain qwc live before terminate", [](TestCase &t)
+         {
+             PS2Memory mem;
+@@ -1497,7 +1581,8 @@ void register_ps2_memory_tests()
+             });
+ 
+             t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kBaseAddr), "write VIF1 TADR should succeed");
+-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x104u), "write VIF1 CHCR STR|CHAIN should succeed");
++            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
++                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
+ 
+             mem.processPendingTransfers();
+ 
+@@ -1780,6 +1865,40 @@ void register_ps2_memory_tests()
+             }
+         });
+ 
++        tc.Run("sceDmaSend preserves guest-configured VIF1 TTE", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kVif1Ch = 0x10009000u;
++            constexpr uint32_t kTag = 0x00028500u;
++
++            PS2Memory &mem = runtime.memory();
++            uint8_t *rdram = mem.getRDRAM();
++            R5900Context mainContext{};
++            runtime.eeScheduler().reset(rdram, mainContext); // bind the scheduler executor to this thread
++            writeDmaTag(rdram, kTag, makeDmaTag(0u, 7u, 0u, false)); // END
++            const uint32_t itopCmd = makeVifCmd(0x04u, 0u, 0x66u);
++            std::memcpy(rdram + kTag + 12u, &itopCmd, sizeof(itopCmd));
++
++            // libdma channels are the hardware registers: a game sets CHCR.TTE and then
++            // submits the chain through sceDmaSend.
++            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x40u),
++                     "guest should be able to configure VIF1 CHCR.TTE before submission");
++
++            R5900Context ctx{};
++            setRegU32(ctx, 4, 1u); // sceDmaGetChan(1) / VIF1
++            setRegU32(ctx, 5, kTag);
++            ps2_stubs::sceDmaSend(rdram, &ctx, &runtime);
++
++            t.Equals(static_cast<int32_t>(::getRegU32(&ctx, 2)), 0,
++                     "sceDmaSend should accept the VIF1 chain");
++            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x40u) != 0u,
++                     "sceDmaSend must preserve guest-configured CHCR.TTE");
++            t.Equals(mem.vif1_regs.itops, 0x66u,
++                     "preserved TTE should deliver the tag high-half VIFcode");
++        });
++
+         tc.Run("sceDmaReset re-enables DMAC DMAE", [](TestCase &t)
+         {
+             PS2Runtime runtime;
