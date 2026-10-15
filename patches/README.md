@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los quince patches actualmente activos:
+arriba). Los dieciocho patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -368,3 +368,48 @@ arriba). Los quince patches actualmente activos:
     comportamiento anterior pasan a `CHCR=0x144`. Causa raíz, evidencia y
     validación: `analysis/notes/GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md` y
     `analysis/notes/GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md`.
+
+16. `GAMEPLAY_001J_vu0_vf0_hardwired.patch` (convención B). Corrección
+    general de runtime y recompilador, no específica de DMC: VU0 `vf0` está
+    cableado a `(0,0,0,1)` en hardware. `R5900Context` se construye a cero, por
+    lo que los contextos de `StartThread` y de invocaciones (`queueInvocation`,
+    `invokeCurrent`, `invokeCurrentSequence`) nacían con `vf0 = 0`. El parche
+    restablece `vf0`/`vi0` en esos puntos y al restaurar contextos de checkpoint
+    (`readR5900Context`; sin cambio de formato), y el recompilador restaura `vf0`
+    tras cualquier escritura traducida a `ctx->vu0_vf[0]` (equivale a descartarla;
+    en `SLES_503.58` solo afecta a `atari_check_4` y `atari_check_4R`). No modifica
+    `ps2_runtime.h`. Tests: escrituras a `vf0` descartadas, contexto de `StartThread`
+    y restauración de checkpoint. Evidencia y equivalencia con el experimento previo:
+    `analysis/notes/GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md`.
+
+17. `GAMEPLAY_001J_tsnddrvm_xag_service.patch` (convención B). Servicio IOP
+    `TSNDDRVM` para el driver de sonido de Devil May Cry (`TSNDDRVM.IRX`,
+    SHA-256 `c00b17f0…31fd`), registrado solo en el perfil `devil-may-cry-pal`.
+    El perfil TSNDDRV de RECVX queda intacto. Reconstruido del propio IRX:
+    - SID 0, `fno` 0: cola de comandos empaquetados (longitudes de los
+      empaquetadores EE).
+    - SID 1, `fno` 1/2: `XagChkStandby`/`XagChkPlay`.
+    - Estado de canal XAG 0/1/2/3: `TsndInitXag`, `XagSetBuff`,
+      `XagSetSkip*`, `XagStandby2`, `XagStart` y `XagStop`.
+    - Validación de `XagControl`.
+    - Duración del fragmento en tiempo emulado.
+    - Salida audible: lee el fragmento de la ISO, lo decodifica (SPU-ADPCM) y lo
+      envía al host. El audio suena a velocidad real, sin sincronizar con un
+      juego más lento que el tiempo real (limitación conocida).
+
+    `IopHost` gana tres métodos virtuales con implementación por defecto:
+    `vsyncTick`, `streamPcm` y `stopPcmStream`. `iop_host.h` no lo incluye el
+    código generado. Tests en `ps2_iop_tests.cpp`. Documentación:
+    `analysis/notes/GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md` (secciones
+    TSNDDRVM fase 1, 2a y 2b).
+
+18. `GAMEPLAY_001J_checkpoint_save_path_and_trigger.patch` (convención B).
+    Herramientas de checkpoint:
+    - `PS2X_CHECKPOINT_SAVE_PATH` elige el destino de F9 y nunca sobrescribe
+      (añade un sufijo `_N`).
+    - `PS2X_CHECKPOINT_TRIGGER_FILE` permite pedir el mismo guardado sin
+      teclado, creando ese archivo.
+
+    No cambia el formato. Se usó para crear
+    `dmc_checkpoint_mainmenu_abi2_tsnd_v1.dmck`. Documentación: la misma nota
+    de GAMEPLAY_001J.

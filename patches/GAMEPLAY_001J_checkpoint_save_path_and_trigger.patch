@@ -1,0 +1,79 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index a4c99d1..bf22c3c 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -29,6 +29,33 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++namespace
++{
++    // F9 checkpoint destination. PS2X_CHECKPOINT_SAVE_PATH selects the file
++    // (default keeps the historical dmc_checkpoint_mainmenu_v2.dmck name). An
++    // existing file is never overwritten: a numeric suffix is appended instead.
++    std::filesystem::path &lastCheckpointRequestPath()
++    {
++        static std::filesystem::path path;
++        return path;
++    }
++
++    std::filesystem::path checkpointSaveRequestPathNoOverwrite()
++    {
++        const char *env = std::getenv("PS2X_CHECKPOINT_SAVE_PATH");
++        std::filesystem::path base = (env && *env) ? std::filesystem::path(env)
++                                                   : std::filesystem::path("dmc_checkpoint_mainmenu_v2.dmck");
++        std::filesystem::path candidate = base;
++        std::error_code ec;
++        for (unsigned n = 1; std::filesystem::exists(candidate, ec) && n < 1000u; ++n)
++        {
++            candidate = base.parent_path() / (base.stem().string() + "_" + std::to_string(n) + base.extension().string());
++        }
++        lastCheckpointRequestPath() = candidate;
++        return candidate;
++    }
++}
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -2697,7 +2724,21 @@ void PS2Runtime::run(const std::filesystem::path &devstateLoadPath)
+         // DEVSTATE_003B: F9 requests a real checkpoint save. The request is
+         // only QUEUED here (render thread); validation and serialization run
+         // on the EE executor at the certified scheduler boundary.
+-        if (IsKeyPressed(KEY_F9))
++        // PS2X_CHECKPOINT_TRIGGER_FILE: unattended runs request the same save as F9 by creating this
++        // file; it is removed once seen.
++        static const char *s_ckptTrigger = std::getenv("PS2X_CHECKPOINT_TRIGGER_FILE");
++        bool checkpointTriggerSeen = false;
++        if (s_ckptTrigger && *s_ckptTrigger)
++        {
++            std::error_code triggerError;
++            if (std::filesystem::exists(s_ckptTrigger, triggerError))
++            {
++                std::filesystem::remove(s_ckptTrigger, triggerError);
++                checkpointTriggerSeen = true;
++                std::cerr << "[CKPT:REQUEST] trigger file seen: " << s_ckptTrigger << std::endl;
++            }
++        }
++        if (IsKeyPressed(KEY_F9) || checkpointTriggerSeen)
+         {
+             if (!ps2x::checkpoint::hasProcessIdentity())
+             {
+@@ -2706,14 +2747,11 @@ void PS2Runtime::run(const std::filesystem::path &devstateLoadPath)
+             }
+             else if (m_eeScheduler &&
+                      m_eeScheduler->requestCheckpoint(
+-                         // DEVSTATE_003C: new filename -- the 003B 5-section
+-                         // artifact (dmc_checkpoint_mainmenu.dmck) is kept
+-                         // untouched as a format-rejection test fixture.
+-                         std::filesystem::path("dmc_checkpoint_mainmenu_v2.dmck"),
++                         checkpointSaveRequestPathNoOverwrite(),
+                          ps2x::checkpoint::processIdentity()))
+             {
+-                std::cerr << "[CKPT:REQUEST] queued (F9); waiting for scheduler boundary"
+-                          << std::endl;
++                std::cerr << "[CKPT:REQUEST] queued (F9) path=" << lastCheckpointRequestPath().string()
++                          << "; waiting for scheduler boundary" << std::endl;
+             }
+             else
+             {

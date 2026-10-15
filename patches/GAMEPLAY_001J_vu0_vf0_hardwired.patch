@@ -1,0 +1,245 @@
+diff --git a/ps2xRecomp/src/lib/code_generator.cpp b/ps2xRecomp/src/lib/code_generator.cpp
+index 68b0984..c99a9d8 100644
+--- a/ps2xRecomp/src/lib/code_generator.cpp
++++ b/ps2xRecomp/src/lib/code_generator.cpp
+@@ -223,14 +223,27 @@ namespace ps2recomp
+ 
+     CodeGenerator::~CodeGenerator() = default;
+ 
++    namespace
++    {
++        // VU0 vf0 is hardwired to (0, 0, 0, 1): a guest write to it has no effect. Every
++        // translated statement that assigns ctx->vu0_vf[0] is followed by restoring the
++        // constant, which is equivalent to discarding the write.
++        std::string discardVu0Vf0Write(std::string code)
++        {
++            if (code.find("ctx->vu0_vf[0] =") != std::string::npos)
++                code += " ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f); /* vf0 is hardwired */";
++            return code;
++        }
++    }
++
+     std::string CodeGenerator::translateInstruction(const Instruction &inst)
+     {
+-        return InstructionTranslator(*this).translate(inst, {});
++        return discardVu0Vf0Write(InstructionTranslator(*this).translate(inst, {}));
+     }
+ 
+     std::string CodeGenerator::translateInstruction(const Instruction &inst, const MemoryAccessHint &memoryHint)
+     {
+-        return InstructionTranslator(*this).translate(inst, memoryHint);
++        return discardVu0Vf0Write(InstructionTranslator(*this).translate(inst, memoryHint));
+     }
+ 
+     std::string CodeGenerator::translateSpecialInstruction(const Instruction &inst)
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 9cbae69..ba1c636 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -404,6 +404,7 @@ public:
+     void debugEnqueueInvocationForTest(GuestInvocationKind kind, uint64_t tag,
+                                        bool withCompletion);
+     void debugClearPendingInvocationsForTest();
++    [[nodiscard]] R5900Context debugThreadContextForTest(int threadId) const;
+     bool debugSetWaitCompletionForTest(int threadId, bool set);
+ 
+     // DEVSTATE_003A: scheduler-side quiescence counters for the checkpoint
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 126f547..026beb4 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -10,6 +10,18 @@
+ #include <limits>
+ #include <stdexcept>
+ 
++namespace
++{
++    // VU0 vf0 is hardwired to (0, 0, 0, 1) on the PS2. R5900Context's constructor zeroes
++    // every register, so any context created for a guest thread or invocation must
++    // re-establish the constant before guest code runs (VU0 macro code reads vf0.w as 1.0).
++    void resetVu0HardwiredRegisters(R5900Context &context)
++    {
++        context.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++        context.vi[0] = 0;
++    }
++}
++
+ namespace
+ {
+     constexpr int KE_OK = 0;
+@@ -868,6 +880,12 @@ void EeScheduler::debugEnqueueInvocationForTest(GuestInvocationKind kind, uint64
+     m_pendingInvocations.push_back(std::move(inv));
+ }
+ 
++R5900Context EeScheduler::debugThreadContextForTest(int threadId) const
++{
++    const GuestThread *t = thread(threadId);
++    return t ? t->context : R5900Context{};
++}
++
+ void EeScheduler::debugClearPendingInvocationsForTest()
+ {
+     m_pendingInvocations.clear();
+@@ -1323,6 +1341,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+     }
+ 
+     target->context = R5900Context{};
++    resetVu0HardwiredRegisters(target->context);
+     target->context.pc = target->entry;
+     target->arg = arg;
+     target->suspendCount = 0;
+@@ -1934,6 +1953,7 @@ int EeScheduler::cancelAlarm(int id)
+ void EeScheduler::queueInvocation(GuestInvocation invocation)
+ {
+     assertExecutor();
++    resetVu0HardwiredRegisters(invocation.context);
+     invocation.sequence = ++m_invocationSequence;
+     m_pendingInvocations.push_back(std::move(invocation));
+     m_checkpointPending.store(true, std::memory_order_release);
+@@ -1944,6 +1964,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     assertExecutor();
+     GuestThread *owner = currentThread();
+     assert(owner != nullptr);
++    resetVu0HardwiredRegisters(invocation.context);
+     if (getRegU32(&invocation.context, 29) == 0u)
+     {
+         SET_GPR_U32(&invocation.context, 29, invocationStackTop());
+@@ -1966,6 +1987,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+         {
+             SET_GPR_U32(&it->context, 29, invocationStackTop());
+         }
++        resetVu0HardwiredRegisters(it->context);
+         it->sequence = ++m_invocationSequence;
+         owner->invocations.push_back(std::move(*it));
+     }
+diff --git a/ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp b/ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp
+index 10f44d9..02dfbf5 100644
+--- a/ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp
++++ b/ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp
+@@ -313,11 +313,22 @@ namespace ps2x::checkpoint
+ 
+     void writeR5900Context(ByteWriter &w, const R5900Context &c)
+     {
+-        writeR5900(w, c);
++        // vf0/vi0 are hardwired on VU0 and are not state: always serialize the
++        // constant so save/restore round-trips stay byte-identical.
++        R5900Context canonical = c;
++        canonical.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++        canonical.vi[0] = 0;
++        writeR5900(w, canonical);
+     }
+     bool readR5900Context(ByteReader &r, R5900Context &c)
+     {
+-        return readR5900(r, c);
++        if (!readR5900(r, c))
++            return false;
++        // vf0/vi0 are hardwired on VU0; checkpoints saved by runtimes that left them
++        // zero in thread/invocation contexts must not restore that invalid state.
++        c.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++        c.vi[0] = 0;
++        return true;
+     }
+ 
+     namespace
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index ad7df46..96ed81e 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -16,6 +16,7 @@
+ #include "Stubs/Audio.h"
+ #include "Stubs/GS.h"
+ #include "Stubs/VU.h"
++#include "runtime/checkpoint/checkpoint.h"
+ 
+ #include <atomic>
+ #include <cstdint>
+@@ -309,6 +310,9 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    // vf0 hardwired-constant tests (GAMEPLAY_001K).
++    constexpr uint32_t kVf0ProbeMainPc = 0x00410000u;
++    constexpr uint32_t kVf0ProbeThreadPc = 0x00410100u;
+ }
+ 
+ void register_ps2_runtime_expansion_tests()
+@@ -968,6 +972,79 @@ void register_ps2_runtime_expansion_tests()
+                      "sprintf should return the rendered length");
+         });
+ 
++        tc.Run("VU0 writes to vf0 are discarded by the recompiler", [](TestCase &t)
++        {
++            R5900Decoder decoder;
++            CodeGenerator generator({}, {});
++            const struct
++            {
++                const char *name;
++                uint32_t raw;
++                bool writesVf0;
++            } cases[] = {
++                {"VSUB.xyzw vf0, vf0, vf0", 0x4BE0002Cu, true},
++                {"VSUB.xyzw vf5, vf0, vf0", 0x4BE0016Cu, false},
++                {"LQC2 vf0, 0(a1)", 0xD8A00000u, true},
++                {"QMTC2 t0, vf0", 0x48A80000u, true},
++            };
++            const std::string restore = "ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);";
++            for (size_t i = 0; i < std::size(cases); ++i)
++            {
++                const Instruction inst = decoder.decodeInstruction(0x3000u + static_cast<uint32_t>(i * 4u), cases[i].raw);
++                const std::string generated = generator.translateInstruction(inst);
++                const size_t write = generated.find("ctx->vu0_vf[0] =");
++                const size_t restoreAt = generated.rfind(restore);
++                if (cases[i].writesVf0)
++                {
++                    t.IsTrue(write != std::string::npos, std::string("expected a vf0 assignment for ") + cases[i].name);
++                    t.IsTrue(restoreAt != std::string::npos && restoreAt > write,
++                             std::string("vf0 must be restored after the write for ") + cases[i].name);
++                }
++                else
++                {
++                    t.IsTrue(generated.find(restore) == std::string::npos,
++                             std::string("no vf0 restore expected for ") + cases[i].name);
++                }
++            }
++        });
++
++        tc.Run("StartThread contexts expose the hardwired VU0 vf0", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++            R5900Context mainContext{};
++            mainContext.pc = kVf0ProbeMainPc;
++            EeScheduler &ee = runtime.eeScheduler();
++            ee.reset(rdram.data(), mainContext);
++            const int id = ee.createThread(EeThreadCreateParams{0u, kVf0ProbeThreadPc, 0u, 0u, 0u, 10, 0u});
++            t.IsTrue(id > 1, "probe thread should be created");
++            t.Equals(ee.startThread(id, 0u, mainContext, false), 0, "probe thread should start");
++            const R5900Context started = ee.debugThreadContextForTest(id);
++            float v[4];
++            _mm_storeu_ps(v, started.vu0_vf[0]);
++            t.IsTrue(v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f && v[3] == 1.0f,
++                     "a StartThread context must hold vf0 = (0, 0, 0, 1) before its first dispatch");
++            t.Equals(started.pc, kVf0ProbeThreadPc, "StartThread should still set the entry PC");
++        });
++
++        tc.Run("checkpoint context restore re-establishes the hardwired VU0 vf0", [](TestCase &t)
++        {
++            R5900Context saved{};
++            saved.vu0_vf[0] = _mm_setzero_ps();
++            saved.vu0_vf[1] = _mm_set_ps(4.0f, 3.0f, 2.0f, 1.0f);
++            ps2x::checkpoint::ByteWriter w;
++            ps2x::checkpoint::writeR5900Context(w, saved);
++            R5900Context restored{};
++            ps2x::checkpoint::ByteReader r(w.buffer().data(), w.buffer().size());
++            t.IsTrue(ps2x::checkpoint::readR5900Context(r, restored), "context should deserialize");
++            float v0[4], v1[4];
++            _mm_storeu_ps(v0, restored.vu0_vf[0]);
++            _mm_storeu_ps(v1, restored.vu0_vf[1]);
++            t.IsTrue(v0[0] == 0.0f && v0[1] == 0.0f && v0[2] == 0.0f && v0[3] == 1.0f,
++                     "restored vf0 must be (0, 0, 0, 1) even if the checkpoint stored zero");
++            t.IsTrue(v1[0] == 1.0f && v1[3] == 4.0f, "other VF registers must be restored unchanged");
++        });
++
+         tc.Run("multiply-add matrix writes rd only when R5900 requires it", [](TestCase &t)
+         {
+             R5900Decoder decoder;

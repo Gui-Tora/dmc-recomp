@@ -1,11 +1,11 @@
 # Estado actual del proyecto — punto de entrada para nuevos agentes
 
-Última actualización: 2026-10-14, publicación técnica de GAMEPLAY_001I en la rama `gameplay-001i` ([GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md)).
+Última actualización: 2026-10-15, cierre de GAMEPLAY_001J (TSNDDRVM/XAG, la cinemática de la oficina ya no se detiene, preparación de v0.1.0-alpha) — [GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md](GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md).
 Índice histórico completo: [RESEARCH_INDEX.md](RESEARCH_INDEX.md).
 Reglas del proyecto: [AGENTS.md](../../AGENTS.md) (obligatorias) y [README.md](../../README.md).
 
-> **Aviso:** el avance técnico de GAMEPLAY_001D–001I está publicado en la rama `gameplay-001i`, que aún no
-> está fusionada en `master`. Lee la sección «Estado remoto frente a estado local».
+> **Aviso:** `master` (`f3c4e33`, PR #2) contiene el avance de 001D–001I. El trabajo de 001J (parches 16–18,
+> notas) está en la rama local `gameplay-001j`, preparado para PR y pendiente de autorización. Lee la sección «Estado remoto frente a estado local».
 > **El juego no es jugable.** El primer frame jugable **no** está demostrado.
 
 Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
@@ -18,7 +18,7 @@ Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
 | ELF | `SLES_503.58`; SHA-256 `d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`; CRC32 `0x77654AD2`; entry `0x00100008` |
 | `CDMODULE.IRX` | SHA-256 `9d51f16d1ed861e508daa1389e6aaf4fe597687b3f0cd5feb920e62a479b34fa` |
 | `TSNDDRVM.IRX` | SHA-256 `c00b17f07aa0dfed089a517498074eec251c7b571f58a7649414ef88be7f31fd` |
-| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master`: 13 parches (`patched_commit` `dcd03052…`). Rama `gameplay-001i`: 15 parches (`patched_commit` `6bea2eb0146c321903dc895a6290f36fa1803df4`) |
+| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master`: 15 parches (`patched_commit` `6bea2eb0…`). Rama `gameplay-001j`: **18 parches** (`patched_commit` `585c347e4cf3e26c804b561b3f2d5aa27b0fe1ae`), vendor idéntico byte a byte al replay limpio |
 | Límites de función | `.symtab` del ELF (*symtab-first*), no Ghidra. Ver [SYMTAB_BASELINE_PROMOTION.md](SYMTAB_BASELINE_PROMOTION.md) |
 | Herramientas | Rabbitizer (en ps2_recomp), Ghidra solo para navegación y xrefs, PCSX2 2.8.2 como oráculo (PINE de solo lectura + debugger manual del usuario) |
 | Repositorio | `https://github.com/Gui-Tora/dmc-recomp` (rama principal `master`) |
@@ -37,33 +37,27 @@ generales del runtime van en `patches/`.
 | Checkpoint de desarrollo Main Menu | formato v2; runtime ABI 2 en el parche 14 (`gameplay-001i`) |
 | CDMODULE `fno=2 mode=1/2/8/0xA`, `fno=1/8`, SeReplace | validado; parche 14 (`gameplay-001i`) |
 | Película `0x232` tras NEW GAME | reproducida completa con los parches 14 + 15 |
-| Escena posterior a la película | ejecución por frames observada (INFERENCIA); **no validada visualmente** |
-| Audio | no audible en ningún punto del proyecto (observación del usuario) |
+| Escena posterior a la película | cinemática en tiempo real de la oficina **ya no se detiene**: con el parche 17 (TSNDDRVM) `Event_voice_call` encuentra el stream XAG listo y, en una corrida Release de ~46 min, el script llegó a su final (tick 32366); sigue el vídeo `0x231`, la carga del escenario siguiente y el bloqueo `sceDmaRecvI` (IPU/scratchpad en `Movie_texture`). Defectos visuales: oscuridad, tinte verde, huecos, circuito 1 mal colocado (VISUAL_001/004/005/006) |
+| Audio | **voz/pista XAG de la cinemática audible** (parche 17; confirmado por el usuario 2026-10-15), a velocidad real y por tanto desincronizada con un juego más lento; efectos (TQ), BGM y audio de películas PSS siguen mudos |
 | 20 `ret0` VU0 | 3 restauradas localmente (`capVu0MulMatrix2`, `capVu0AddVectorXYZ`, `capVu0SubVectorXYZ`); **17 pendientes** ([GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md)) |
 
-## 3. Última ejecución comprobada (local, 2026-10-14)
+## 3. Última ejecución comprobada (local, 2026-10-15, estado publicado)
 
-- **Ejecutable reproducible:** `7110206b429e20198cef6e7f436ae4e33465287c4dd52e47e28e62d0a218459e` (corrida `pubR1`).
-  - Construido con el vendor idéntico al replay de los 15 parches.
-  - 17 `ret0` y overrides limpios, sin diagnósticos ni experimentos.
-  - Selftests 97/0.
-- **Corrida anterior equivalente:** `finalF1` (exe `d80ac6f2…`).
-- **Condiciones:** checkpoint ABI 2. Detalle en
-  [GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md).
-
-Secuencia:
-
-1. Carga del checkpoint en Main Menu (`CKPT:LOAD` compatible) y Cross por archivo PAD (NEW GAME).
-2. CDMODULE carga 24 recursos, idénticos a ORIGINAL hasta `0x32`: `0x52 0x50 0x51 0x54 0x53 0xFE 0xFF 0x108 0x103 0x4F 0x118 0x14E 0x119 0x11A 0x5A 0x1B9 0x2E 0x31 0x36 0x3C 0x3A 0x33 0x44 0x32`.
-3. `SndSceneBgmStart → SdrGetState(0x80000006)`: RPC no manejado, RECOMP devuelve 0 y ORIGINAL 1.
-4. Película `0x232` (`MOVIE:start lba=0x215524 totalSize=0x490C004`), ~7,6 s después de `0x32`:
-   - 1169 trozos hasta `remaining=0x0` y 1550 fotogramas MPEG;
-   - 0 errores VU1/XGKICK.
-5. Después de la película: `MPEG:delete`, inicialización de escena (`Get_light_str` ×21 500) y bucle por frame
-   del hilo 12 (`Game_main`; ~346 600 `katVu0Clip_ld` en la ventana de 320 s).
-
-**Sin el parche TTE:** después de `0x32` el GS se queda bloqueado en un paquete DIRECT falso de ~55 KiB y
-`0x232` nunca se solicita (001H).
+- **Ejecutables reproducibles** (vendor = base + 18 parches, sin instrumentación):
+  - Release: `a1934eb32f7967b8a59512aff1909c18abc1e4f847fc5f9f9faade5231956d25`;
+  - Debug: `b35b2f558fe4dafd8679625a0880015666fc4c1fae723db8e750a1c516c491c9`.
+- **Selftests:** 97/0. `ps2x_tests`: 268 PASS, mismos fallos preexistentes.
+- **Prueba de humo** (`clean_smoke_release`):
+  - checkpoint `dmc_checkpoint_mainmenu_abi2_tsnd_v1.dmck`, un Cross;
+  - NEW GAME y película `0x232` completa;
+  - `Event_voice_call` → stream XAG (fichero `0x1B8`, bloques `[40,+272)`) en standby y reproducción;
+  - audio encolado completo.
+- **Corrida larga de referencia** (`tsnd_release_60m`, ~46 min reales):
+  1. El script de la cinemática avanza sin detenerse.
+  2. Final por script en el tick 32366 (`Event_skip(3)` → `XagStop`).
+  3. Vídeo `0x231`, carga de `0x1D4`/`0x2E`/`0x31`/`0x33`/`0x32` y `SdrBgmReq`.
+  4. `Unimplemented PS2 stub called: sceDmaRecvI` (PC `0x3FEE34`, `Movie_texture`).
+- **Rendimiento:** ~3–4 VSync/s en escenas 3D (Release); el intérprete VU1 ocupa ~83 % del hilo del juego.
 
 ## 4. Checkpoints
 
@@ -71,19 +65,25 @@ Secuencia:
 |---|---|---|
 | `dmc_checkpoint_mainmenu_v1.dmck` | formato v1 (build ID estricto) | inválido tras cualquier relink (ver GAMEPLAY_001) |
 | `dmc_checkpoint_mainmenu_v2.dmck` | formato v2, ABI 1 | rechazado por el runtime ABI 2 (`checkpoint runtime ABI mismatch`): no contiene `SdtAddr` |
-| `dmc_checkpoint_mainmenu_abi2.dmck` | formato v2, **ABI 2**; SHA-256 `88fe10cd…7078`; `compat=c3db86c0…4fdc` | **operativo** (001F–001H); creado por cold boot el 2026-10-11 |
+| `dmc_checkpoint_mainmenu_abi2.dmck` | formato v2, **ABI 2**; SHA-256 `88fe10cd…7078`; `compat=c3db86c0…4fdc` | operativo hasta 001I; **no contiene el estado TSNDDRVM**: los comandos de inicialización de `SndInit` se perdieron, así que no sirve para la voz XAG |
+| `dmc_checkpoint_mainmenu_abi2_tsnd_v1.dmck` | formato v2, ABI 2; SHA-256 `5fc03336…c09e`; tick 20153 | **operativo desde 001J**: cold boot con el servicio TSNDDRVM (`TsndInitXag 0x70000 2/2`, `XagSetBuff 0x30000`); validado cargándolo en un proceso nuevo |
 
 - Formato v2 ([DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md](DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md)):
   - el gate estricto usa una identidad de compatibilidad de estado;
   - el build ID del ejecutable es solo procedencia;
   - un relink no semántico no invalida el checkpoint.
 - ABI 2 ([GAMEPLAY_001E_CDMODULE_MIXED_EE_IOP_SPU.md](GAMEPLAY_001E_CDMODULE_MIXED_EE_IOP_SPU.md)):
-  `kCheckpointRuntimeAbiVersion = 2` y `kIopSectionVersion = 2`, porque el estado de CDMODULE incluye
-  `SdtAddr`. Incluido en el parche 14.
-- Procedimiento:
+  `kCheckpointRuntimeAbiVersion = 2` y `kIopSectionVersion = 2`, porque el estado de CDMODULE incluye `SdtAddr`.
+  Incluido en el parche 14.
+- El servicio TSNDDRVM serializa su propio estado (payload v2). Un checkpoint sin esa sección carga el servicio en
+  su estado inicial.
+- **Procedimiento:**
   - cargar con `DMC_DEVSTATE_LOAD=<archivo.dmck>`;
-  - guardar en Main Menu con F9 en una sesión de cold boot ([DEVSTATE_003D](DEVSTATE_003D_CHECKPOINT_COMPATIBILITY_ID.md));
-  - autotests con `DMC_CHECKPOINT_SELFTEST=1` (97 PASS / 0 FAIL en el ejecutable reproducible `7110206b…`).
+  - guardar con F9 o con el disparador `PS2X_CHECKPOINT_TRIGGER_FILE` (parche 18);
+  - fijar el destino con `PS2X_CHECKPOINT_SAVE_PATH`; nunca sobrescribe.
+- **Autotests:** `DMC_CHECKPOINT_SELFTEST=1` (97 PASS / 0 FAIL).
+- **Checkpoint de final de intro:** no se pudo crear. El punto seguro lo rechaza con `CDMODULE: movie stream active`
+  entre el final de `0x231` y el bloqueo; ver la nota de 001J.
 - **Regla:** cualquier cambio del estado serializado exige cambiar la ABI. No aceptar checkpoints antiguos con
   semántica nueva.
 
@@ -114,8 +114,10 @@ Secuencia:
 - Defecto de runtime: **`vf0 = (0,0,0,0)`** en todos los hilos salvo el principal.
   - Causa: `StartThread` e invocaciones `GsCallback` crean contextos con `memset 0` (HECHO, 001I).
   - En hardware `vf0 = (0,0,0,1)` es constante.
-  - Con el experimento `DMC_VF0_FIX`, `_capVu0ecossin` coincide bit a bit con el modelo independiente
-    (600/600). La corrección sigue siendo **experimental**.
+  - **Parche 16 (local, sin commit)**: corrección general en `StartThread`, en las invocaciones y en
+    lectura/escritura del checkpoint; el recompilador descarta las escrituras a `vf0`. Probado (tests,
+    selftests 97/0) y equivalente al experimento `DMC_VF0_FIX`, que se retiró. Con él, `_capVu0ecossin`
+    coincide bit a bit con el modelo (600/600).
 
 ## 7. VIF1 / VU1 / GS
 
@@ -137,57 +139,45 @@ Secuencia:
 
 ## 8. Próximos bloqueadores (orden por evidencia)
 
-1. **Pantalla oscura tras la fachada** (VISUAL_003, observación del usuario), que impide demostrar el primer
-   frame jugable. Fase GAMEPLAY_001J.
-2. **`vf0` en hilos:** convertir el experimento en cambio general (HECHO de causa; validado en ecossin).
-3. **`ret0` en la ruta por frame:**
-   - `katVu0Clip_ld` (CLIP) y `katVu0SetClip`;
-   - `_capVu0ecossin` (tras `vf0`);
-   - `Get_light_str`.
+1. **`sceDmaRecvI` / `Movie_texture`:** decodificación IPU por hardware (toIPU → IPU → scratchpad → fromSPR) usada
+   por niebla, fondos y pantallas de estado. El runtime no emula IPU ni DMA de scratchpad.
+   - Decisión tomada: HLE de `Movie_texture` específica de DMC con FFmpeg (`AV_CODEC_ID_IPU`).
+   - Hay un borrador **no validado ni integrado** en `analysis/local/gameplay_001j/provisional_ipu/`.
+2. **Rendimiento:** ~3–4 VSync/s en escenas 3D, por el intérprete VU1 (~1,27 M ciclos VU1 por VSync a ~4,6 M
+   ciclos/s de host). 25 VSync/s exigen ~6,8× y requieren cambiar la arquitectura del VU1
+   (recompilación/JIT o un modelo de pipeline más barato).
+3. **Checkpoint posterior a la intro:** bloqueado por `CDMODULE: movie stream active` tras `0x231`. Causa UNKNOWN.
+4. **Audio:** sincronizar el stream XAG con el tiempo emulado (borrador no verificado preservado); efectos (TQ),
+   BGM y audio PSS.
+5. **Defectos visuales de la oficina** (VISUAL_001/004/005/006). Requieren oráculo PCSX2.
+6. **Defectos generales del traductor VU0** (CLIP/MAC/DIV/SQRT/FTOI) y 17 `ret0` pendientes.
 
-   Corrección visual o de lógica pendiente (INFERENCIA).
-4. **Defectos generales del traductor VU0** (CLIP/MAC/DIV/SQRT/FTOI/escritura a `vf0`): ya afectan a código
-   nativo activo (HECHO).
-5. **SDRDRV `SdrGetState`:** divergencia abierta, no causal para `0x232` (HECHO).
-6. **Verificación visual del primer frame jugable y rendimiento de la escena** (UNKNOWN; el runtime no tiene
-   volcado de framebuffer).
+## 9. Próxima fase (propuesta, no iniciada)
 
-## 9. Próxima fase: GAMEPLAY_001J (propuesta, no iniciada)
+1. Publicar GAMEPLAY_001J (PR) y la pre-release `v0.1.0-alpha` (NOT PLAYABLE, solo código fuente).
+2. Decidir la estrategia de rendimiento del VU1 con los datos del perfil.
+3. Validar e integrar la HLE de `Movie_texture` para superar `sceDmaRecvI`.
 
-1. Corrección general de `vf0`:
-   - inicializar en `StartThread` e invocaciones (o en el constructor si se justifica la recompilación);
-   - descartar escrituras a `vf0` en el traductor.
-2. Después, A/B de `_capVu0ecossin` (`ret0` frente a nativa) con la corrección común en ambos brazos.
-3. Parche general del traductor para CLIP (`katVu0Clip_ld`) y oráculo de una llamada.
-4. Mecanismo de evidencia visual (volcado de framebuffer) para poder evaluar el primer frame jugable.
+GAMEPLAY_001J está documentada en
+[GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md](GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md).
 
-GAMEPLAY_001I (TTE, Add/Sub, sonda `vf0`) está **cerrada**:
-[GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md).
+## 10. Estado remoto frente a estado local (verificado 2026-10-15, cierre de 001J)
 
-## 10. Estado remoto frente a estado local (verificado 2026-10-14, cierre de 001I)
-
-- `origin/master = 6cc8ce8`; la rama documental `docs/gameplay-001-history` (`da7ec4d`) está publicada pero no
-  integrada.
-- `master = 0cc5243` (PR #1 documental fusionado). El trabajo técnico de 001D–001I está publicado en la rama
-  `gameplay-001i` (`7e7e65b`, `22088d0`, `5cee31b` + documentación), **sin merge**.
-- Vendor `HEAD = 0efd17c`. El árbol vendor publicado equivale a baseline + 13 parches; se verificó
-  reconstruyéndolo y comparándolo archivo por archivo.
+- `origin/master = f3c4e33`: PR #2 fusionado (parches 14 y 15, 17 `ret0`, notas de 001I). Sin releases ni tags.
+- La rama local `gameplay-001j` (desde `f3c4e33`) contiene el trabajo de 001J **sin commit**, pendiente de
+  autorización.
 
 | Elemento | Implementado localmente | Validado localmente | Versionado en Git | Publicado en GitHub |
 |---|---|---|---|---|
-| BLOCKER_001–004, checkpoint v1/v2 (DEVSTATE) | sí | sí | sí | sí |
-| Notas GAMEPLAY_001 a 001H | sí | — | sí (`da7ec4d`) | sí, en `master` (PR #1) |
-| Notas GAMEPLAY_001I y actualizaciones | sí | — | sí | rama `gameplay-001i` |
-| CDMODULE `mode&2/8`, `0x103`, `0x118`, `fno=1/8`, SeReplace + ABI 2 (parche 14) | sí | sí | sí (`7e7e65b`) | rama `gameplay-001i` |
-| Parche VIF1 TTE (parche 15) | sí | sí (tests, 7 ejecuciones completas) | sí (`22088d0`) | rama `gameplay-001i` |
-| `capVu0MulMatrix2`, `capVu0Add/SubVectorXYZ` nativas (TOML 17 `ret0@`, overrides 17) | sí | sí | sí (`5cee31b`) | rama `gameplay-001i` |
-| Modo sombra / `DMC_RET0_NATIVE` / sombra de ecossin | copia en `analysis/local/gameplay_001j/` | diagnóstico | **no** (excluido a propósito) | **no** |
-| Experimento `vf0` (`DMC_VF0_PROBE` / `DMC_VF0_FIX`) | retirado del vendor; diff en `analysis/local/gameplay_001i/` | sí (ecossin 600/600) | **no** | **no** |
-| Pendiente | merge de `gameplay-001i` a `master`; diseño general de `vf0` | | | |
-
-Consecuencia: un clon de la rama `gameplay-001i` reproduce el avance hasta la película `0x232` y la escena
-posterior. Verificado: el replay de los 15 parches coincide archivo por archivo con el vendor usado para el
-ejecutable `7110206b…`. El código generado se regenera desde `recomp/symtabfirst.toml`, que contiene 17 `ret0`.
+| BLOCKER_001–004, DEVSTATE, notas hasta 001I | sí | sí | sí | sí (`master`) |
+| CDMODULE + ABI 2 (parche 14), VIF1 TTE (parche 15), 17 `ret0` | sí | sí | sí | sí (`master`) |
+| Parche 16 `vf0` | sí | sí (tests, selftests, equivalencia) | **no** (pendiente) | **no** |
+| Parche 17 TSNDDRVM/XAG (estado, stream, audio) | sí | sí (tests 268, corridas, audio confirmado por el usuario) | **no** (pendiente) | **no** |
+| Parche 18 ruta F9 y disparador de checkpoint | sí | sí (creó `..._abi2_tsnd_v1.dmck`) | **no** (pendiente) | **no** |
+| Notas 001J, README, CHANGELOG | sí | — | **no** (pendiente) | **no** |
+| Ritmo de audio por tiempo emulado | borrador | **no** | no (preservado en `analysis/local`) | no |
+| HLE de `Movie_texture` / decodificador IPU | borrador | **no** | no (preservado en `analysis/local`) | no |
+| Instrumentación de 001J (GS, GIF, render, perfilador, VU1, traza de sonido) | retirada | — | no | no |
 
 ## 11. Cómo reproducir
 
