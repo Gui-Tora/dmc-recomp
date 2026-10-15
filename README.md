@@ -20,11 +20,22 @@ project, not a playable port.
 - Title screen reached
 - Rendering is still incomplete/corrupted
 - Later game states (gameplay, missions) are not yet functional. Past
-  NEW GAME, the intro movie (`0x232`) is requested and plays to completion
-  with the current patchset (CDMODULE `mode&2`/`mode&8`, checkpoint ABI 2,
-  VIF1 TTE; see
-  [`analysis/notes/GAMEPLAY_CURRENT_STATUS.md`](analysis/notes/GAMEPLAY_CURRENT_STATUS.md));
-  a first playable frame has not been demonstrated
+  NEW GAME, the intro movie (`0x232`) plays to completion and the
+  real-time office cutscene that follows no longer stalls: in one ~46-minute
+  Release run its event script reached its end (GAMEPLAY_001J), with visual
+  defects and unsynchronized audio. The game then requests movie `0x231`,
+  loads the next scene and stops at an unimplemented PS2 stub
+  (`sceDmaRecvI`, IPU movie-texture path), before any gameplay; see
+  [`analysis/notes/GAMEPLAY_CURRENT_STATUS.md`](analysis/notes/GAMEPLAY_CURRENT_STATUS.md).
+  A first playable frame has not been demonstrated
+- First audible game audio: the cutscene's streamed voice/audio track
+  (XAG, through a reconstructed HLE of the game's `TSNDDRVM.IRX` sound
+  driver). It plays at real-time speed and is not yet synchronized with the
+  (much slower) emulated picture; sound effects, background music and movie
+  audio are still silent
+- Performance is very low (far from real time): about 3–4 VSync/s
+  (vs. 50 on PAL) in 3D scenes on a Release build, dominated by the VU1
+  interpreter
 - Movie/PSS frames now render as recognizable, legible imagery (logo
   text, fire/smoke animation) after a GS double-buffer display
   environment fix, but playback is not yet fully correct (see
@@ -317,14 +328,42 @@ from it (`BLOCKER_004_ASTRA_P311_OVERNIGHT.md`,
 `BLOCKER_004_P421_MPEG_DEMUX_VIBUF_BACKPRESSURE_FIX.md`,
 `BLOCKER_004_P422_VIBUF_BLOCK_BYTE_ACCOUNTING_ROOT_CAUSE.md`).
 
+**GAMEPLAY_001J** — after the intro movie the office cutscene stayed on an
+identical frame. Two causes were found and fixed: VU0 `vf0` was zero in
+guest threads (it is hard-wired to `(0,0,0,1)`; patch
+`GAMEPLAY_001J_vu0_vf0_hardwired.patch`), and the cutscene script waited
+forever for the XAG voice channel of the game's sound driver
+(`TSNDDRVM.IRX`), which had no HLE for this game. The driver's command queue
+and XAG stream state machine were reconstructed from the IRX itself
+(`GAMEPLAY_001J_tsnddrvm_xag_service.patch`): the cutscene's event script
+now advances (it reached its end in one long Release run) and its voice
+track is audible. A small checkpoint tooling patch
+(`GAMEPLAY_001J_checkpoint_save_path_and_trigger.patch`) makes the F9 save
+path configurable and never overwrites. Details, measurements (including a
+CPU profile: ~83% of the game thread in the VU1 interpreter) and the
+retractions made along the way:
+[`analysis/notes/GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md`](analysis/notes/GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md).
+
 Known, currently out-of-scope limitations (not yet classified as blocking
 further progress):
 
 - `CdModuleService` handles `mode=1`, `mode&2` and `mode&8` (patch
   `GAMEPLAY_001D_001G_cdmodule_mode2_sound_abi2.patch`); IOP/SPU sound
-  effects are modelled as data only (no TSND playback backend).
+  effects are modelled as data only. The `TSNDDRVM` service models only the
+  XAG stream channels (state, CD stream, audible output); sound effects,
+  BGM and the other driver queries are not implemented yet.
+- The scene after the intro uses hardware IPU movie textures
+  (`Movie_texture` → `sceDmaRecvI`), which the runtime does not emulate.
 - Rendering is incomplete/corrupted past the title screen.
 - The boot flow after the title screen is still under investigation.
+
+## Releases
+
+Releases are **source-only** pre-releases. They never contain the game, its
+executable, recompiled game code, binaries built from it, checkpoints or any
+other material derived from the game: you build everything locally from your
+own legally obtained copy. `v0.1.0-alpha` is **NOT PLAYABLE** — see
+[`CHANGELOG.md`](CHANGELOG.md).
 
 ## Build
 
