@@ -1,0 +1,22 @@
+{
+  "comment": "Metadata only (no game bytes): where the VU1 microcode the game uploads lives in the user's own ELF, and which entries to compile. Consumed by make_vu1c.py. Evidence: analysis/notes/GAMEPLAY_001K_VU1_PERFORMANCE_DESIGN.md sections 9-12.",
+  "elf": {
+    "name": "SLES_503.58",
+    "sha256": "d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4",
+    "crc32": "77654AD2",
+    "entry": "0x00100008"
+  },
+  "images": [
+    {
+      "fnv1a64": "a0dbee2aeac4dafa",
+      "description": "Micro memory as uploaded before the post-intro office scene (VIF1 MPG generation 11 in the GAMEPLAY_001K capture).",
+      "vif_mpg_file_offsets": ["0x3f4184", "0x3f44e4", "0x3f48d4", "0x3f4d0c", "0x3f5214", "0x3f57ac", "0x3f5da4", "0x3f636c", "0x3f6894", "0x3f6e74"],
+      "entries": [
+        {"kind": 0, "pc": "0x0000", "note": "MSCAL, once per frame"},
+        {"kind": 1, "pc": "0x00b8", "note": "MSCNT after the MSCAL program"},
+        {"kind": 1, "pc": "0x0300", "note": "MSCNT after the XGKICK/E-bit exit at 0x02f8"},
+        {"kind": 1, "pc": "0x0348", "note": "MSCNT after the 0x0310 exit (seen in game from VSync ~23873)"}
+      ]
+    }
+  ]
+}
