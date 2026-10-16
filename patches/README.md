@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los dieciocho patches actualmente activos:
+arriba). Los diecinueve patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -413,3 +413,26 @@ arriba). Los dieciocho patches actualmente activos:
     No cambia el formato. Se usó para crear
     `dmc_checkpoint_mainmenu_abi2_tsnd_v1.dmck`. Documentación: la misma nota
     de GAMEPLAY_001J.
+
+19. `GAMEPLAY_001K_vu1_native_dispatch.patch` (convención B). Ejecución de
+    microprogramas VU1 compilados por adelantado, con el intérprete como
+    referencia y fallback:
+    - `vu/ps2_vu1_native.h`: soporte genérico del código generado por
+      `tools/vu1_replay/gen_vu1c.py` (normalización, flags FMAC, Q, clip,
+      XGKICK perezoso, redondeo y registro de programas).
+    - `ps2_vu1_native_dispatch.inc`, incluido solo por `ps2_runtime.cpp`:
+      despachador de `MSCAL`/`MSCNT`. `PS2X_VU1_NATIVE` sin definir mantiene la
+      ruta original; `interpreter`, `native` y `verify` (el intérprete es
+      autoritativo y el código compilado se compara campo a campo).
+      Diagnóstico opcional: `PS2X_VU1_PATH1_HASH`, `PS2X_VU1_STATS_SEC` y
+      `PS2X_VU1_TRACE_CALLS`.
+    - Rollback completo (estado, memoria de datos y PATH1 retenido) ante
+      `Budget`/`Fault`/rechazo; reinicio del planificador del intérprete antes
+      de que continúe tras una llamada compilada; offset de ciclos para que
+      `state.cycles` coincida con el del intérprete.
+    - `ps2_memory.cpp`: observador opcional de paquetes PATH1.
+
+    No modifica `ps2_vu1.h` ni ninguna cabecera incluida por el código
+    generado. Sin programas compilados registrados se comporta como el
+    intérprete. Documentación y validación:
+    `analysis/notes/GAMEPLAY_001K_VU1_PERFORMANCE_DESIGN.md`.
