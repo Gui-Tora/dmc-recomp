@@ -34,8 +34,11 @@ project, not a playable port.
   (much slower) emulated picture; sound effects, background music and movie
   audio are still silent
 - Performance is very low (far from real time): about 3–4 VSync/s
-  (vs. 50 on PAL) in 3D scenes on a Release build, dominated by the VU1
-  interpreter
+  (vs. 50 on PAL) in 3D scenes on a Release build with the default VU1
+  interpreter. With the optional compiled VU1 programs (GAMEPLAY_001K,
+  generated locally, see "Optional: compiled VU1 programs") the post-intro
+  office scene runs at about 12.5 VSync/s; the software GS then becomes the
+  largest cost
 - Movie/PSS frames now render as recognizable, legible imagery (logo
   text, fire/smoke animation) after a GS double-buffer display
   environment fix, but playback is not yet fully correct (see
@@ -376,6 +379,22 @@ python scripts/pipeline.py bootstrap
 python scripts/pipeline.py tools
 python scripts/pipeline.py identify original/YOUR_ELF_NAME
 ```
+
+### Optional: compiled VU1 programs
+
+The VU1 microprograms of the post-intro scene can be compiled ahead of time
+(GAMEPLAY_001K). The generated C++ derives from the game, so it is never
+distributed: generate it locally from your own `SLES_503.58`, then rebuild.
+
+```powershell
+python tools/vu1_replay/make_vu1c.py   # verifies the ELF, writes recomp/vu1c/ (ignored by Git)
+```
+
+At run time `PS2X_VU1_NATIVE=native` uses them (falling back to the
+interpreter when needed) and `PS2X_VU1_NATIVE=verify` compares them with the
+interpreter call by call. Unset, the game uses the interpreter as before;
+without `recomp/vu1c/` the build is unchanged. Details:
+[`tools/vu1_replay/README.md`](tools/vu1_replay/README.md).
 
 ## License
 

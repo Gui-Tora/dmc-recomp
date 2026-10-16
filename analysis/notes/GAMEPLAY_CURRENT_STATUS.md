@@ -143,9 +143,12 @@ generales del runtime van en `patches/`.
    por niebla, fondos y pantallas de estado. El runtime no emula IPU ni DMA de scratchpad.
    - Decisión tomada: HLE de `Movie_texture` específica de DMC con FFmpeg (`AV_CODEC_ID_IPU`).
    - Hay un borrador **no validado ni integrado** en `analysis/local/gameplay_001j/provisional_ipu/`.
-2. **Rendimiento:** ~3–4 VSync/s en escenas 3D, por el intérprete VU1 (~1,27 M ciclos VU1 por VSync a ~4,6 M
-   ciclos/s de host). 25 VSync/s exigen ~6,8× y requieren cambiar la arquitectura del VU1
-   (recompilación/JIT o un modelo de pipeline más barato).
+2. **Rendimiento:** con el intérprete VU1 (por defecto), ~3,3 VSync/s en la oficina.
+   - **GAMEPLAY_001K (local, en revisión):** programas VU1 compilados, generados localmente desde el ELF del
+     usuario (`tools/vu1_replay/make_vu1c.py`, parche 19), llevan la oficina a ~12,5 VSync/s con equivalencia
+     verificada.
+   - El mayor coste pasa a ser el GS por software (~31 ms por VSync).
+   - Ver [GAMEPLAY_001K_VU1_PERFORMANCE_DESIGN.md](GAMEPLAY_001K_VU1_PERFORMANCE_DESIGN.md).
 3. **Checkpoint posterior a la intro:** bloqueado por `CDMODULE: movie stream active` tras `0x231`. Causa UNKNOWN.
 4. **Audio:** sincronizar el stream XAG con el tiempo emulado (borrador no verificado preservado); efectos (TQ),
    BGM y audio PSS.
@@ -154,9 +157,9 @@ generales del runtime van en `patches/`.
 
 ## 9. Próxima fase (propuesta, no iniciada)
 
-1. Publicar GAMEPLAY_001J (PR) y la pre-release `v0.1.0-alpha` (NOT PLAYABLE, solo código fuente).
-2. Decidir la estrategia de rendimiento del VU1 con los datos del perfil.
-3. Validar e integrar la HLE de `Movie_texture` para superar `sceDmaRecvI`.
+1. Revisar y publicar GAMEPLAY_001K (programas VU1 compilados; parche 19).
+2. **GAMEPLAY_001L:** superar `sceDmaRecvI` / `Movie_texture` (HLE con FFmpeg; borrador en
+   `analysis/local/gameplay_001j/provisional_ipu/`).
 
 GAMEPLAY_001J está documentada en
 [GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md](GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md).
