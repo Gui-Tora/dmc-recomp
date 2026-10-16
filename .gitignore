@@ -16,6 +16,7 @@
 /analysis/local/
 /recomp/generated/
 /recomp/generated_active/
+/recomp/vu1c/
 /recomp/config.toml
 __pycache__/
 *.iso

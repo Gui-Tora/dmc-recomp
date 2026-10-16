@@ -24,6 +24,17 @@ list(FILTER runner_sources EXCLUDE REGEX "[/\\\\]register_functions\\.cpp$")
 set_property(TARGET ps2EntryRunner PROPERTY SOURCES "${runner_sources}")
 file(GLOB generated_sources CONFIGURE_DEPENDS "${DMC_GENERATED_DIR}/*.cpp")
 target_sources(ps2EntryRunner PRIVATE ${generated_sources} runtime/dmc_overrides.cpp)
+# GAMEPLAY_001K: VU1 programs compiled ahead of time from this game's microcode. They are generated
+# locally by tools/vu1_replay/make_vu1c.py from the user's own ELF into recomp/vu1c/ (ignored by Git).
+# Without them the build is unchanged and every VU1 call is interpreted; with them, PS2X_VU1_NATIVE
+# selects interpreter (default when unset), native or verify at run time.
+file(GLOB dmc_vu1c_sources CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/recomp/vu1c/*.cpp")
+if(dmc_vu1c_sources)
+    target_sources(ps2EntryRunner PRIVATE ${dmc_vu1c_sources})
+    # per-source include directory: the generated game sources keep their compile flags unchanged
+    set_source_files_properties(${dmc_vu1c_sources} TARGET_DIRECTORY ps2EntryRunner PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/vendor/PS2Recomp/ps2xRuntime/src/lib")
+endif()
 target_include_directories(ps2EntryRunner BEFORE PRIVATE "${DMC_GENERATED_DIR}")
 set_target_properties(ps2EntryRunner PROPERTIES OUTPUT_NAME dmc-recomp
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

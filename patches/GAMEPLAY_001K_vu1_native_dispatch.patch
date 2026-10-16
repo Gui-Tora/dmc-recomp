@@ -1,0 +1,953 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 9fa48f0..260b1d1 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1823,11 +1823,17 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+         m_gifArbiter->drain();
+ }
+ 
++// Optional observer of PATH1 (VU1 XGKICK) packets, used by the VU1 dispatcher's verify/hash modes.
++void (*g_ps2xPath1Observer)(const uint8_t *data, uint32_t sizeBytes) = nullptr;
++
+ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
+ {
+     if (!data || sizeBytes < 16)
+         return;
+ 
++    if (pathId == GifPathId::Path1 && g_ps2xPath1Observer)
++        g_ps2xPath1Observer(data, sizeBytes);
++
+     if (pathId == GifPathId::Path3)
+     {
+         if (m_path3Masked)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index bf22c3c..301b9c5 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -29,6 +29,9 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++#include "vu/ps2_vu1_native.h"
++#include "ps2_vu1_native_dispatch.inc"
++
+ namespace
+ {
+     // F9 checkpoint destination. PS2X_CHECKPOINT_SAVE_PATH selects the file
+@@ -678,9 +681,12 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
++                                     const uint64_t vsyncTick = m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u;
++                                     // PS2X_VU1_NATIVE selects compiled VU1 programs; unset keeps this original path.
++                                     if (!PS2Runtime_vu1DispatchCall(m_vu1, m_memory, m_gs, 0u, startPC, top, itop, vsyncTick))
++                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
++                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                                                       m_gs, &m_memory, startPC, top, itop, 65536);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -696,9 +702,11 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+-                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+-                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+-                                                  m_gs, &m_memory, top, itop, 65536);
++                                     const uint64_t vsyncTick = m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u;
++                                     if (!PS2Runtime_vu1DispatchCall(m_vu1, m_memory, m_gs, 1u, 0u, top, itop, vsyncTick))
++                                         m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
++                                                      m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                                                      m_gs, &m_memory, top, itop, 65536);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+diff --git a/ps2xRuntime/src/lib/ps2_vu1_native_dispatch.inc b/ps2xRuntime/src/lib/ps2_vu1_native_dispatch.inc
+new file mode 100644
+index 0000000..253b941
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vu1_native_dispatch.inc
+@@ -0,0 +1,512 @@
++// GAMEPLAY_001K: dispatch of VIF1 MSCAL/MSCNT calls to VU1 microprograms compiled ahead
++// of time (vu/ps2_vu1_native.h). Included only by ps2_runtime.cpp; no shared header changes.
++//
++// PS2X_VU1_NATIVE   unset        original code path (no dispatcher at all)
++//                   interpreter  dispatcher bookkeeping, every call interpreted (A baseline)
++//                   native       compiled program when available, interpreter otherwise
++//                   verify       interpreter is authoritative; the compiled program runs on copies and
++//                                every field, data byte, PATH1 packet and the cycle delta are compared
++// PS2X_VU1_PATH1_HASH=1          log an FNV-1a hash of every 1000 PATH1 packets (all modes)
++// PS2X_VU1_STATS_SEC=<s>         period of the [VU1:dispatch] statistics line (default 5)
++// PS2X_VU1_TRACE_CALLS=<n>       log input/output hashes of the first n calls ([VU1:trace], diagnosis)
++// PS2X_VU1_VERIFY_STRICT=1       verify mode: stop the process with an explicit failure (exit code 3)
++//                                right after reporting the first divergence (default: log and continue)
++//
++// Correctness rules (see analysis/notes/GAMEPLAY_001K_VU1_PERFORMANCE_DESIGN.md section 11):
++// - A compiled MSCNT only continues a compiled call that ended Ok (never an interpreter state, whose
++//   private scheduler may be mid-program); a compiled MSCAL may always run (execute() resets it).
++// - Before the interpreter continues (MSCNT) after a compiled call, its private scheduler is reset by an
++//   execute() with a zero cycle budget and the architectural state is restored: that is exactly the
++//   interpreter's own state after a clean program end (pipelines flushed, working clip == clip, no
++//   branch-VI backup - the generator rejects programs whose last pair would leave one).
++// - Rollback: VU1State and VU1 data memory are snapshotted and PATH1 packets are held until the
++//   compiled call returns Ok; on Budget/Fault/any refusal the snapshot is restored, the packets are
++//   dropped and the interpreter runs the call.
++// - state.cycles: the interpreter overwrites it with its private counter, which does not advance
++//   during compiled calls; the dispatcher keeps the cycles of compiled calls in an offset and adds it
++//   after every interpreter call, so state.cycles equals the interpreter-only value in every mode.
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <set>
++#include <sstream>
++#include <string>
++#include <tuple>
++#include <vector>
++
++extern void (*g_ps2xPath1Observer)(const uint8_t *data, uint32_t sizeBytes); // ps2_memory.cpp
++
++namespace vu1native
++{
++    enum class Mode
++    {
++        Off,
++        Interpreter,
++        Native,
++        Verify
++    };
++
++    struct Dispatcher
++    {
++        bool initialized = false;
++        Mode mode = Mode::Off;
++        bool path1Hash = false;
++        double statsPeriod = 5.0;
++
++        uint64_t lastGeneration = ~0ull;
++        uint64_t codeHash = 0;
++        uint64_t cycleOffset = 0;
++        // The interpreter's private cycle counter after its last run (priming does not move it; compiled
++        // calls do not touch it). Interpreter deltas are measured on it, because state.cycles need not
++        // equal private + offset (e.g. right after a checkpoint load restored state.cycles).
++        uint64_t lastPrivate = 0;
++        bool interpreterStale = false; // a compiled call ran after the interpreter's last call
++        bool prevCompiledOk = false;   // previous call was a compiled call that returned Ok
++        bool prevInterpreterClean = true;
++
++        std::vector<uint8_t> dataSnapshot = std::vector<uint8_t>(PS2_VU1_DATA_SIZE);
++        std::vector<uint8_t> scratchData = std::vector<uint8_t>(PS2_VU1_DATA_SIZE);
++        std::vector<uint8_t> packetScratch = std::vector<uint8_t>(vu1c::Xgkick::kBufferSize);
++        std::vector<uint8_t> heldPackets;            // [u32 size][bytes]...
++        std::vector<std::vector<uint8_t>> interpPackets;
++
++        // statistics (window and total)
++        uint64_t calls = 0, compiledOk = 0, interpCalls = 0, fallback[5]{}, noProgram = 0, chainBlocked = 0;
++        uint64_t compiledCycles = 0, interpCycles = 0, compiledNs = 0, interpNs = 0, primeCount = 0;
++        uint64_t verifyCompared = 0, verifyMismatch = 0, verifySkipped = 0, verifyRefused = 0;
++        uint64_t windowStartVsync = 0;
++        std::chrono::steady_clock::time_point windowStart{};
++        uint64_t wCalls = 0, wCompiledOk = 0, wFallback = 0, wInterp = 0, wCompiledNs = 0, wInterpNs = 0, wCycles = 0;
++        uint64_t wSubmitNs = 0; // PATH1 submission (GIF/GS processing) of compiled calls, outside wCompiledNs
++
++        uint64_t p1Packets = 0, p1Hash = 1469598103934665603ull, p1Block = 0;
++        uint64_t traceCalls = 0;
++        bool verifyStrict = false;
++        std::string firstMismatch; // detail of the first verify divergence (kept for reports and tests)
++        // Strict-mode failure handler; null = report and terminate. Tests install their own handler.
++        void (*strictFailure)(const std::string &detail) = nullptr;
++        std::set<std::tuple<uint64_t, uint32_t, uint32_t>> reportedUncompiled;
++        uint64_t traceOutPath1 = 0; // FNV of the PATH1 packets of the current call
++    };
++
++    inline Dispatcher &d()
++    {
++        static Dispatcher instance;
++        return instance;
++    }
++
++    inline uint64_t fnv(const uint8_t *p, size_t n, uint64_t h = 1469598103934665603ull)
++    {
++        for (size_t i = 0; i < n; ++i)
++        {
++            h ^= p[i];
++            h *= 1099511628211ull;
++        }
++        return h;
++    }
++
++    inline uint32_t floatBitsOf(float f)
++    {
++        uint32_t b;
++        std::memcpy(&b, &f, 4);
++        return b;
++    }
++
++    // Architectural VU1 state hash (cycles excluded: they are traced as a delta).
++    inline uint64_t stateHash(const VU1State &st)
++    {
++        uint64_t h = fnv(reinterpret_cast<const uint8_t *>(st.vf), sizeof(st.vf));
++        h = fnv(reinterpret_cast<const uint8_t *>(st.vi), sizeof(st.vi), h);
++        h = fnv(reinterpret_cast<const uint8_t *>(st.acc), sizeof(st.acc), h);
++        const uint32_t words[] = {floatBitsOf(st.q), floatBitsOf(st.p), floatBitsOf(st.i), st.r, st.pc, st.mac,
++                                  st.clip, st.status, st.top, st.itop, st.branchTarget, st.branchDelay,
++                                  static_cast<uint32_t>(st.ebit) | (static_cast<uint32_t>(st.haltAfterDelaySlot) << 1) |
++                                      (static_cast<uint32_t>(st.stoppedByD) << 2) | (static_cast<uint32_t>(st.stoppedByT) << 3) |
++                                      (static_cast<uint32_t>(st.branchPending) << 4) | (static_cast<uint32_t>(st.dBitEnabled) << 5) |
++                                      (static_cast<uint32_t>(st.tBitEnabled) << 6)};
++        return fnv(reinterpret_cast<const uint8_t *>(words), sizeof(words), h);
++    }
++
++    inline bool init()
++    {
++        Dispatcher &s = d();
++        if (s.initialized)
++            return s.mode != Mode::Off;
++        s.initialized = true;
++        const char *m = std::getenv("PS2X_VU1_NATIVE");
++        if (!m || !*m)
++            return false;
++        const std::string v = m;
++        s.mode = v == "native" ? Mode::Native : v == "verify" ? Mode::Verify : Mode::Interpreter;
++        const char *h = std::getenv("PS2X_VU1_PATH1_HASH");
++        s.path1Hash = h && h[0] == '1';
++        if (const char *p = std::getenv("PS2X_VU1_STATS_SEC"))
++            s.statsPeriod = std::max(0.5, std::atof(p));
++        if (const char *t = std::getenv("PS2X_VU1_TRACE_CALLS"))
++            s.traceCalls = std::strtoull(t, nullptr, 0);
++        const char *strict = std::getenv("PS2X_VU1_VERIFY_STRICT");
++        s.verifyStrict = strict && strict[0] == '1';
++        if (s.traceCalls)
++            s.path1Hash = true; // packets must be collected in every mode to be traced
++        s.windowStart = std::chrono::steady_clock::now();
++        std::cerr << "[VU1:dispatch] mode=" << v << " compiled_entries=" << vu1c::registry().size()
++                  << " path1Hash=" << s.path1Hash << std::endl;
++        return true;
++    }
++
++    inline void hashPacket(const uint8_t *data, uint32_t size, uint64_t vsync)
++    {
++        Dispatcher &s = d();
++        if (s.traceCalls)
++            s.traceOutPath1 = fnv(data, size, fnv(reinterpret_cast<const uint8_t *>(&size), sizeof(size), s.traceOutPath1));
++        if (!s.path1Hash)
++            return;
++        s.p1Hash = fnv(reinterpret_cast<const uint8_t *>(&size), sizeof(size), s.p1Hash);
++        s.p1Hash = fnv(data, size, s.p1Hash);
++        if (++s.p1Packets % 1000u == 0u)
++        {
++            std::cerr << "[VU1:path1] block=" << s.p1Block++ << " packets=" << s.p1Packets << " hash=0x" << std::hex
++                      << s.p1Hash << std::dec << " vsync=" << vsync << std::endl;
++            s.p1Hash = 1469598103934665603ull;
++        }
++    }
++
++    inline void onInterpreterPath1(const uint8_t *data, uint32_t size)
++    {
++        d().interpPackets.emplace_back(data, data + size);
++    }
++
++    inline void maybeLogStats(uint64_t vsync)
++    {
++        Dispatcher &s = d();
++        const auto now = std::chrono::steady_clock::now();
++        const double sec = std::chrono::duration<double>(now - s.windowStart).count();
++        if (sec < s.statsPeriod)
++            return;
++        const uint64_t vs = vsync - s.windowStartVsync;
++        std::cerr << "[VU1:dispatch] vsync=" << vsync << " window=" << sec << "s vsyncs=" << vs << " vsyncPerSec=" << (vs / sec)
++                  << " calls=" << s.wCalls << " compiledOk=" << s.wCompiledOk << " fallback=" << s.wFallback
++                  << " interp=" << s.wInterp << " cycles=" << s.wCycles
++                  << " vu1HostMs=" << (s.wCompiledNs + s.wInterpNs) / 1e6
++                  << " vu1HostMsPerVsync=" << (vs ? (s.wCompiledNs + s.wInterpNs) / 1e6 / vs : 0.0)
++                  << " hostMsPerVsync=" << (vs ? sec * 1000.0 / vs : 0.0)
++                  << " path1SubmitMsPerVsync=" << (vs ? s.wSubmitNs / 1e6 / vs : 0.0)
++                  << " totals{calls=" << s.calls << " compiledOk=" << s.compiledOk << " interp=" << s.interpCalls
++                  << " noProgram=" << s.noProgram << " chainBlocked=" << s.chainBlocked
++                  << " budget=" << s.fallback[vu1c::Budget] << " fault=" << s.fallback[vu1c::Fault]
++                  << " precondition=" << s.fallback[vu1c::Precondition] << " unsupported=" << s.fallback[vu1c::UnsupportedEntry]
++                  << " primes=" << s.primeCount << " verifyCompared=" << s.verifyCompared
++                  << " verifyMismatch=" << s.verifyMismatch << " verifySkipped=" << s.verifySkipped
++                  << " verifyRefused=" << s.verifyRefused << "}" << std::endl;
++        s.windowStart = now;
++        s.windowStartVsync = vsync;
++        s.wCalls = s.wCompiledOk = s.wFallback = s.wInterp = s.wCompiledNs = s.wInterpNs = s.wCycles = 0;
++        s.wSubmitNs = 0;
++    }
++
++    inline std::string diffState(const VU1State &a, const VU1State &b, uint64_t cyclesA, uint64_t cyclesB)
++    {
++        std::string out;
++        auto add = [&out](const std::string &f)
++        { out += (out.empty() ? "" : " ") + f; };
++        for (int r = 0; r < 32; ++r)
++            if (std::memcmp(a.vf[r], b.vf[r], 16) != 0)
++                add("vf" + std::to_string(r));
++        for (int r = 0; r < 16; ++r)
++            if (a.vi[r] != b.vi[r])
++                add("vi" + std::to_string(r));
++        if (std::memcmp(a.acc, b.acc, 16) != 0)
++            add("acc");
++        if (std::memcmp(&a.q, &b.q, 4) != 0)
++            add("q");
++        if (std::memcmp(&a.p, &b.p, 4) != 0)
++            add("p");
++        if (std::memcmp(&a.i, &b.i, 4) != 0)
++            add("i");
++        if (a.r != b.r)
++            add("r");
++        if (a.pc != b.pc)
++            add("pc");
++        if (a.mac != b.mac)
++            add("mac");
++        if (a.status != b.status)
++            add("status");
++        if (a.clip != b.clip)
++            add("clip");
++        if (cyclesA != cyclesB)
++            add("cycles(" + std::to_string(cyclesA) + " vs " + std::to_string(cyclesB) + ")");
++        if (a.ebit != b.ebit || a.haltAfterDelaySlot != b.haltAfterDelaySlot)
++            add("ebit/halt");
++        if (a.dBitEnabled != b.dBitEnabled)
++            add("dBitEnabled");
++        if (a.tBitEnabled != b.tBitEnabled)
++            add("tBitEnabled");
++        if (a.stoppedByD != b.stoppedByD || a.stoppedByT != b.stoppedByT)
++            add("stoppedByD/T");
++        if (a.top != b.top || a.itop != b.itop)
++            add("top/itop");
++        if (a.branchPending != b.branchPending || a.branchTarget != b.branchTarget || a.branchDelay != b.branchDelay)
++            add("branch");
++        return out;
++    }
++}
++
++namespace vu1native
++{
++    // Records a verify divergence; in strict mode the first one stops the process (or calls the
++    // installed handler) after it has been reported.
++    inline void reportVerifyMismatch(const std::string &detail)
++    {
++        Dispatcher &s = d();
++        ++s.verifyMismatch;
++        if (s.firstMismatch.empty())
++            s.firstMismatch = detail;
++        if (s.verifyMismatch <= 20u || s.verifyStrict)
++            std::cerr << "[VU1:verify] MISMATCH " << detail << std::endl;
++        if (!s.verifyStrict)
++            return;
++        if (s.strictFailure)
++        {
++            s.strictFailure(detail);
++            return;
++        }
++        std::cerr << "[VU1:verify] FATAL: PS2X_VU1_VERIFY_STRICT=1, stopping at the first divergence" << std::endl;
++        std::cerr.flush();
++        std::fflush(nullptr);
++        std::_Exit(3);
++    }
++}
++
++// One MSCAL (kind 0) or MSCNT (kind 1) call. Returns false when the dispatcher is disabled, in which
++// case the caller runs its original code path.
++inline bool PS2Runtime_vu1DispatchCall(VU1Interpreter &vu1, PS2Memory &memory, GS &gs, uint32_t kind,
++                                uint32_t startPC, uint32_t top, uint32_t itop, uint64_t vsync)
++{
++    using namespace vu1native;
++    if (!init())
++        return false;
++    Dispatcher &s = d();
++    constexpr uint32_t kMaxCycles = 65536u;
++    using clk = std::chrono::steady_clock;
++    VU1State &st = vu1.state();
++
++    const uint64_t generation = memory.getVU1CodeGeneration();
++    if (generation != s.lastGeneration)
++    {
++        s.lastGeneration = generation;
++        s.codeHash = fnv(memory.getVU1Code(), PS2_VU1_CODE_SIZE);
++    }
++    const uint32_t entry = kind == 0 ? (startPC & 0x3FFFu) : st.pc;
++    const vu1c::Program *prog = vu1c::lookup(s.codeHash, kind, entry);
++    ++s.calls;
++    ++s.wCalls;
++    if (!prog)
++    {
++        ++s.noProgram;
++        if (s.reportedUncompiled.insert({s.codeHash, kind, entry}).second)
++            std::cerr << "[VU1:dispatch] uncompiled image=0x" << std::hex << s.codeHash << " kind=" << std::dec << kind
++                      << " entry=0x" << std::hex << entry << std::dec << " vsync=" << vsync << " generation=" << generation
++                      << std::endl;
++    }
++    const bool tracing = s.calls <= s.traceCalls;
++    uint64_t inState = 0, inData = 0, lastDelta = 0;
++    if (tracing)
++    {
++        inState = stateHash(st);
++        inData = fnv(memory.getVU1Data(), PS2_VU1_DATA_SIZE);
++        s.traceOutPath1 = 1469598103934665603ull;
++    }
++    auto traceEnd = [&](const char *how)
++    {
++        if (!tracing)
++            return;
++        std::cerr << "[VU1:trace] i=" << s.calls << " vsync=" << vsync << " kind=" << kind << " entry=0x" << std::hex
++                  << entry << " in=" << inState << "/" << inData << " out=" << stateHash(st) << "/"
++                  << fnv(memory.getVU1Data(), PS2_VU1_DATA_SIZE) << " path1=" << s.traceOutPath1 << std::dec
++                  << " cycles=" << lastDelta << " via=" << how << std::endl;
++    };
++
++    auto runInterpreter = [&](bool collectPackets)
++    {
++        if (kind == 1 && s.interpreterStale)
++        {
++            const VU1State saved = st;
++            vu1.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE, gs, &memory,
++                        0u, top, itop, 0u);
++            st = saved;
++            ++s.primeCount;
++        }
++        s.interpreterStale = false;
++        if (collectPackets)
++        {
++            s.interpPackets.clear();
++            g_ps2xPath1Observer = &onInterpreterPath1;
++        }
++        const auto t0 = clk::now();
++        if (kind == 0)
++            vu1.execute(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE, gs, &memory,
++                        startPC, top, itop, kMaxCycles);
++        else
++            vu1.resume(memory.getVU1Code(), PS2_VU1_CODE_SIZE, memory.getVU1Data(), PS2_VU1_DATA_SIZE, gs, &memory,
++                       top, itop, kMaxCycles);
++        const auto t1 = clk::now();
++        if (collectPackets)
++            g_ps2xPath1Observer = nullptr;
++        // run() leaves the interpreter's private counter in state.cycles; restore the virtual count.
++        const uint64_t privateCycles = st.cycles;
++        const uint64_t delta = privateCycles - s.lastPrivate;
++        s.lastPrivate = privateCycles;
++        st.cycles = privateCycles + s.cycleOffset;
++        const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
++        s.interpNs += ns;
++        s.wInterpNs += ns;
++        s.interpCycles += delta;
++        s.wCycles += delta;
++        ++s.interpCalls;
++        ++s.wInterp;
++        s.prevCompiledOk = false;
++        s.prevInterpreterClean = delta < kMaxCycles && !st.stoppedByD && !st.stoppedByT;
++        lastDelta = delta;
++        return delta;
++    };
++
++    if (s.mode == Mode::Native && prog && (kind == 0 || s.prevCompiledOk))
++    {
++        const VU1State snapshot = st;
++        std::memcpy(s.dataSnapshot.data(), memory.getVU1Data(), PS2_VU1_DATA_SIZE);
++        s.heldPackets.clear();
++        vu1c::Ctx ctx;
++        ctx.st = &st;
++        ctx.data = memory.getVU1Data();
++        ctx.dataSize = PS2_VU1_DATA_SIZE;
++        ctx.kind = kind;
++        ctx.startPC = startPC;
++        ctx.top = top;
++        ctx.itop = itop;
++        ctx.maxCycles = kMaxCycles;
++        ctx.packet = s.packetScratch.data();
++        ctx.sinkUser = &s.heldPackets;
++        ctx.sink = [](void *user, const uint8_t *data, uint32_t size)
++        {
++            auto &held = *static_cast<std::vector<uint8_t> *>(user);
++            const uint8_t *sz = reinterpret_cast<const uint8_t *>(&size);
++            held.insert(held.end(), sz, sz + sizeof(size));
++            held.insert(held.end(), data, data + size);
++        };
++        const auto t0 = clk::now();
++        const int r = prog->fn(ctx);
++        const auto t1 = clk::now();
++        const uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
++        if (r == vu1c::Ok)
++        {
++            const auto ts0 = clk::now();
++            for (size_t off = 0; off < s.heldPackets.size();)
++            {
++                uint32_t size = 0;
++                std::memcpy(&size, s.heldPackets.data() + off, sizeof(size));
++                const uint8_t *data = s.heldPackets.data() + off + sizeof(size);
++                memory.submitGifPacket(GifPathId::Path1, data, size);
++                hashPacket(data, size, vsync);
++                off += sizeof(size) + size;
++            }
++            s.wSubmitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - ts0).count();
++            const uint64_t delta = st.cycles - snapshot.cycles;
++            s.cycleOffset += delta;
++            s.interpreterStale = true;
++            s.prevCompiledOk = true;
++            ++s.compiledOk;
++            ++s.wCompiledOk;
++            s.compiledNs += ns;
++            s.wCompiledNs += ns;
++            s.compiledCycles += delta;
++            s.wCycles += delta;
++            lastDelta = delta;
++            traceEnd("compiled");
++            maybeLogStats(vsync);
++            return true;
++        }
++        // rollback: architectural state, data memory, held PATH1 packets
++        st = snapshot;
++        std::memcpy(memory.getVU1Data(), s.dataSnapshot.data(), PS2_VU1_DATA_SIZE);
++        s.heldPackets.clear();
++        ++s.fallback[r & 7];
++        ++s.wFallback;
++        s.compiledNs += ns;
++        s.wCompiledNs += ns;
++    }
++    else if (s.mode == Mode::Native && prog)
++        ++s.chainBlocked;
++
++    if (s.mode == Mode::Verify && prog)
++    {
++        if (kind == 1 && !s.prevInterpreterClean)
++        {
++            ++s.verifySkipped;
++            runInterpreter(s.path1Hash);
++        }
++        else
++        {
++            VU1State cst = st;
++            std::memcpy(s.scratchData.data(), memory.getVU1Data(), PS2_VU1_DATA_SIZE);
++            s.heldPackets.clear();
++            vu1c::Ctx ctx;
++            ctx.st = &cst;
++            ctx.data = s.scratchData.data();
++            ctx.dataSize = PS2_VU1_DATA_SIZE;
++            ctx.kind = kind;
++            ctx.startPC = startPC;
++            ctx.top = top;
++            ctx.itop = itop;
++            ctx.maxCycles = kMaxCycles;
++            ctx.packet = s.packetScratch.data();
++            std::vector<std::vector<uint8_t>> compiledPackets;
++            ctx.sinkUser = &compiledPackets;
++            ctx.sink = [](void *user, const uint8_t *data, uint32_t size)
++            { static_cast<std::vector<std::vector<uint8_t>> *>(user)->emplace_back(data, data + size); };
++            const uint64_t before = st.cycles;
++            const int r = prog->fn(ctx);
++            const uint64_t delta = runInterpreter(true);
++            if (r != vu1c::Ok)
++            {
++                ++s.verifyRefused;
++                if (delta < kMaxCycles && r != vu1c::Fault)
++                {
++                    std::ostringstream detail;
++                    detail << "vsync=" << vsync << " entry=0x" << std::hex << entry << std::dec << " kind=" << kind
++                           << ": compiled refused (" << r << ") but the interpreter finished";
++                    reportVerifyMismatch(detail.str());
++                }
++            }
++            else
++            {
++                ++s.verifyCompared;
++                std::string diff = diffState(st, cst, delta, cst.cycles - before);
++                if (std::memcmp(s.scratchData.data(), memory.getVU1Data(), PS2_VU1_DATA_SIZE) != 0)
++                    diff += " data";
++                if (compiledPackets != s.interpPackets)
++                    diff += " path1(" + std::to_string(s.interpPackets.size()) + " vs " + std::to_string(compiledPackets.size()) + ")";
++                if (!diff.empty())
++                {
++                    std::ostringstream detail;
++                    detail << "vsync=" << vsync << " entry=0x" << std::hex << entry << std::dec << " kind=" << kind << ":"
++                           << (diff[0] == ' ' ? "" : " ") << diff;
++                    reportVerifyMismatch(detail.str());
++                }
++            }
++            for (const auto &pk : s.interpPackets)
++                hashPacket(pk.data(), static_cast<uint32_t>(pk.size()), vsync);
++        }
++        traceEnd("verify-interp");
++        maybeLogStats(vsync);
++        return true;
++    }
++
++    runInterpreter(s.path1Hash);
++    if (s.path1Hash)
++        for (const auto &pk : s.interpPackets)
++            hashPacket(pk.data(), static_cast<uint32_t>(pk.size()), vsync);
++    traceEnd("interp");
++    maybeLogStats(vsync);
++    return true;
++}
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_native.h b/ps2xRuntime/src/lib/vu/ps2_vu1_native.h
+new file mode 100644
+index 0000000..381e194
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_native.h
+@@ -0,0 +1,362 @@
++// GAMEPLAY_001K: runtime support for VU1 microprograms compiled ahead of time
++// (generator: dmc-recomp tools/vu1_replay/gen_vu1c.py). Generic: no game data.
++//
++// The generated code must reproduce PS2Recomp's VU1Interpreter bit for bit (values, MAC/status/clip,
++// Q, VI, data memory, cycle count and PATH1 packets). The helpers below mirror the interpreter's own
++// rules (ps2_vu1_core.cpp / ps2_vu1_upper.cpp / ps2_vu1_lower.cpp); they are a re-expression of those
++// rules, not new semantics. Values are written in program order: the interpreter interlocks every
++// declared VF/VI/ACC read, so a read always observes the latest earlier write. Only the resources the
++// interpreter does not interlock are modelled with timing: Q (FDIV), clip flags, MAC/status (final
++// value), the branch-VI backup, stores versus the in-flight XGKICK, and the end-of-program flush.
++#pragma once
++
++#include "runtime/ps2_vu1.h"
++
++#include <algorithm>
++#include <cfenv>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <vector>
++
++namespace vu1c
++{
++    enum Result : int
++    {
++        Ok = 0,
++        UnsupportedEntry = 1, // entry PC not compiled: run the interpreter
++        Precondition = 2,     // state the compiled code cannot continue from (pending branch/E/halt)
++        Budget = 3,           // would reach the caller's cycle budget: discard, run the interpreter
++        Fault = 4             // XGKICK packet error the interpreter reports as reserved: discard
++    };
++
++    using Path1Sink = void (*)(void *user, const uint8_t *data, uint32_t size);
++
++    struct Ctx
++    {
++        VU1State *st = nullptr; // in/out architectural state
++        uint8_t *data = nullptr; // VU1 data memory (in/out)
++        uint32_t dataSize = 0;
++        uint32_t kind = 0; // 0 = MSCAL execute(startPC), 1 = MSCNT resume
++        uint32_t startPC = 0, top = 0, itop = 0;
++        uint32_t maxCycles = 65536;
++        Path1Sink sink = nullptr;
++        void *sinkUser = nullptr;
++        uint8_t *packet = nullptr; // scratch, >= 64 KiB
++    };
++
++    using ProgramFn = int (*)(Ctx &);
++
++    struct Program
++    {
++        uint64_t codeHash;
++        uint32_t kind;
++        uint32_t entryPc;
++        ProgramFn fn;
++    };
++
++    // Generated translation units register their programs at static-initialisation time.
++    inline std::vector<Program> &registry()
++    {
++        static std::vector<Program> programs;
++        return programs;
++    }
++
++    struct Registrar
++    {
++        Registrar(const Program *programs, size_t count) { registry().insert(registry().end(), programs, programs + count); }
++    };
++
++    inline const Program *lookup(uint64_t codeHash, uint32_t kind, uint32_t entryPc)
++    {
++        for (const Program &p : registry())
++            if (p.codeHash == codeHash && p.kind == kind && p.entryPc == entryPc)
++                return &p;
++        return nullptr;
++    }
++
++    inline float bitsToFloat(uint32_t b)
++    {
++        float f;
++        std::memcpy(&f, &b, 4);
++        return f;
++    }
++
++    inline uint32_t floatToBits(float f)
++    {
++        uint32_t b;
++        std::memcpy(&b, &f, 4);
++        return b;
++    }
++
++    // VU1Interpreter::normalizeOperand
++    inline float nrm(float value)
++    {
++        uint32_t bits = floatToBits(value);
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (exponent == 0u)
++            bits &= 0x80000000u;
++        else if (exponent == 0xFFu)
++            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++        return bitsToFloat(bits);
++    }
++
++    // VU1Interpreter::normalizeResult (flags discarded by all callers used here)
++    inline float nrmResult(float value)
++    {
++        uint32_t bits = floatToBits(value);
++        const uint32_t sign = bits & 0x80000000u;
++        const uint32_t magnitude = bits & 0x7FFFFFFFu;
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (magnitude != 0u)
++        {
++            if (exponent == 0u)
++                bits = sign;
++            else if (exponent == 0xFFu)
++                bits = sign | 0x7F7FFFFFu;
++        }
++        return bitsToFloat(bits);
++    }
++
++    // VU1Interpreter::normalizeFmacExactResult: returns Z=1 S=2 U=4 O=8 and fixes the value.
++    inline uint32_t exactFlags(float &value, long double exact)
++    {
++        const bool negative = std::signbit(exact);
++        const long double magnitude = std::fabs(exact);
++        uint32_t flags = negative ? 0x2u : 0u;
++        const uint32_t bits = negative ? 0x80000000u : 0u;
++        if (magnitude == 0.0L)
++        {
++            flags |= 0x1u;
++            value = bitsToFloat(bits);
++        }
++        else if (magnitude > static_cast<long double>(std::numeric_limits<float>::max()))
++        {
++            flags |= 0x8u;
++            value = bitsToFloat(bits | 0x7F7FFFFFu);
++        }
++        else if (magnitude < static_cast<long double>(std::numeric_limits<float>::min()))
++        {
++            flags |= 0x5u;
++            value = bitsToFloat(bits);
++        }
++        return flags;
++    }
++
++    // Product condition of product-sum instructions (VU1Interpreter::calculateFmacProductSticky).
++    inline uint32_t productSticky(float left, float right)
++    {
++        float product = left * right;
++        return exactFlags(product, static_cast<long double>(left) * static_cast<long double>(right)) & 0xFu;
++    }
++
++    // vuFloatToInt (ps2_vu1_upper.cpp)
++    inline int32_t floatToInt(float value, float scale)
++    {
++        const double scaled = static_cast<double>(value) * static_cast<double>(scale);
++        if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
++            return std::numeric_limits<int32_t>::max();
++        if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
++            return std::numeric_limits<int32_t>::min();
++        return static_cast<int32_t>(scaled);
++    }
++
++    inline bool clipExceeds(float value, uint32_t signMask, int32_t limit)
++    {
++        uint32_t bits = floatToBits(value) ^ signMask;
++        int32_t ordered;
++        std::memcpy(&ordered, &bits, 4);
++        return ordered > limit;
++    }
++
++    // MAC/status contributed by one FMAC issue (VU1Interpreter::updateFmacFlags). Only the final
++    // value is architectural for the compiled paths (they contain no MAC/status reader), so the
++    // generated code keeps the last MAC, the last current status and the OR of sticky conditions.
++    struct FmacFlags
++    {
++        uint32_t lastMac = 0, lastCur = 0, sticky = 0;
++        bool any = false;
++
++        inline void issue(uint32_t mac, uint32_t cur, uint32_t extra)
++        {
++            lastMac = mac;
++            lastCur = cur;
++            sticky |= cur | extra;
++            any = true;
++        }
++    };
++
++    inline uint32_t macBits(uint32_t lane, uint32_t f)
++    {
++        uint32_t m = 0;
++        if (f & 1u) m |= lane;
++        if (f & 2u) m |= lane << 4;
++        if (f & 4u) m |= lane << 8;
++        if (f & 8u) m |= lane << 12;
++        return m;
++    }
++
++    // Q (FDIV) result pipeline: one entry, committed at its ready cycle.
++    struct Fdiv
++    {
++        bool valid = false;
++        uint64_t ready = 0;
++        float value = 0.0f;
++        uint32_t di = 0;
++    };
++
++    // Clip flag pipeline (FIFO; every clip entry has the same 4-cycle latency).
++    struct ClipQueue
++    {
++        uint64_t ready[8]{};
++        uint32_t value[8]{};
++        uint32_t head = 0, count = 0;
++
++        inline bool push(uint64_t r, uint32_t v)
++        {
++            if (count == 8u)
++                return false;
++            const uint32_t slot = (head + count) & 7u;
++            ready[slot] = r;
++            value[slot] = v;
++            ++count;
++            return true;
++        }
++
++        inline void commit(uint64_t cycle, uint32_t &clip)
++        {
++            while (count && ready[head] <= cycle)
++            {
++                clip = value[head];
++                head = (head + 1u) & 7u;
++                --count;
++            }
++        }
++    };
++
++    // PATH1 transfer started by XGKICK (VU1Interpreter::startXgkick/progressXgkick/finishXgkick),
++    // advanced lazily: progress for cycle c happens before stores issued at cycle c become visible.
++    struct Xgkick
++    {
++        static constexpr uint32_t kBufferSize = 0x10000u;
++        bool active = false;
++        bool eop = false;
++        bool fault = false;
++        uint32_t source = 0, copied = 0, tagEnd = 0, total = 0, credit = 0;
++        uint64_t lastCycle = 0;
++
++        inline void start(uint32_t qwordAddress, uint64_t cycle, uint32_t dataSize)
++        {
++            active = true;
++            eop = false;
++            source = (qwordAddress * 16u) % dataSize;
++            copied = 0;
++            tagEnd = 0;
++            total = 0;
++            credit = 1u;
++            lastCycle = cycle;
++        }
++
++        inline void step(Ctx &c)
++        {
++            ++credit;
++            while (active && credit >= 2u)
++            {
++                credit -= 2u;
++                if (copied > kBufferSize - 16u)
++                {
++                    fault = true;
++                    active = false;
++                    return;
++                }
++                const uint32_t qwordOffset = copied;
++                for (uint32_t i = 0; i < 16u; ++i)
++                    c.packet[copied + i] = c.data[(source + copied + i) % c.dataSize];
++                copied += 16u;
++                if (tagEnd == 0u)
++                {
++                    uint64_t tagLo = 0;
++                    std::memcpy(&tagLo, c.packet + qwordOffset, sizeof(tagLo));
++                    const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++                    const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
++                    uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
++                    if (nreg == 0u)
++                        nreg = 16u;
++                    uint64_t tagBytes = 16u;
++                    if (format == 0u)
++                        tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
++                    else if (format == 1u)
++                        tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
++                    else if (format == 2u)
++                        tagBytes += static_cast<uint64_t>(nloop) * 16u;
++                    else
++                    {
++                        fault = true;
++                        active = false;
++                        return;
++                    }
++                    if (tagBytes > kBufferSize - qwordOffset)
++                    {
++                        fault = true;
++                        active = false;
++                        return;
++                    }
++                    tagEnd = qwordOffset + static_cast<uint32_t>(tagBytes);
++                    eop = ((tagLo >> 15) & 1u) != 0u;
++                    if (eop)
++                        total = tagEnd;
++                }
++                if (copied >= tagEnd)
++                {
++                    if (eop)
++                    {
++                        if (c.sink)
++                            c.sink(c.sinkUser, c.packet, total);
++                        active = false;
++                    }
++                    else
++                    {
++                        tagEnd = 0u;
++                        eop = false;
++                    }
++                }
++            }
++        }
++
++        // Run every per-cycle progress step up to and including `cycle`.
++        inline void advance(Ctx &c, uint64_t cycle)
++        {
++            while (active && lastCycle < cycle)
++            {
++                ++lastCycle;
++                step(c);
++            }
++            if (!active && lastCycle < cycle)
++                lastCycle = cycle;
++        }
++
++        // Drain at program end; returns the cycle in which the transfer finished.
++        inline uint64_t drain(Ctx &c)
++        {
++            while (active)
++            {
++                ++lastCycle;
++                step(c);
++            }
++            return lastCycle;
++        }
++    };
++
++    struct RoundingScope
++    {
++        int previous;
++        bool changed;
++        RoundingScope() : previous(std::fegetround()), changed(std::fesetround(FE_TOWARDZERO) == 0) {}
++        ~RoundingScope()
++        {
++            if (changed && previous != -1)
++                std::fesetround(previous);
++        }
++    };
++}

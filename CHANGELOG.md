@@ -8,6 +8,26 @@ recompiled game code, binaries built from it, checkpoints, memory dumps or
 any other material derived from the game. You need your own legally obtained
 copy of the game to build and run anything.
 
+## [Unreleased] — GAMEPLAY_001K (under review)
+
+### Added
+
+- Optional VU1 programs compiled ahead of time, generated locally from the
+  user's own ELF (`tools/vu1_replay/make_vu1c.py`; nothing derived from the
+  game is distributed). Runtime patch
+  `GAMEPLAY_001K_vu1_native_dispatch.patch`: `PS2X_VU1_NATIVE` =
+  `interpreter` / `native` (with full rollback and interpreter fallback) /
+  `verify` (call-by-call comparison). Unset keeps the original behaviour.
+- `tools/vu1_replay/`: generator, offline VU1 bench, differential fuzzing and
+  dispatcher integration tests.
+
+### Measured
+
+- Post-intro office scene, Release, same emulated window: 3.29 → 12.48
+  VSync/s with compiled programs; VU1 host time per VSync 280.9 → 25.6 ms.
+  Verify mode: hundreds of thousands of calls compared in game, zero
+  differences. Still **NOT PLAYABLE**; the `sceDmaRecvI` blocker is unchanged.
+
 ## [v0.1.0-alpha] — 2026-10-15 — NOT PLAYABLE
 
 First public pre-release. It packages the research and runtime work done so
