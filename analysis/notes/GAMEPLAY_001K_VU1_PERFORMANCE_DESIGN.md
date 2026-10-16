@@ -590,14 +590,15 @@ oficina.
   `G001K_VENDOR_CHANGES_INTEGRATION.diff`), junto con las capturas.
 - El banco sigue leyendo esas capturas locales.
 
-**Parche 19** `patches/GAMEPLAY_001K_vu1_native_dispatch.patch` (sha256 `9100fbb6…1dec`), contra el estado de los 18
+**Parche 19** `patches/GAMEPLAY_001K_vu1_native_dispatch.patch` (sha256 `9100fbb6…1dec` en el cierre; sustituido en §12.5), contra el estado de los 18
 parches:
 
 - `vu/ps2_vu1_native.h` y `ps2_vu1_native_dispatch.inc`, nuevos;
 - `ps2_runtime.cpp`: el despachador en los callbacks `MSCAL`/`MSCNT`;
 - `ps2_memory.cpp`: un observador PATH1 opcional (`g_ps2xPath1Observer`) que sustituye al gancho de captura;
 - todo en ASCII;
-- `upstream.lock.json`: 19 parches, `patched_commit` `f6a23de9bd0eb60bb11ec5dbba8162fc7104c9b7`.
+- `upstream.lock.json`: 19 parches, `patched_commit` `f6a23de9bd0eb60bb11ec5dbba8162fc7104c9b7` en el cierre (actual:
+  `912b1c23…`, §12.5).
 
 **Herramientas del proyecto:** `tools/vu1_replay/` (generador, banco, `make_vu1c.py` y su manifiesto). Ver su README.
 
@@ -694,3 +695,36 @@ Después basta un build incremental.
 7. **Captura retirada:** generar un corpus nuevo exige reaplicar el diff local de captura.
 8. **Rendimiento:** ~12,5 VSync/s en la oficina, lejos de 50. El GS por software (~31 ms por VSync) es ahora el mayor
    coste. El juego sigue **NOT PLAYABLE** y el bloqueo `sceDmaRecvI` no cambia.
+
+### 12.5 Ajustes de la revisión del PR #4 (2026-10-16)
+
+**1. Comparación de `dBitEnabled` y `tBitEnabled` en Verify**
+
+- **Defecto:** `diffState()` del despachador no comparaba `dBitEnabled` ni `tBitEnabled`, así que Verify no cubría todo
+  `VU1State`.
+- **Corrección:** ahora se comparan.
+
+**2. Modo estricto `PS2X_VU1_VERIFY_STRICT=1`**
+
+- Tras informar de la primera divergencia, imprime `[VU1:verify] FATAL` y termina el proceso con código 3.
+- Sin la variable, Verify mantiene el comportamiento anterior: registra y continúa.
+- El fallo pasa por un manejador sustituible (`Dispatcher::strictFailure`) para poder probarlo; el detalle de la primera
+  divergencia queda en `Dispatcher::firstMismatch`.
+
+**Pruebas aisladas** (`vu1_replay --dispatch-tests 1`; T1–T9 sobre 3 779 muestras, 0 fallos):
+
+| Prueba | Qué comprueba |
+|---|---|
+| T6 | alterar solo `dBitEnabled` se detecta como exactamente `dBitEnabled` |
+| T7 | alterar solo `tBitEnabled` se detecta como exactamente `tBitEnabled` |
+| T8 | en modo estricto, una divergencia inyectada en `vf5` llama al manejador una sola vez con ese detalle, y el resultado autoritativo del intérprete queda intacto |
+| T9 | en modo estricto sin divergencia, no se llama al manejador |
+
+- **Terminación real:** con el manejador por defecto (`--strict-exit 1`), el proceso termina con código 3 tras imprimir
+  la discrepancia y la línea `FATAL`.
+
+**Reproducibilidad:**
+
+- Parche 19 regenerado (sha256 `90372be1…`).
+- Replay de 19 parches → `912b1c23ac1f1984e93a930d620fd02ac873b100`; el vendor coincide.
+- Build incremental del juego: solo `ps2_runtime.cpp`.

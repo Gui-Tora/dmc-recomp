@@ -78,7 +78,7 @@
     },
     {
       "path": "patches/GAMEPLAY_001K_vu1_native_dispatch.patch",
-      "sha256": "9100fbb671c98ec366ce2f91db10c9a554a2a03d81856ab202db76f3cdb81dec"
+      "sha256": "90372be185def27afd0a3816e6b4d485ef20aacaa932ee08fd0271d7c265a5a2"
     }
   ],
   "patch_identity": {
@@ -87,5 +87,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "f6a23de9bd0eb60bb11ec5dbba8162fc7104c9b7"
+  "patched_commit": "912b1c23ac1f1984e93a930d620fd02ac873b100"
 }

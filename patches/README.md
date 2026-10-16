@@ -423,9 +423,11 @@ arriba). Los diecinueve patches actualmente activos:
     - `ps2_vu1_native_dispatch.inc`, incluido solo por `ps2_runtime.cpp`:
       despachador de `MSCAL`/`MSCNT`. `PS2X_VU1_NATIVE` sin definir mantiene la
       ruta original; `interpreter`, `native` y `verify` (el intérprete es
-      autoritativo y el código compilado se compara campo a campo).
-      Diagnóstico opcional: `PS2X_VU1_PATH1_HASH`, `PS2X_VU1_STATS_SEC` y
-      `PS2X_VU1_TRACE_CALLS`.
+      autoritativo y el código compilado se compara campo a campo, todo
+      `VU1State` incluido). `PS2X_VU1_VERIFY_STRICT=1` detiene el proceso
+      (código de salida 3) tras informar de la primera divergencia; sin él,
+      Verify registra y continúa. Diagnóstico opcional: `PS2X_VU1_PATH1_HASH`,
+      `PS2X_VU1_STATS_SEC` y `PS2X_VU1_TRACE_CALLS`.
     - Rollback completo (estado, memoria de datos y PATH1 retenido) ante
       `Budget`/`Fault`/rechazo; reinicio del planificador del intérprete antes
       de que continúe tras una llamada compilada; offset de ciclos para que

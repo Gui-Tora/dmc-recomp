@@ -206,6 +206,7 @@ int main(int argc, char **argv)
     bool profile = false;
     bool native = false;
     bool dispatchTests = false;
+    bool strictExitTest = false; // --strict-exit 1: default strict handler must terminate the process (exit 3)
     std::map<std::string, uint64_t> dtRuns, dtFail;
     std::map<std::string, std::string> dtFirstFail;
     std::filesystem::path regressionPath;
@@ -217,6 +218,8 @@ int main(int argc, char **argv)
             maxSamples = std::strtoull(argv[i + 1], nullptr, 0);
         else if (opt == "--report")
             reportPath = argv[i + 1];
+        else if (opt == "--strict-exit")
+            strictExitTest = std::strtoul(argv[i + 1], nullptr, 0) != 0;
         else if (opt == "--dispatch-tests")
             dispatchTests = std::strtoul(argv[i + 1], nullptr, 0) != 0;
         else if (opt == "--native")
@@ -576,6 +579,97 @@ int main(int argc, char **argv)
                 if (memData() != s.dataAfter || replayPath1 != s.path1)
                     diff += "authoritative-result-changed ";
                 check("T5_verify_detects_divergence", diff.empty(), diff);
+                break;
+            }
+
+            // T6/T7: one-field negative controls for the D/T enable bits, T8: strict mode stops at the first
+            // divergence (handler called once, with the detail), T9: strict mode with no divergence.
+            for (vu1c::Program &entryProg : vu1c::registry())
+            {
+                if (!prog || entryProg.codeHash != prog->codeHash || entryProg.kind != prog->kind || entryProg.entryPc != prog->entryPc)
+                    continue;
+                static vu1c::ProgramFn realFn2;
+                static int corruption;
+                static uint32_t strictCalls;
+                static std::string strictDetail;
+                realFn2 = entryProg.fn;
+                auto corrupting = [](vu1c::Ctx &c)
+                {
+                    const int r = realFn2(c);
+                    if (r == vu1c::Ok)
+                    {
+                        if (corruption == 1)
+                            c.st->dBitEnabled = !c.st->dBitEnabled;
+                        else if (corruption == 2)
+                            c.st->tBitEnabled = !c.st->tBitEnabled;
+                        else if (corruption == 3)
+                        {
+                            uint32_t bits;
+                            std::memcpy(&bits, &c.st->vf[5][1], 4);
+                            bits ^= 1u;
+                            std::memcpy(&c.st->vf[5][1], &bits, 4);
+                        }
+                    }
+                    return r;
+                };
+                auto runVerify = [&](int corrupt, bool strict)
+                {
+                    corruption = corrupt;
+                    strictCalls = 0;
+                    strictDetail.clear();
+                    entryProg.fn = corrupting;
+                    resetDispatcher(Mode::Verify);
+                    d().verifyStrict = strict;
+                    d().strictFailure = [](const std::string &detail)
+                    {
+                        ++strictCalls;
+                        strictDetail = detail;
+                    };
+                    load(s.before, s.dataBefore);
+                    if (s.h.kind == 1)
+                    {
+                        vu1->execute(mem->getVU1Code(), PS2_VU1_CODE_SIZE, mem->getVU1Data(), PS2_VU1_DATA_SIZE, *gs,
+                                     mem.get(), 0u, s.h.top, s.h.itop, 0u);
+                        vu1->state() = s.before;
+                    }
+                    syncPrivate();
+                    PS2Runtime_vu1DispatchCall(*vu1, *mem, *gs, s.h.kind, s.h.startPC, s.h.top, s.h.itop, 0u);
+                    entryProg.fn = realFn2;
+                };
+                auto onlyField = [](const std::string &detail, const char *field)
+                {
+                    // the reported difference list must name the field and nothing else
+                    const size_t colon = detail.find(':');
+                    const std::string list = colon == std::string::npos ? detail : detail.substr(colon + 1);
+                    return list == std::string(" ") + field;
+                };
+                runVerify(1, false);
+                check("T6_verify_detects_dBitEnabled", d().verifyMismatch == 1u && onlyField(d().firstMismatch, "dBitEnabled") && strictCalls == 0u,
+                      d().firstMismatch);
+                runVerify(2, false);
+                check("T7_verify_detects_tBitEnabled", d().verifyMismatch == 1u && onlyField(d().firstMismatch, "tBitEnabled") && strictCalls == 0u,
+                      d().firstMismatch);
+                if (strictExitTest)
+                {
+                    // default handler: report, then terminate; reaching the line below is a failure
+                    corruption = 3;
+                    entryProg.fn = corrupting;
+                    resetDispatcher(Mode::Verify);
+                    d().verifyStrict = true;
+                    load(s.before, s.dataBefore);
+                    syncPrivate();
+                    PS2Runtime_vu1DispatchCall(*vu1, *mem, *gs, s.h.kind, s.h.startPC, s.h.top, s.h.itop, 0u);
+                    std::printf("strict-exit test FAILED: the process was not stopped\n");
+                    return 1;
+                }
+                runVerify(3, true);
+                check("T8_strict_stops_at_first_divergence",
+                      d().verifyMismatch == 1u && strictCalls == 1u && strictDetail == d().firstMismatch && onlyField(strictDetail, "vf5") &&
+                          memData() == s.dataAfter && replayPath1 == s.path1,
+                      "calls=" + std::to_string(strictCalls) + " " + strictDetail);
+                runVerify(0, true);
+                check("T9_strict_without_divergence", d().verifyMismatch == 0u && strictCalls == 0u && d().verifyCompared == 1u,
+                      "calls=" + std::to_string(strictCalls) + " " + d().firstMismatch);
                 break;
             }
             continue;

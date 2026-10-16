@@ -23,7 +23,10 @@ Run-time selection (runtime patch `GAMEPLAY_001K_vu1_native_dispatch.patch`):
 | unset | original code path (default) |
 | `interpreter` | dispatcher bookkeeping, every call interpreted |
 | `native` | compiled program when available, interpreter otherwise (with rollback) |
-| `verify` | interpreter authoritative; compiled program run on copies and compared field by field |
+| `verify` | interpreter authoritative; compiled program run on copies and compared field by field (every `VU1State` field, data memory, PATH1 packets, cycle count) |
+
+`PS2X_VU1_VERIFY_STRICT=1` (verify mode): report the first divergence, then stop the process with exit
+code 3. Without it, verify logs divergences and continues.
 
 Diagnostics: `PS2X_VU1_STATS_SEC=<s>` (statistics line), `PS2X_VU1_PATH1_HASH=1` (hash of every 1000
 PATH1 packets), `PS2X_VU1_TRACE_CALLS=<n>` (input/output hashes of the first n calls).
@@ -54,7 +57,8 @@ vu1_replay <cap>                          # interpreter replay vs capture
 vu1_replay <cap> --profile 1              # + cycle-by-cycle profile
 vu1_replay <cap> --native 1 --repeat 5    # + compiled A/B and timing
 vu1_replay <cap> --native 1 --fuzz 8      # + differential fuzzing with follow-up MSCNT calls
-vu1_replay <cap> --dispatch-tests 1       # dispatcher integration tests T1-T5
+vu1_replay <cap> --dispatch-tests 1       # dispatcher integration tests T1-T9
+vu1_replay <cap> --dispatch-tests 1 --strict-exit 1   # must terminate with exit code 3 (strict verify)
 ```
 
 The captures were produced by temporary GAMEPLAY_001K instrumentation (`DMC_VU1_CAPTURE_DIR`), retired

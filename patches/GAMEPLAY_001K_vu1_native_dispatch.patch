@@ -67,10 +67,10 @@ index bf22c3c..301b9c5 100644
                                           (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
 diff --git a/ps2xRuntime/src/lib/ps2_vu1_native_dispatch.inc b/ps2xRuntime/src/lib/ps2_vu1_native_dispatch.inc
 new file mode 100644
-index 0000000..c3676f1
+index 0000000..253b941
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/ps2_vu1_native_dispatch.inc
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,512 @@
 +// GAMEPLAY_001K: dispatch of VIF1 MSCAL/MSCNT calls to VU1 microprograms compiled ahead
 +// of time (vu/ps2_vu1_native.h). Included only by ps2_runtime.cpp; no shared header changes.
 +//
@@ -82,6 +82,8 @@ index 0000000..c3676f1
 +// PS2X_VU1_PATH1_HASH=1          log an FNV-1a hash of every 1000 PATH1 packets (all modes)
 +// PS2X_VU1_STATS_SEC=<s>         period of the [VU1:dispatch] statistics line (default 5)
 +// PS2X_VU1_TRACE_CALLS=<n>       log input/output hashes of the first n calls ([VU1:trace], diagnosis)
++// PS2X_VU1_VERIFY_STRICT=1       verify mode: stop the process with an explicit failure (exit code 3)
++//                                right after reporting the first divergence (default: log and continue)
 +//
 +// Correctness rules (see analysis/notes/GAMEPLAY_001K_VU1_PERFORMANCE_DESIGN.md section 11):
 +// - A compiled MSCNT only continues a compiled call that ended Ok (never an interpreter state, whose
@@ -98,7 +100,10 @@ index 0000000..c3676f1
 +//   after every interpreter call, so state.cycles equals the interpreter-only value in every mode.
 +
 +#include <chrono>
++#include <cstdio>
++#include <cstdlib>
 +#include <set>
++#include <sstream>
 +#include <string>
 +#include <tuple>
 +#include <vector>
@@ -150,6 +155,10 @@ index 0000000..c3676f1
 +
 +        uint64_t p1Packets = 0, p1Hash = 1469598103934665603ull, p1Block = 0;
 +        uint64_t traceCalls = 0;
++        bool verifyStrict = false;
++        std::string firstMismatch; // detail of the first verify divergence (kept for reports and tests)
++        // Strict-mode failure handler; null = report and terminate. Tests install their own handler.
++        void (*strictFailure)(const std::string &detail) = nullptr;
 +        std::set<std::tuple<uint64_t, uint32_t, uint32_t>> reportedUncompiled;
 +        uint64_t traceOutPath1 = 0; // FNV of the PATH1 packets of the current call
 +    };
@@ -209,6 +218,8 @@ index 0000000..c3676f1
 +            s.statsPeriod = std::max(0.5, std::atof(p));
 +        if (const char *t = std::getenv("PS2X_VU1_TRACE_CALLS"))
 +            s.traceCalls = std::strtoull(t, nullptr, 0);
++        const char *strict = std::getenv("PS2X_VU1_VERIFY_STRICT");
++        s.verifyStrict = strict && strict[0] == '1';
 +        if (s.traceCalls)
 +            s.path1Hash = true; // packets must be collected in every mode to be traced
 +        s.windowStart = std::chrono::steady_clock::now();
@@ -300,6 +311,10 @@ index 0000000..c3676f1
 +            add("cycles(" + std::to_string(cyclesA) + " vs " + std::to_string(cyclesB) + ")");
 +        if (a.ebit != b.ebit || a.haltAfterDelaySlot != b.haltAfterDelaySlot)
 +            add("ebit/halt");
++        if (a.dBitEnabled != b.dBitEnabled)
++            add("dBitEnabled");
++        if (a.tBitEnabled != b.tBitEnabled)
++            add("tBitEnabled");
 +        if (a.stoppedByD != b.stoppedByD || a.stoppedByT != b.stoppedByT)
 +            add("stoppedByD/T");
 +        if (a.top != b.top || a.itop != b.itop)
@@ -307,6 +322,32 @@ index 0000000..c3676f1
 +        if (a.branchPending != b.branchPending || a.branchTarget != b.branchTarget || a.branchDelay != b.branchDelay)
 +            add("branch");
 +        return out;
++    }
++}
++
++namespace vu1native
++{
++    // Records a verify divergence; in strict mode the first one stops the process (or calls the
++    // installed handler) after it has been reported.
++    inline void reportVerifyMismatch(const std::string &detail)
++    {
++        Dispatcher &s = d();
++        ++s.verifyMismatch;
++        if (s.firstMismatch.empty())
++            s.firstMismatch = detail;
++        if (s.verifyMismatch <= 20u || s.verifyStrict)
++            std::cerr << "[VU1:verify] MISMATCH " << detail << std::endl;
++        if (!s.verifyStrict)
++            return;
++        if (s.strictFailure)
++        {
++            s.strictFailure(detail);
++            return;
++        }
++        std::cerr << "[VU1:verify] FATAL: PS2X_VU1_VERIFY_STRICT=1, stopping at the first divergence" << std::endl;
++        std::cerr.flush();
++        std::fflush(nullptr);
++        std::_Exit(3);
 +    }
 +}
 +
@@ -504,9 +545,10 @@ index 0000000..c3676f1
 +                ++s.verifyRefused;
 +                if (delta < kMaxCycles && r != vu1c::Fault)
 +                {
-+                    ++s.verifyMismatch;
-+                    std::cerr << "[VU1:verify] MISMATCH vsync=" << vsync << " entry=0x" << std::hex << entry << std::dec
-+                              << " kind=" << kind << ": compiled refused (" << r << ") but the interpreter finished" << std::endl;
++                    std::ostringstream detail;
++                    detail << "vsync=" << vsync << " entry=0x" << std::hex << entry << std::dec << " kind=" << kind
++                           << ": compiled refused (" << r << ") but the interpreter finished";
++                    reportVerifyMismatch(detail.str());
 +                }
 +            }
 +            else
@@ -519,10 +561,10 @@ index 0000000..c3676f1
 +                    diff += " path1(" + std::to_string(s.interpPackets.size()) + " vs " + std::to_string(compiledPackets.size()) + ")";
 +                if (!diff.empty())
 +                {
-+                    ++s.verifyMismatch;
-+                    if (s.verifyMismatch <= 20u)
-+                        std::cerr << "[VU1:verify] MISMATCH vsync=" << vsync << " entry=0x" << std::hex << entry << std::dec
-+                                  << " kind=" << kind << ":" << diff << std::endl;
++                    std::ostringstream detail;
++                    detail << "vsync=" << vsync << " entry=0x" << std::hex << entry << std::dec << " kind=" << kind << ":"
++                           << (diff[0] == ' ' ? "" : " ") << diff;
++                    reportVerifyMismatch(detail.str());
 +                }
 +            }
 +            for (const auto &pk : s.interpPackets)
