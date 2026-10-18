@@ -427,8 +427,6 @@ stubs = [
   "ret0@0x00132D70", # katVu0SetClip
   "ret0@0x001A01F0", # capCopyMatrix
   "ret0@0x0019FC40", # capVu0ScaleVectorXYZ2
-  "ret0@0x001A03C0", # _capVu0ecossin
-  "ret0@0x0016D8E0", # Get_light_str
   "ret0@0x001A0300", # capVu0Compare
 ]
 untracked_stubs = [

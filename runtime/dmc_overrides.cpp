@@ -6,13 +6,17 @@
 #include <cstdio>
 #include "p311_pad_test.inc"
 
-// Instrumented ret0 stand-ins for the 17 R5900/VU0 functions that are still not
+// Instrumented ret0 stand-ins for the 15 R5900/VU0 functions that are still not
 // restored (SLES_503.58). History: they were stubbed when Ghidra's R6 language
 // produced bogus 1-3.6MB boundaries (analysis/notes/HUGE_GENERATED_FILES.md); the
 // ELF .symtab now gives correct boundaries and their native bodies generate cleanly.
 // The old claim of "zero real callers" was RETRACTED: the ELF has 1544 JAL to the
 // original 20 entries (analysis/notes/GAMEPLAY_001_RET0_AUDIT.md).
 // Restored to their generated native bodies (no longer overridden):
+//   _capVu0ecossin     @0x001A03C0 (GAMEPLAY_001L: with vf0 hardwired its body matches the model 600/600; the
+//                      stand-in left vf4/vf5 stale and produced NaN character matrices)
+//   Get_light_str      @0x0016D8E0 (GAMEPLAY_001L: 600/600 EXACT against an independent model of its MIPS/VU0
+//                      code; the stand-in left $f0 stale, ~1e-7, so point lights were scaled to almost nothing)
 //   capVu0MulMatrix2   @0x001A0080 (RET0_FIRSTCALL, matches ORIGINAL oracle)
 //   capVu0AddVectorXYZ @0x0019FBB0, capVu0SubVectorXYZ @0x0019FBD0 (GAMEPLAY_001I)
 // Status and restoration order: analysis/notes/GAMEPLAY_001_RET0_RESTORATION_STATUS.md.
@@ -62,8 +66,6 @@ namespace
     DMC_INSTRUMENTED_RET0(dmcStub_katVu0SetClip, 0x00132D70u)
     DMC_INSTRUMENTED_RET0(dmcStub_capCopyMatrix, 0x001A01F0u)
     DMC_INSTRUMENTED_RET0(dmcStub_capVu0ScaleVectorXYZ2, 0x0019FC40u)
-    DMC_INSTRUMENTED_RET0(dmcStub_capVu0ecossin, 0x001A03C0u)
-    DMC_INSTRUMENTED_RET0(dmcStub_Get_light_str, 0x0016D8E0u)
     DMC_INSTRUMENTED_RET0(dmcStub_capVu0Compare, 0x001A0300u)
 
 #undef DMC_INSTRUMENTED_RET0
@@ -85,8 +87,6 @@ namespace
         runtime.registerFunction(0x00132D70u, dmcStub_katVu0SetClip);
         runtime.registerFunction(0x001A01F0u, dmcStub_capCopyMatrix);
         runtime.registerFunction(0x0019FC40u, dmcStub_capVu0ScaleVectorXYZ2);
-        runtime.registerFunction(0x001A03C0u, dmcStub_capVu0ecossin);
-        runtime.registerFunction(0x0016D8E0u, dmcStub_Get_light_str);
         runtime.registerFunction(0x001A0300u, dmcStub_capVu0Compare);
     }
 }
