@@ -24,6 +24,9 @@ list(FILTER runner_sources EXCLUDE REGEX "[/\\\\]register_functions\\.cpp$")
 set_property(TARGET ps2EntryRunner PROPERTY SOURCES "${runner_sources}")
 file(GLOB generated_sources CONFIGURE_DEPENDS "${DMC_GENERATED_DIR}/*.cpp")
 target_sources(ps2EntryRunner PRIVATE ${generated_sources} runtime/dmc_overrides.cpp)
+# GAMEPLAY_001L: the DMC overrides configure the runtime's private IPU module (ps2xRuntime/src/lib/ipu).
+set_source_files_properties(runtime/dmc_overrides.cpp TARGET_DIRECTORY ps2EntryRunner PROPERTIES
+    INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/vendor/PS2Recomp/ps2xRuntime/src/lib")
 # GAMEPLAY_001K: VU1 programs compiled ahead of time from this game's microcode. They are generated
 # locally by tools/vu1_replay/make_vu1c.py from the user's own ELF into recomp/vu1c/ (ignored by Git).
 # Without them the build is unchanged and every VU1 call is interpreted; with them, PS2X_VU1_NATIVE

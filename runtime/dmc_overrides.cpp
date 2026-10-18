@@ -1,6 +1,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
+#include "ipu/ps2_ipu.h"
 
 #include <cstdio>
 #include "p311_pad_test.inc"
@@ -96,3 +97,27 @@ PS2_REGISTER_GAME_OVERRIDE(
     0x00100008u,
     0x77654AD2u,
     applyHugeFunctionInstrumentation);
+
+// GAMEPLAY_001L: guest layout of libipu for the sceIpuInit HLE (SLES_503.58, SHA-256 d0753a6b...bab4,
+// entry 0x00100008, CRC32 77654AD2). From the ELF: sceIpuInit@0x0010B868 calls setD4_CHCR@0x0010B800 with
+// a0=1, writes 8 qwords from 0x004FC860 to the IPU input FIFO (+0x00..+0x30, then +0x40 four times: default
+// intra matrix in zigzag order and a flat non-intra matrix) and 2 qwords from 0x004FC8B0 (VQCLUT). The stub's
+// built-in addresses fall inside Homing2 (code) in this ELF.
+namespace
+{
+    void applyLibIpuInitLayout(PS2Runtime &)
+    {
+        ps2_ipu::LibIpuInitLayout layout;
+        layout.setD4ChcrEntry = 0x0010B800u;
+        layout.iqTable = 0x004FC860u;
+        layout.vqTable = 0x004FC8B0u;
+        ps2_ipu::setLibIpuInitLayout(layout);
+    }
+}
+
+PS2_REGISTER_GAME_OVERRIDE(
+    "dmc-sles-503.58-libipu-init-layout",
+    "SLES_503.58",
+    0x00100008u,
+    0x77654AD2u,
+    applyLibIpuInitLayout);

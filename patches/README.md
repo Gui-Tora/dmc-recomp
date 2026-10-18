@@ -438,3 +438,30 @@ arriba). Los diecinueve patches actualmente activos:
     generado. Sin programas compilados registrados se comporta como el
     intérprete. Documentación y validación:
     `analysis/notes/GAMEPLAY_001K_VU1_PERFORMANCE_DESIGN.md`.
+
+20. `GAMEPLAY_001L_ipu_idec_spr_dma.patch` (convención B). IPU y los canales
+    DMA que lo rodean, ejecutados de forma síncrona:
+    - `ipu/ps2_ipu.{h,cpp}` (cabecera privada, no la incluye el código
+      generado): FIFO de entrada y salida, `BCLR`, `IDEC` (salida RGB32;
+      MPEG-2 intra, tablas B.14/B.15, IDCT entera de referencia y CSC del
+      IPU), `FDEC`, `SETIQ`, `SETVQ`, `SETTH` y `IPU_CTRL.RST`; D4 toIPU
+      (normal y cadena de origen, con tags leídos solo cuando el IPU necesita
+      datos), D3 fromIPU (normal) y D8 fromSPR (normal e intercalado con
+      `D_SQWC`). `VDEC`, `BDEC`, `CSC`, `PACK` y los modos IDEC que no usa
+      DMC (`OFM`, `DTD`, `SGN`, `DTE`, `AS`, `QST`, `MP1`, umbrales de
+      `SETTH`) se notifican como error, sin salida ni finalización ficticia.
+    - `ps2_memory.cpp`: registros `0x10002000-0x1000203F`, FIFO de entrada
+      por `sq` a `0x10007010` y escrituras de `CHCR` de D3, D4 y D8. El
+      estado vive en `ps2_memory.cpp` (sin cambios en `ps2_memory.h`).
+      `IPU_CTRL.RST` se borra solo tras el reset (antes se leía de vuelta).
+    - `sceDmaRecvI`: semántica de libdma (MADR salvo `0xFFFFFFFF`, QWC y
+      `CHCR` con `MOD=intercalado`, `DIR=0`, `STR`); solo fromSPR.
+    - `sceIpuSync`: el modo 1 devuelve `BUSY`; el modo 0 informa si el IPU
+      sigue ocupado en lugar de darlo por terminado.
+    - `sceIpuInit`: las direcciones de `setD4_CHCR` y de las tablas IQ/VQ son
+      configurables (`ps2_ipu::setLibIpuInitLayout`); por defecto, las que
+      ya usaba el stub. DMC fija las suyas en `runtime/dmc_overrides.cpp`.
+
+    Tests en `ps2_ipu_tests.cpp`; dos expectativas de
+    `ps2_runtime_expansion_tests.cpp` pasan a `IPU_CTRL = 0` tras el reset.
+    Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.
