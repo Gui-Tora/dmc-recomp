@@ -1,0 +1,117 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 05fc764..6196ede 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -674,13 +674,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     }
+                     else if (vl == 3u && vn == 3u)
+                     {
+-                        // V4-5: packed color-like format in a single 16-bit value.
++                        // V4-5 (RGBA 5:5:5:1 in 16 bits): R, G and B expand to 8 bits (<< 3) and A to bit 7,
++                        // as in PCSX2 Vif_Unpack.cpp UNPACK_V4_5.
+                         uint16_t packed = 0;
+                         std::memcpy(&packed, srcVec, sizeof(packed));
+-                        decompressed[0] = packed & 0x1Fu;
+-                        decompressed[1] = (packed >> 5) & 0x1Fu;
+-                        decompressed[2] = (packed >> 10) & 0x1Fu;
+-                        decompressed[3] = (packed >> 15) & 0x01u;
++                        const uint32_t v = packed;
++                        decompressed[0] = (v & 0x001Fu) << 3;
++                        decompressed[1] = (v & 0x03E0u) >> 2;
++                        decompressed[2] = (v & 0x7C00u) >> 7;
++                        decompressed[3] = (v & 0x8000u) >> 8;
+                     }
+                     else
+                     {
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index aa97e32..057f23e 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -534,6 +534,87 @@ void register_ps2_memory_tests()
+             t.Equals(sw, 0x00008001u, "zero-extend w");
+         });
+ 
++        tc.Run("VIF UNPACK V4-5 expands RGBA5551 to 8-bit lanes (R,G,B << 3, A << 7)", [](TestCase &t)
++        {
++            // PCSX2 Vif_Unpack.cpp UNPACK_V4_5: x=(d&0x1F)<<3, y=(d&0x3E0)>>2, z=(d&0x7C00)>>7, w=(d&0x8000)>>8.
++            // The last three inputs are skinning weights of a DMC model (SLES_503.58): three 5-bit weights that sum to
++            // 31 plus a flag bit; its VU1 program scales them by 1/248.
++            struct Case { uint16_t in; uint32_t x, y, z, w; const char *what; };
++            const Case cases[] = {
++                {0x0000u, 0u, 0u, 0u, 0u, "0x0000: all zero"},
++                {0xFFFFu, 248u, 248u, 248u, 128u, "0xFFFF: RGB=248 A=128"},
++                {0x001Fu, 248u, 0u, 0u, 0u, "0x001F: only R"},
++                {0x03E0u, 0u, 248u, 0u, 0u, "0x03E0: only G"},
++                {0x7C00u, 0u, 0u, 248u, 0u, "0x7C00: only B"},
++                {0x8000u, 0u, 0u, 0u, 128u, "0x8000: only A"},
++                {0x01F0u, 128u, 120u, 0u, 0u, "DMC weights 16,15,0 A=0"},
++                {0x801Fu, 248u, 0u, 0u, 128u, "DMC weights 31,0,0 A=1"},
++                {0xCDCDu, 104u, 112u, 152u, 128u, "DMC weights 13,14,19 A=1"},
++            };
++            constexpr uint32_t kCount = sizeof(cases) / sizeof(cases[0]);
++
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
++            std::vector<uint8_t> packet;
++            appendU32(packet, makeVifCmd(0x6Fu, static_cast<uint8_t>(kCount), 0x0000u)); // UNPACK V4-5, addr=0
++            for (const Case &c : cases)
++            {
++                const size_t pos = packet.size();
++                packet.resize(pos + sizeof(uint16_t));
++                std::memcpy(packet.data() + pos, &c.in, sizeof(uint16_t));
++            }
++            while (packet.size() % 4u)
++                packet.push_back(0u);
++            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
++
++            const uint8_t *vu1 = mem.getVU1Data();
++            for (uint32_t i = 0; i < kCount; ++i)
++            {
++                uint32_t v[4] = {};
++                std::memcpy(v, vu1 + i * 16u, sizeof(v));
++                const std::string what(cases[i].what);
++                t.Equals(v[0], cases[i].x, what + " x");
++                t.Equals(v[1], cases[i].y, what + " y");
++                t.Equals(v[2], cases[i].z, what + " z");
++                t.Equals(v[3], cases[i].w, what + " w");
++            }
++        });
++
++        tc.Run("VIF UNPACK V4-5 with STCYCL CL=5 WL=1 lands in the vertex-record slot only", [](TestCase &t)
++        {
++            // Layout used by DMC's skinned batches: one weight vector every 5 qwords (UNPACK V4-5 addr=8, num=3).
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            uint8_t *vu1 = mem.getVU1Data();
++            std::memset(vu1, 0xAB, PS2_VU1_DATA_SIZE);
++            const uint16_t packed[3] = {0x801Fu, 0x01F0u, 0xCDCDu};
++            std::vector<uint8_t> packet;
++            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0105u)); // STCYCL CL=5 WL=1
++            appendU32(packet, makeVifCmd(0x6Fu, 3u, 0x0008u)); // UNPACK V4-5 num=3 addr=8
++            for (uint16_t p : packed)
++            {
++                const size_t pos = packet.size();
++                packet.resize(pos + sizeof(uint16_t));
++                std::memcpy(packet.data() + pos, &p, sizeof(uint16_t));
++            }
++            while (packet.size() % 4u)
++                packet.push_back(0u);
++            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
++
++            const uint32_t expected[3][4] = {{248u, 0u, 0u, 128u}, {128u, 120u, 0u, 0u}, {104u, 112u, 152u, 128u}};
++            for (uint32_t i = 0; i < 3u; ++i)
++            {
++                uint32_t v[4] = {};
++                std::memcpy(v, vu1 + (8u + i * 5u) * 16u, sizeof(v));
++                for (uint32_t c = 0; c < 4u; ++c)
++                    t.Equals(v[c], expected[i][c], "weight vector " + std::to_string(i) + " lane " + std::to_string(c));
++                uint32_t gap[4] = {};
++                std::memcpy(gap, vu1 + (9u + i * 5u) * 16u, sizeof(gap));
++                t.Equals(gap[0], 0xABABABABu, "qword after vector " + std::to_string(i) + " is untouched");
++            }
++        });
++
+         tc.Run("VIF UNPACK bit15 adds TOPS to destination address", [](TestCase &t)
+         {
+             PS2Memory mem;

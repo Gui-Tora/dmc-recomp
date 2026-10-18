@@ -540,3 +540,23 @@ arriba). Los diecinueve patches actualmente activos:
     - Arnés offline que ejecuta los cuerpos generados frente a un modelo
       PCSX2 y a un oráculo matemático de `CLIP`, descrito en
       `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.
+
+24. `GAMEPLAY_001L_vif_v45_unpack_fix.patch` (convención B). `UNPACK V4-5` de VIF1
+    (`ps2_vif1_interpreter.cpp`): el formato RGBA 5:5:5:1 de 16 bits se expande
+    como en PCSX2 (`Vif_Unpack.cpp`, `UNPACK_V4_5`): `R`, `G` y `B` `<< 3` (0–248) y `A`
+    al bit 7 (0/0x80).
+    - Antes los campos se escribían sin desplazar (0–31 y 0/1).
+    - DMC guarda ahí los pesos de skinning (5 bits, suma 31) y su programa VU1 los
+      escala por 1/248. Con valores 8 veces menores, los vértices de la vía mezclada
+      colapsaban hacia el origen del mundo y formaban polígonos gigantes: la cuña
+      negra de la oficina y una Trish deformada.
+    - No cambia ningún otro formato, ni el tratamiento de máscara/`ROW`: igual que
+      en PCSX2, `V4-5` no suma `ROW`.
+
+    Tests en `ps2_memory_tests.cpp`:
+    - `0x0000`, `0xFFFF`, `0x001F`, `0x03E0`, `0x7C00`, `0x8000`;
+    - tres valores reales de pesos del modelo;
+    - un caso con `STCYCL CL=5 WL=1` que comprueba la posición final en la memoria VU1.
+
+    Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`,
+    sección 16.
