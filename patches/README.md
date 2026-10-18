@@ -465,3 +465,30 @@ arriba). Los diecinueve patches actualmente activos:
     Tests en `ps2_ipu_tests.cpp`; dos expectativas de
     `ps2_runtime_expansion_tests.cpp` pasan a `IPU_CTRL = 0` tras el reset.
     Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.
+
+21. `GAMEPLAY_001L_sif_rpc_iop_server_handles.patch` (convención B). Separa los
+    servidores RPC del IOP gestionados por HLE de la RAM del EE:
+    - `SifBindRpc` a un SID que ningún servidor EE ha registrado ya no toma un
+      descriptor de `rpcAllocServerAddr` (pool `0x01F10000` en RDRAM, que se
+      ponía a cero al vincular y se escribía en cada `SifCallRpc`). El
+      descriptor vive en `RpcServerState::hle` y `cd->server` recibe un handle
+      del espacio IOP (`0x1C1F0000 + n·0x80`, nunca una dirección de RDRAM;
+      distinto de cero, así que los bucles de bind siguen funcionando).
+    - `SifCallRpc` resuelve el servidor solo a través del registro (SID
+      vinculado y, si no, la entrada que nombra `cd->server`). Un
+      `cd->server` desconocido ya no se desreferencia.
+    - Los servidores registrados en el EE (`SifRegisterRpc`) conservan su
+      descriptor en RAM del EE, esté donde esté.
+    - Checkpoint: formato sin cambios. Al cargar, las entradas antiguas cuyo
+      `sd_ptr` es exactamente un hueco ya asignado del pool de RDRAM
+      (`slot < g_rpc_server_index`) se vuelven a vincular a un handle IOP;
+      los clientes lo toman en su siguiente llamada.
+    - `ps2_debug_panel.cpp` muestra el descriptor del runtime para estos
+      servidores.
+    - Tests en `ps2_sif_rpc_tests.cpp` (3 nuevos y la expectativa del
+      provisional pasa al rango IOP).
+
+    `rpcAllocServerAddr`/`rpcAllocPacketAddr` siguen existiendo para
+    `IopHost::allocateIopHandle` (solo los usa `cri_dtx`, que DMC no carga).
+    Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`
+    (sección 11).

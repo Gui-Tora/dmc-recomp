@@ -1,0 +1,495 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index 110b2f3..3777ef9 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -161,7 +161,11 @@ inline std::mutex g_fd_mutex;
+ struct RpcServerState
+ {
+     uint32_t sid = 0;
+-    uint32_t sd_ptr = 0; // PS2 address
++    // EE-registered server (SifRegisterRpc): guest address of its t_SifRpcServerData in EE RAM.
++    // IOP server bound through HLE (hle_iop): an IOP-space handle used as cd->server, never an EE address.
++    uint32_t sd_ptr = 0;
++    bool hle_iop = false;
++    t_SifRpcServerData hle{}; // descriptor of an hle_iop server, kept in runtime memory
+ };
+ 
+ struct RpcClientState
+@@ -220,6 +224,7 @@ inline bool g_rpc_initialized = false;
+ inline uint32_t g_rpc_next_id = 1;
+ inline uint32_t g_rpc_packet_index = 0;
+ inline uint32_t g_rpc_server_index = 0;
++inline uint32_t g_rpc_hle_server_index = 0;
+ inline uint32_t g_rpc_active_queue = 0;
+ inline std::mutex g_bootmode_mutex;
+ inline bool g_bootmode_initialized = false;
+@@ -255,6 +260,12 @@ static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
+ static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+ static constexpr uint32_t kRpcServerStride = 0x80;
+ static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
++// cd->server handles for IOP servers bound through HLE. On hardware cd->server holds an IOP address that the EE
++// never dereferences; these handles sit in the EE physical window of IOP RAM (0x1C000000 + IOP 0x1F0000),
++// outside EE RDRAM, and are resolved only through g_rpc_servers.
++static constexpr uint32_t kRpcHleServerHandleBase = 0x1C1F0000;
++static constexpr uint32_t kRpcHleServerHandleBytes = 0x00010000;
++static constexpr uint32_t kRpcHleServerHandleCount = kRpcHleServerHandleBytes / kRpcServerStride;
+ 
+ static constexpr uint32_t kTlsPoolBase = 0x01F20000;
+ static constexpr uint32_t kTlsPoolBytes = 0x00010000;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 4830005..bea1263 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -5,6 +5,45 @@
+ 
+ namespace ps2_syscalls
+ {
++    namespace
++    {
++        // Allocates the cd->server handle of an IOP server bound through HLE (see kRpcHleServerHandleBase).
++        // Caller holds g_rpc_mutex.
++        uint32_t rpcAllocHleServerHandleLocked()
++        {
++            const uint32_t slot = g_rpc_hle_server_index++ % kRpcHleServerHandleCount;
++            return kRpcHleServerHandleBase + slot * kRpcServerStride;
++        }
++
++        bool rpcIsHleServerHandle(uint32_t handle)
++        {
++            return handle >= kRpcHleServerHandleBase &&
++                   handle < kRpcHleServerHandleBase + kRpcHleServerHandleBytes &&
++                   ((handle - kRpcHleServerHandleBase) % kRpcServerStride) == 0u;
++        }
++
++        // Descriptor of a registry entry: runtime memory for HLE IOP servers, EE RAM for EE-registered ones.
++        // Caller holds g_rpc_mutex.
++        t_SifRpcServerData *rpcServerDescriptorLocked(uint8_t *rdram, RpcServerState &state)
++        {
++            if (state.hle_iop)
++                return &state.hle;
++            return state.sd_ptr ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, state.sd_ptr)) : nullptr;
++        }
++
++        RpcServerState *rpcFindServerByPtrLocked(uint32_t sdPtr)
++        {
++            if (sdPtr == 0u)
++                return nullptr;
++            for (auto &kv : g_rpc_servers)
++            {
++                if (kv.second.sd_ptr == sdPtr)
++                    return &kv.second;
++            }
++            return nullptr;
++        }
++    }
++
+     // DEVSTATE_003C checkpoint codec for EE-side RPC state. Debug history
+     // (g_sif_rpc_debug_history/next_seq) is intentionally NOT serialized --
+     // it is diagnostics only (DEVSTATE_002 §11 policy), never consulted for
+@@ -134,6 +173,44 @@ namespace ps2_syscalls
+         }
+         g_rpc_initialized = initialized != 0u;
+ 
++        // The format stores sd_ptr only. HLE IOP servers are recognised by their handle range. Checkpoints written
++        // before the handles existed hold the RDRAM placeholders that SifBindRpc took from rpcAllocServerAddr:
++        // exactly kRpcServerPoolBase + slot * kRpcServerStride with slot < g_rpc_server_index. Those are rebound to
++        // an IOP handle, so no descriptor is written into EE RAM again; clients pick the new handle on their next
++        // SifCallRpc.
++        g_rpc_hle_server_index = 0;
++        for (auto &kv : g_rpc_servers)
++        {
++            RpcServerState &s = kv.second;
++            if (rpcIsHleServerHandle(s.sd_ptr))
++            {
++                s.hle_iop = true;
++                g_rpc_hle_server_index = std::max(g_rpc_hle_server_index,
++                                                  (s.sd_ptr - kRpcHleServerHandleBase) / kRpcServerStride + 1u);
++            }
++        }
++        for (auto &kv : g_rpc_servers)
++        {
++            RpcServerState &s = kv.second;
++            const bool legacyPlaceholder =
++                s.sd_ptr >= kRpcServerPoolBase && s.sd_ptr < kRpcServerPoolBase + kRpcServerPoolBytes &&
++                ((s.sd_ptr - kRpcServerPoolBase) % kRpcServerStride) == 0u &&
++                (s.sd_ptr - kRpcServerPoolBase) / kRpcServerStride < g_rpc_server_index;
++            if (!s.hle_iop && legacyPlaceholder)
++            {
++                const uint32_t legacy = s.sd_ptr;
++                s.sd_ptr = rpcAllocHleServerHandleLocked();
++                s.hle_iop = true;
++                RUNTIME_LOG("[SifRpc] checkpoint: sid=0x" << std::hex << s.sid << " RDRAM placeholder 0x" << legacy
++                                                          << " rebound to IOP handle 0x" << s.sd_ptr << std::dec);
++            }
++            if (s.hle_iop)
++            {
++                s.hle = t_SifRpcServerData{};
++                s.hle.sid = static_cast<int>(s.sid);
++            }
++        }
++
+         std::lock_guard<std::mutex> moduleLock(g_sif_module_mutex);
+         uint32_t moduleCount = 0;
+         if (!r.u32(moduleCount) || moduleCount > 65536u)
+@@ -416,6 +493,7 @@ namespace ps2_syscalls
+             g_rpc_next_id = 1;
+             g_rpc_packet_index = 0;
+             g_rpc_server_index = 0;
++            g_rpc_hle_server_index = 0;
+             g_rpc_active_queue = 0;
+             g_sif_rpc_debug_next_seq = 0;
+             for (size_t i = 0; i < kSifRpcDebugHistoryCount; ++i)
+@@ -468,43 +546,24 @@ namespace ps2_syscalls
+             std::lock_guard<std::mutex> lock(g_rpc_mutex);
+             client->hdr.rpc_id = g_rpc_next_id++;
+             auto it = g_rpc_servers.find(rpcId);
+-            if (it != g_rpc_servers.end())
+-            {
+-                serverPtr = it->second.sd_ptr;
+-            }
+-            g_rpc_clients[clientPtr] = {};
+-            g_rpc_clients[clientPtr].sid = rpcId;
+-        }
+-
+-        if (!serverPtr)
+-        {
+-            // Allocate a dummy server so bind loops can proceed.
+-            serverPtr = rpcAllocServerAddr(rdram);
+-            if (serverPtr)
++            if (it == g_rpc_servers.end() || it->second.sd_ptr == 0u)
+             {
+-                t_SifRpcServerData *dummy = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
+-                if (dummy)
+-                {
+-                    std::memset(dummy, 0, sizeof(*dummy));
+-                    dummy->sid = static_cast<int>(rpcId);
+-                }
+-                std::lock_guard<std::mutex> lock(g_rpc_mutex);
+-                g_rpc_servers[rpcId] = {rpcId, serverPtr};
++                // No EE server registered this SID: it is an IOP server handled by HLE. Its descriptor stays in
++                // runtime memory and cd->server gets an IOP-space handle (non-zero, so bind loops proceed).
++                RpcServerState state{};
++                state.sid = rpcId;
++                state.sd_ptr = rpcAllocHleServerHandleLocked();
++                state.hle_iop = true;
++                state.hle.sid = static_cast<int>(rpcId);
++                it = g_rpc_servers.insert_or_assign(rpcId, state).first;
+             }
+-        }
+-
+-        if (serverPtr)
+-        {
+-            t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr));
++            serverPtr = it->second.sd_ptr;
++            const t_SifRpcServerData *sd = rpcServerDescriptorLocked(rdram, it->second);
+             client->server = serverPtr;
+             client->buf = sd ? sd->buf : 0;
+             client->cbuf = sd ? sd->cbuf : 0;
+-        }
+-        else
+-        {
+-            client->server = 0;
+-            client->buf = 0;
+-            client->cbuf = 0;
++            g_rpc_clients[clientPtr] = {};
++            g_rpc_clients[clientPtr].sid = rpcId;
+         }
+ 
+         SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx, runtime);
+@@ -662,27 +721,33 @@ namespace ps2_syscalls
+         client->hdr.mode = mode;
+ 
+         uint32_t sid = 0u;
++        t_SifRpcServerData *server = nullptr;
+         {
+             std::lock_guard<std::mutex> lock(g_rpc_mutex);
++            const bool boundClient = g_rpc_clients.find(clientPtr) != g_rpc_clients.end();
+             auto &state = g_rpc_clients[clientPtr];
+             state.busy = true;
+             state.last_rpc = rpcNum;
+             sid = state.sid;
+-            if (sid != 0u)
++            // The descriptor comes from the registry: the bound SID first, then the entry cd->server names.
++            // A cd->server unknown to the registry is not dereferenced.
++            RpcServerState *entry = nullptr;
++            if (boundClient)
+             {
+                 const auto serverIt = g_rpc_servers.find(sid);
+-                if (serverIt != g_rpc_servers.end() &&
+-                    serverIt->second.sd_ptr != 0u)
+-                {
+-                    client->server = serverIt->second.sd_ptr;
+-                }
++                if (serverIt != g_rpc_servers.end() && serverIt->second.sd_ptr != 0u)
++                    entry = &serverIt->second;
++            }
++            if (!entry)
++                entry = rpcFindServerByPtrLocked(client->server);
++            if (entry)
++            {
++                client->server = entry->sd_ptr;
++                server = rpcServerDescriptorLocked(rdram, *entry);
+             }
+         }
+ 
+         const uint32_t serverPtr = client->server;
+-        auto *server = serverPtr
+-                           ? reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, serverPtr))
+-                           : nullptr;
+         if (server)
+         {
+             server->client = clientPtr;
+diff --git a/ps2xRuntime/src/lib/ps2_debug_panel.cpp b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+index cf0b439..377e56a 100644
+--- a/ps2xRuntime/src/lib/ps2_debug_panel.cpp
++++ b/ps2xRuntime/src/lib/ps2_debug_panel.cpp
+@@ -958,7 +958,15 @@ namespace
+                 RpcServerRow row{};
+                 row.sid = sid;
+                 row.sdPtr = state.sd_ptr;
+-                row.readable = readGuestObjectNoThrow(rdram, state.sd_ptr, row.sd);
++                if (state.hle_iop)
++                {
++                    row.sd = state.hle; // IOP server handled by HLE: sd_ptr is an IOP handle, not EE RAM
++                    row.readable = true;
++                }
++                else
++                {
++                    row.readable = readGuestObjectNoThrow(rdram, state.sd_ptr, row.sd);
++                }
+                 servers.push_back(row);
+             }
+ 
+diff --git a/ps2xTest/src/ps2_sif_rpc_tests.cpp b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+index eefb495..c074ece 100644
+--- a/ps2xTest/src/ps2_sif_rpc_tests.cpp
++++ b/ps2xTest/src/ps2_sif_rpc_tests.cpp
+@@ -5,6 +5,8 @@
+ #include "ps2_syscalls.h"
+ #include "ps2_stubs.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/checkpoint/checkpoint.h"
++#include "runtime/checkpoint/checkpoint_probes.h"
+ 
+ #include <array>
+ #include <atomic>
+@@ -847,8 +849,8 @@ void register_ps2_sif_rpc_tests()
+ 
+             const SifRpcClientData clientBeforeRegister = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
+             t.IsTrue(clientBeforeRegister.server != 0u, "bind should allocate placeholder server when sid is missing");
+-            t.IsTrue(clientBeforeRegister.server >= 0x01F10000u && clientBeforeRegister.server < 0x01F20000u,
+-                     "placeholder server should come from rpc server pool");
++            t.IsTrue(clientBeforeRegister.server >= 0x1C1F0000u && clientBeforeRegister.server < 0x1C200000u,
++                     "placeholder server should be an IOP-space handle, not an EE RAM address");
+             t.Equals(clientBeforeRegister.buf, 0u, "placeholder server starts with empty buf");
+             t.Equals(clientBeforeRegister.cbuf, 0u, "placeholder server starts with empty cbuf");
+ 
+@@ -1295,5 +1297,208 @@ void register_ps2_sif_rpc_tests()
+             t.IsTrue(stackHandle != 0u, "DTX handle should be written to stack-selected recv buffer");
+             t.Equals(regHandle, 0u, "register recv buffer should remain untouched when stack ABI is preferred");
+         });
++        tc.Run("IOP servers bound through HLE keep their descriptors out of EE RAM", [](TestCase &t)
++        {
++            // DMC (SLES_503.58) binds four IOP SIDs and calls them like SdrGetStateSend (SID 1, NOWAIT, sema).
++            // Game data that happens to sit where the old RDRAM placeholder pool was must survive.
++            TestEnv env;
++            std::string error;
++            t.IsTrue(PS2IopTransport::configureForTesting(&env.runtime, {"SLES_503.58", 0x00100008u, 0x77654AD2u}, &error),
++                     "DMC profile should configure");
++
++            constexpr uint32_t kLegacyPoolBase = 0x01F00000u; // old packet pool + server pool
++            constexpr uint32_t kLegacyPoolBytes = 0x00020000u;
++            std::memset(env.rdram.data() + kLegacyPoolBase, 0xA5, kLegacyPoolBytes);
++
++            constexpr uint32_t kSids[4] = {0x00000000u, 0x00000001u, 0x12345678u, 0x87654321u};
++            constexpr uint32_t kClientBase = 0x0002F000u;
++            constexpr uint32_t kBufAddr = 0x0002F300u;
++
++            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            const std::vector<uint8_t> before(env.rdram.begin(), env.rdram.end());
++
++            std::array<uint32_t, 4> handles{};
++            for (size_t i = 0; i < 4; ++i)
++            {
++                setRegU32(env.ctx, 4, kClientBase + static_cast<uint32_t>(i) * 0x40u);
++                setRegU32(env.ctx, 5, kSids[i]);
++                setRegU32(env.ctx, 6, 0u);
++                SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
++                t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifBindRpc should succeed");
++                handles[i] = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientBase + static_cast<uint32_t>(i) * 0x40u).server;
++                t.IsTrue(handles[i] != 0u, "cd->server must be non-zero so bind loops proceed");
++                t.IsTrue(handles[i] >= 0x1C1F0000u && handles[i] < 0x1C200000u,
++                         "an IOP server bound through HLE gets an IOP-space handle, not an EE RAM address");
++            }
++            t.IsTrue(handles[0] != handles[1] && handles[1] != handles[2] && handles[2] != handles[3],
++                     "each SID gets its own handle");
++
++            // SdrGetStateSend shape: SID 1, rpc 2 (XagChkPlay), NOWAIT, send = recv = 16-byte buffer. The game's
++            // completion goes through its end function; NOWAIT callbacks and semaphores are covered by the
++            // LotR/RECVX/snddrv tests above.
++            for (int call = 0; call < 3; ++call)
++            {
++                std::memset(env.rdram.data() + kBufAddr, 0, 16u);
++                setRegU32(env.ctx, 4, kClientBase + 0x40u);
++                setRegU32(env.ctx, 5, 2u);
++                setRegU32(env.ctx, 6, K_SIF_RPC_MODE_NOWAIT);
++                setRegU32(env.ctx, 7, kBufAddr);
++                setRegU32(env.ctx, 8, 16u);
++                setRegU32(env.ctx, 9, kBufAddr);
++                setRegU32(env.ctx, 10, 16u);
++                setRegU32(env.ctx, 11, 0u);
++                setRegU32(env.ctx, 29, K_STACK_ADDR);
++                writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, 0u);
++                SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
++                t.Equals(getRegS32(env.ctx, 2), KE_OK, "NOWAIT state RPC should succeed");
++                t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kBufAddr), 0xFFFFFFFFu,
++                         "TSNDDRVM still answers XagChkPlay on an idle channel with -1 in the receive buffer");
++            }
++
++            // SID 0 command stream (0xFF terminated) through the same path.
++            const uint8_t commands[16] = {0xFFu};
++            std::memcpy(env.rdram.data() + kBufAddr, commands, sizeof(commands));
++            setRegU32(env.ctx, 4, kClientBase);
++            setRegU32(env.ctx, 5, 0u);
++            setRegU32(env.ctx, 6, 0u);
++            setRegU32(env.ctx, 7, kBufAddr);
++            setRegU32(env.ctx, 8, 16u);
++            setRegU32(env.ctx, 9, 0u);
++            setRegU32(env.ctx, 10, 0u);
++            setRegU32(env.ctx, 11, 0u);
++            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "command RPC should succeed");
++
++            t.IsTrue(std::memcmp(env.rdram.data() + kLegacyPoolBase, before.data() + kLegacyPoolBase, kLegacyPoolBytes) == 0,
++                     "bind and calls leave the data at the old placeholder pool untouched");
++            size_t outside = 0;
++            for (uint32_t a = 0; a < PS2_RAM_SIZE; ++a)
++            {
++                const bool authorized = (a >= kClientBase && a < kClientBase + 4u * 0x40u) || // client structs
++                                        (a >= kBufAddr && a < kBufAddr + 16u) ||                // send/recv buffer
++                                        (a >= K_STACK_ADDR && a < K_STACK_ADDR + 4u);           // stack argument
++                if (!authorized && env.rdram[a] != before[a])
++                    ++outside;
++            }
++            t.Equals(outside, static_cast<size_t>(0u), "no EE RAM byte changes outside the client and its buffers");
++        });
++
++        tc.Run("legacy checkpoint RDRAM placeholders are rebound to IOP handles", [](TestCase &t)
++        {
++            TestEnv env;
++            constexpr uint32_t kSid = 0x20000F01u;
++            constexpr uint32_t kClientAddr = 0x0002F800u;
++            constexpr uint32_t kLegacyServer = 0x01F10080u; // slot 1 of the old server pool
++            constexpr uint32_t kSendAddr = 0x0002F900u;
++            constexpr uint32_t kRecvAddr = 0x0002FA00u;
++
++            // RPC section as written by a runtime that still placed placeholders in RDRAM (format unchanged).
++            ps2x::checkpoint::ByteWriter w;
++            w.u32(1u);
++            w.u32(kSid);
++            w.u32(kSid);
++            w.u32(kLegacyServer);
++            w.u32(1u);
++            w.u32(kClientAddr);
++            w.u8(0u);
++            w.u32(0u);
++            w.u32(kSid);
++            w.u8(1u);        // initialized
++            w.u32(10u);      // next id
++            w.u32(0u);       // packet index
++            w.u32(2u);       // server index: slots 0 and 1 were allocated
++            w.u32(0u);       // active queue
++            w.u32(0u);       // modules
++            w.u32(1u);       // next module id
++            std::vector<uint8_t> blob = w.take();
++            ps2x::checkpoint::ByteReader r(blob.data(), blob.size());
++            std::string error;
++            t.IsTrue(checkpointDeserializeRpc(r, error), "legacy RPC section should load: " + error);
++
++            std::memset(env.rdram.data() + 0x01F10000u, 0x5A, 0x200u);
++            SifRpcClientData client{};
++            client.server = kLegacyServer;
++            client.hdr.sema_id = -1;
++            writeGuestStruct(env.rdram.data(), kClientAddr, client);
++            writeGuestU32(env.rdram.data(), kSendAddr, 0xCAFEF00Du);
++
++            setRegU32(env.ctx, 4, kClientAddr);
++            setRegU32(env.ctx, 5, 3u);
++            setRegU32(env.ctx, 6, 0u);
++            setRegU32(env.ctx, 7, kSendAddr);
++            setRegU32(env.ctx, 8, 4u);
++            setRegU32(env.ctx, 9, kRecvAddr);
++            setRegU32(env.ctx, 10, 4u);
++            setRegU32(env.ctx, 11, 0u);
++            setRegU32(env.ctx, 29, K_STACK_ADDR);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, 0u);
++            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "call through a migrated client should succeed");
++
++            bool intact = true;
++            for (uint32_t a = 0x01F10000u; a < 0x01F10200u; ++a)
++                intact = intact && env.rdram[a] == 0x5Au;
++            t.IsTrue(intact, "nothing is written at the legacy placeholder address");
++            const uint32_t handle = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr).server;
++            t.IsTrue(handle >= 0x1C1F0000u && handle < 0x1C200000u, "the client picks up the IOP handle");
++            t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), kRecvAddr), 0xCAFEF00Du,
++                     "the unhandled-RPC fallback still fills the receive buffer");
++
++            ps2x::checkpoint::ByteWriter again;
++            checkpointSerializeRpc(again);
++            std::vector<uint8_t> blob2 = again.take();
++            ps2x::checkpoint::ByteReader r2(blob2.data(), blob2.size());
++            t.IsTrue(checkpointDeserializeRpc(r2, error), "round trip should load");
++            setRegU32(env.ctx, 4, kClientAddr);
++            setRegU32(env.ctx, 5, kSid);
++            setRegU32(env.ctx, 6, 0u);
++            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr).server, handle,
++                     "after a round trip the SID keeps the same IOP handle");
++        });
++
++        tc.Run("EE-registered servers keep their descriptor in EE RAM wherever it lives", [](TestCase &t)
++        {
++            // Classification is by registration, not by address: an EE server registered inside the old
++            // placeholder range is still a guest descriptor and is updated in place.
++            TestEnv env;
++            constexpr uint32_t kSdAddr = 0x01F10400u;
++            constexpr uint32_t kClientAddr = 0x0002FC00u;
++            constexpr uint32_t kSid = 0x20000F02u;
++            constexpr uint32_t kSendAddr = 0x0002FD00u;
++
++            SifInitRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            setRegU32(env.ctx, 29, K_STACK_ADDR);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x10u, 0u);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x14u, 0u);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x18u, 0u);
++            setRegU32(env.ctx, 4, kSdAddr);
++            setRegU32(env.ctx, 5, kSid);
++            setRegU32(env.ctx, 6, 0u);
++            setRegU32(env.ctx, 7, 0u);
++            SifRegisterRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(getRegS32(env.ctx, 2), KE_OK, "SifRegisterRpc should succeed");
++
++            setRegU32(env.ctx, 4, kClientAddr);
++            setRegU32(env.ctx, 5, kSid);
++            setRegU32(env.ctx, 6, 0u);
++            SifBindRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr).server, kSdAddr,
++                     "bind returns the registered EE descriptor");
++
++            setRegU32(env.ctx, 4, kClientAddr);
++            setRegU32(env.ctx, 5, 9u);
++            setRegU32(env.ctx, 6, 0u);
++            setRegU32(env.ctx, 7, kSendAddr);
++            setRegU32(env.ctx, 8, 4u);
++            setRegU32(env.ctx, 9, 0u);
++            setRegU32(env.ctx, 10, 0u);
++            setRegU32(env.ctx, 11, 0u);
++            writeGuestU32(env.rdram.data(), K_STACK_ADDR + 0x00u, 0u);
++            SifCallRpc(env.rdram.data(), &env.ctx, &env.runtime);
++            const SifRpcServerData sd = readGuestStruct<SifRpcServerData>(env.rdram.data(), kSdAddr);
++            t.Equals(sd.client, kClientAddr, "the EE descriptor records the calling client");
++            t.Equals(static_cast<uint32_t>(sd.rpc_number), 9u, "the EE descriptor records the RPC number");
++        });
+     });
+ }
