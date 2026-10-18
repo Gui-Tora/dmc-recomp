@@ -4,6 +4,8 @@
 #include "ipu/ps2_ipu.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include "p311_pad_test.inc"
 
 // Instrumented ret0 stand-ins for the 15 R5900/VU0 functions that are still not
@@ -70,24 +72,47 @@ namespace
 
 #undef DMC_INSTRUMENTED_RET0
 
+    // Diagnostic switch (GAMEPLAY_001L): DMC_RET0_NATIVE=name[,name...] leaves the listed ret0 stand-ins
+    // unregistered so their native bodies run instead. Only meaningful with a generated tree whose TOML omits those
+    // ret0@ entries (see analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md, sections 14-16). Unset (default):
+    // all 15 stand-ins are registered, so the default behaviour does not depend on it.
+    bool dmcRet0NativeRequested(const char *name)
+    {
+        const char *list = std::getenv("DMC_RET0_NATIVE");
+        if (!list || !*list)
+            return false;
+        const std::string all = std::string(",") + list + ",";
+        return all.find(std::string(",") + name + ",") != std::string::npos;
+    }
+
+    void registerRet0(PS2Runtime &runtime, uint32_t address, const char *name, PS2Runtime::RecompiledFunction fn)
+    {
+        if (dmcRet0NativeRequested(name))
+        {
+            std::fprintf(stderr, "[dmc-ret0-native] %s@0x%08X runs its native body (DMC_RET0_NATIVE)\n", name, address);
+            return;
+        }
+        runtime.registerFunction(address, fn);
+    }
+
     void applyHugeFunctionInstrumentation(PS2Runtime &runtime)
     {
         startP311PadTest();
-        runtime.registerFunction(0x0016B8E0u, dmcStub_Calc_md);
-        runtime.registerFunction(0x001A0180u, dmcStub_capVu0MulMatrix_r);
-        runtime.registerFunction(0x0016D920u, dmcStub_Calc_scr_light);
-        runtime.registerFunction(0x00132D20u, dmcStub_katVu0ViewVolumeClip);
-        runtime.registerFunction(0x001DA7B0u, dmcStub_katVu0Setmat4_shw);
-        runtime.registerFunction(0x00132DD0u, dmcStub_InterpNode);
-        runtime.registerFunction(0x00132EC0u, dmcStub_ClipCheck2);
-        runtime.registerFunction(0x00132EF0u, dmcStub_katVu0RotTransPersQ);
-        runtime.registerFunction(0x00132DA0u, dmcStub_katVu0Clip_ld);
-        runtime.registerFunction(0x001DA8E0u, dmcStub_katVu0RotTransPers_shw);
-        runtime.registerFunction(0x001D5E40u, dmcStub_sceVu0SetRotTransPers);
-        runtime.registerFunction(0x00132D70u, dmcStub_katVu0SetClip);
-        runtime.registerFunction(0x001A01F0u, dmcStub_capCopyMatrix);
-        runtime.registerFunction(0x0019FC40u, dmcStub_capVu0ScaleVectorXYZ2);
-        runtime.registerFunction(0x001A0300u, dmcStub_capVu0Compare);
+        registerRet0(runtime, 0x0016B8E0u, "Calc_md", dmcStub_Calc_md);
+        registerRet0(runtime, 0x001A0180u, "capVu0MulMatrix_r", dmcStub_capVu0MulMatrix_r);
+        registerRet0(runtime, 0x0016D920u, "Calc_scr_light", dmcStub_Calc_scr_light);
+        registerRet0(runtime, 0x00132D20u, "katVu0ViewVolumeClip", dmcStub_katVu0ViewVolumeClip);
+        registerRet0(runtime, 0x001DA7B0u, "katVu0Setmat4_shw", dmcStub_katVu0Setmat4_shw);
+        registerRet0(runtime, 0x00132DD0u, "InterpNode", dmcStub_InterpNode);
+        registerRet0(runtime, 0x00132EC0u, "ClipCheck2", dmcStub_ClipCheck2);
+        registerRet0(runtime, 0x00132EF0u, "katVu0RotTransPersQ", dmcStub_katVu0RotTransPersQ);
+        registerRet0(runtime, 0x00132DA0u, "katVu0Clip_ld", dmcStub_katVu0Clip_ld);
+        registerRet0(runtime, 0x001DA8E0u, "katVu0RotTransPers_shw", dmcStub_katVu0RotTransPers_shw);
+        registerRet0(runtime, 0x001D5E40u, "sceVu0SetRotTransPers", dmcStub_sceVu0SetRotTransPers);
+        registerRet0(runtime, 0x00132D70u, "katVu0SetClip", dmcStub_katVu0SetClip);
+        registerRet0(runtime, 0x001A01F0u, "capCopyMatrix", dmcStub_capCopyMatrix);
+        registerRet0(runtime, 0x0019FC40u, "capVu0ScaleVectorXYZ2", dmcStub_capVu0ScaleVectorXYZ2);
+        registerRet0(runtime, 0x001A0300u, "capVu0Compare", dmcStub_capVu0Compare);
     }
 }
 
