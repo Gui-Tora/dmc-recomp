@@ -21,24 +21,31 @@ project, not a playable port.
 - Rendering is still incomplete/corrupted
 - Later game states (gameplay, missions) are not yet functional. Past
   NEW GAME, the intro movie (`0x232`) plays to completion and the
-  real-time office cutscene that follows no longer stalls: in one ~46-minute
-  Release run its event script reached its end (GAMEPLAY_001J), with visual
-  defects and unsynchronized audio. The game then requests movie `0x231`,
-  loads the next scene and stops at an unimplemented PS2 stub
-  (`sceDmaRecvI`, IPU movie-texture path), before any gameplay; see
-  [`analysis/notes/GAMEPLAY_CURRENT_STATUS.md`](analysis/notes/GAMEPLAY_CURRENT_STATUS.md).
-  A first playable frame has not been demonstrated
+  real-time office cutscene that follows runs to its end. Since
+  GAMEPLAY_001L the IPU movie-texture path (`sceDmaRecvI`) no longer aborts:
+  one authorized run continued past movie `0x231` into the next 3D scene,
+  where the in-game status menu opens, but no character is visible and the
+  scene does not respond to movement. In the office, the characters and
+  most of the geometry are now drawn (Trish included), after fixes to the
+  VIF1 DMA chain walk, VU0 math helpers and VIF `UNPACK V4-5` (skinning
+  weights). A first playable frame has **not** been demonstrated; see
+  [`analysis/notes/GAMEPLAY_CURRENT_STATUS.md`](analysis/notes/GAMEPLAY_CURRENT_STATUS.md)
 - First audible game audio: the cutscene's streamed voice/audio track
   (XAG, through a reconstructed HLE of the game's `TSNDDRVM.IRX` sound
   driver). It plays at real-time speed and is not yet synchronized with the
   (much slower) emulated picture; sound effects, background music and movie
   audio are still silent
-- Performance is very low (far from real time): about 3–4 VSync/s
-  (vs. 50 on PAL) in 3D scenes on a Release build with the default VU1
-  interpreter. With the optional compiled VU1 programs (GAMEPLAY_001K,
-  generated locally, see "Optional: compiled VU1 programs") the post-intro
-  office scene runs at about 12.5 VSync/s; the software GS then becomes the
-  largest cost
+- Performance is very low (far from real time): about 3–5 VSync/s
+  (vs. 50 on PAL; 5.1 measured in the office on a clean Release build) even with the
+  optional compiled VU1 programs (GAMEPLAY_001K, generated locally, see
+  "Optional: compiled VU1 programs"). The 12.5 VSync/s measured in
+  GAMEPLAY_001K predates GAMEPLAY_001L: back then the runtime silently
+  dropped most of each frame's VIF1 DMA chain (characters were not drawn);
+  now the full chain reaches VU1 and the GS
+- Known visual defects: a horizontal band in the letterboxed presentation
+  (host presentation path), dark foreground figures still to be compared
+  with the original, and 15 VU0 helper functions still replaced by
+  diagnostic `ret0` stand-ins
 - Movie/PSS frames now render as recognizable, legible imagery (logo
   text, fire/smoke animation) after a GS double-buffer display
   environment fix, but playback is not yet fully correct (see
@@ -379,6 +386,30 @@ python scripts/pipeline.py bootstrap
 python scripts/pipeline.py tools
 python scripts/pipeline.py identify original/YOUR_ELF_NAME
 ```
+
+**Known build issue (pre-existing, not yet fixed):** a fresh CMake configuration
+defaults to `PS2X_ENABLE_FFMPEG=OFF`, and `scripts/pipeline.py build` does not change it.
+With FFmpeg disabled the runtime does not compile: `Kernel/Stubs/MPEG.cpp` calls
+`MpegFfmpegDecoder::drained()`, which exists only in the FFmpeg code path (from patch 10,
+`BLOCKER_004_p423_p424_mpeg_movie_completion.patch`). Configure with FFmpeg enabled. These are
+the exact options used for the GAMEPLAY_001L from-scratch validation (Release, 0 errors):
+
+```powershell
+# game (generated sources in <generated-dir>)
+cmake -S . -B <build-dir> -G "Visual Studio 17 2022" -A x64 `
+      -DDMC_GENERATED_DIR=<generated-dir> -DDMC_MSVC_MP_JOBS=4 -DPS2X_ENABLE_FFMPEG=ON
+cmake --build <build-dir> --config Release --target ps2EntryRunner --parallel 1 -- `
+      /p:UseMultiToolTask=true /p:CL_MPCount=4
+
+# runtime/recompiler tests
+cmake -S vendor/PS2Recomp -B <tests-dir> -G "Visual Studio 17 2022" -A x64 `
+      -DPS2X_BUILD_TEST=ON -DPS2X_BUILD_STUDIO=OFF -DPS2X_ENABLE_FFMPEG=ON `
+      -DPS2X_ENABLE_RUNTIME_LOGS=OFF -DPS2X_ENABLE_SCCACHE=OFF
+cmake --build <tests-dir> --config Release --target ps2x_tests --parallel 4
+```
+
+Use short build directories (for example `C:/b/game`): deep paths can exceed the Windows path
+limit while CMake fetches third-party submodules (seen with `toml11`).
 
 ### Optional: compiled VU1 programs
 

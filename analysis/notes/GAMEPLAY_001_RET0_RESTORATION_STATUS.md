@@ -1,6 +1,6 @@
 # GAMEPLAY_001 — Estado de restauración de las 20 funciones `ret0`
 
-Documento de seguimiento permanente. Última verificación: 2026-10-14 (cierre de GAMEPLAY_001I), contra el
+Documento de seguimiento permanente. Última verificación: 2026-10-18 (cierre de GAMEPLAY_001L); antes, 2026-10-14 (cierre de GAMEPLAY_001I), contra el
 árbol de trabajo local; `origin/master = 6cc8ce8`.
 
 Historia y metodología:
@@ -11,7 +11,29 @@ Historia y metodología:
 - [GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md](GAMEPLAY_001H_VIF1_TTE_ROOT_CAUSE.md): A/B Add/Sub previo, ecossin y `vf0`.
 - [GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md): restauración permanente de Add/Sub y experimento `vf0`.
 
-## Resumen verificado
+## Actualización GAMEPLAY_001L (2026-10-18, rama `gameplay-001l`, sin commit)
+
+- **Restauradas** (quitadas del TOML y de `dmc_overrides.cpp`): `_capVu0ecossin`, cuyo *stand-in* dejaba
+  matrices de personaje NaN, y `Get_light_str`, que dejaba la atenuación de luces puntuales a ≈1·10⁻⁷. Ambas
+  validadas 600/600 frente a modelos independientes. **`RET0_COUNT = 15`.**
+- **Parche 23** (traductor): `VCLIPw`, `VDIV` y `VFTOI` con la semántica del intérprete de PCSX2. Desbloquea el
+  grupo B de recorte.
+- **Experimento abierto**, sin restauración definitiva: `katVu0SetClip`, `katVu0Clip_ld`, `ClipCheck2`,
+  `katVu0ViewVolumeClip`, `katVu0RotTransPersQ`, `InterpNode` y `Calc_scr_light`.
+  - Sus cuerpos regenerados pasan el arnés offline frente a PCSX2, salvo **6 casos `InterpNode 0/0`**: la
+    saturación de `VMUL` del runtime da `±Inf` donde PCSX2 da `±FLT_MAX`.
+  - En la oficina ejecutan la rama de recorte cercano (≈80–220 triángulos por VSync) a +4 % de coste, pero
+    no eran la causa de las siluetas negras (que era `UNPACK V4-5`, parche 24).
+  - Se activan solo con `DMC_RET0_NATIVE` y un árbol generado sin sus `ret0@`.
+- Detalle: [GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md](GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md), secciones 13–17.
+
+Las 15 restantes:
+
+- `Calc_md`, `capVu0MulMatrix_r`, `Calc_scr_light`, `katVu0ViewVolumeClip`, `katVu0Setmat4_shw`;
+- `InterpNode`, `ClipCheck2`, `katVu0RotTransPersQ`, `katVu0Clip_ld`, `katVu0RotTransPers_shw`;
+- `sceVu0SetRotTransPers`, `katVu0SetClip`, `capCopyMatrix`, `capVu0ScaleVectorXYZ2`, `capVu0Compare`.
+
+## Resumen verificado (cierre de 001I; los recuentos de 001L están en la sección anterior)
 
 | Concepto | Local (árbol de trabajo) | GitHub (`origin/master` = `6cc8ce8`) |
 |---|---|---|
@@ -63,10 +85,10 @@ máximos registrados con el experimento TTE (`ttefixC16`, granularidad 1/50) o e
 | 1 | capVu0MulMatrix2 | `0x1A0080` | — | **NATIVA VALIDADA** (local; ret0 en GitHub) | sí, sincronizado en el árbol generado local | ninguno usado | primera llamada: AFTER de 64 B = oráculo (`oracle_compare.json`) | **sí**: 64 B BEFORE/AFTER, primera llamada | — | publicar TOML/overrides cuando se autorice código |
 | 2 | capVu0AddVectorXYZ | `0x19FBB0` | A | **NATIVA (001I, local)** | sí, sincronizado (SHA-256 `eb4d4c4c…`) | ninguno | sombra 200/200 EXACT; A/B 2+2 con TTE permanente: sin regresiones; diverge (de forma determinista) el camino de `Coat_matrix_calc`; exe final probado | no | — | publicar cuando se autorice código; oráculo ORIGINAL opcional |
 | 3 | capVu0SubVectorXYZ | `0x19FBD0` | A | **NATIVA (001I, local)** | sí, sincronizado (SHA-256 `78e5be78…`) | ninguno | sombra 200/200 EXACT; A/B 2+2 sin regresiones (6750 llamadas en ambos brazos); exe final probado | no | — | ídem |
-| 4 | _capVu0ecossin | `0x1A03C0` | A* | ret0 + sombra VU0 | sí | **SQRT**; depende de **`vf0.w = 1`** | sin corrección: coseno incorrecto (199/600). Con `DMC_VF0_FIX`: seno y coseno 600/600 bit a bit = modelo (001I); sin casos `1−s²<0` | no | 1 | hacer permanente la corrección `vf0` (cambio general); después A/B ret0 frente a nativa |
+| 4 | _capVu0ecossin | `0x1A03C0` | A* | **NATIVA (001L, local)**; antes ret0 + sombra VU0 | sí | **SQRT**; depende de **`vf0.w = 1`** | sin corrección: coseno incorrecto (199/600). Con `DMC_VF0_FIX`: seno y coseno 600/600 bit a bit = modelo (001I); sin casos `1−s²<0` | no | 1 | hacer permanente la corrección `vf0` (cambio general); después A/B ret0 frente a nativa |
 | 5 | katVu0SetClip | `0x132D70` | A† | ret0 | sí | ninguno (8 `lqc2`) | ≥6150 llamadas por frame tras la película | no | 3 | restaurar junto a su consumidora `katVu0Clip_ld` |
 | 6 | katVu0Clip_ld | `0x132DA0` | B | ret0 | sí | **CLIP** | ≥251 550 llamadas (~5500/tick) | no | 3 | corregir `vclipw` en el traductor (parche general) y oráculo de una llamada |
-| 7 | Get_light_str | `0x16D8E0` | A | ret0 | sí | `vmaxx` no ejercitado en otro código | ≥20 600 llamadas; inicialización de escena normal | no | 4 | sombra con modelo de referencia |
+| 7 | Get_light_str | `0x16D8E0` | A | **NATIVA (001L, local)**: 600/600 EXACT; antes ret0 | sí | `vmaxx` no ejercitado en otro código | ≥20 600 llamadas; inicialización de escena normal | no | 4 | sombra con modelo de referencia |
 | 8 | katVu0Setmat4_shw | `0x1DA7B0` | A† | ret0 | sí | ninguno (16 `lqc2`) | ≥100 llamadas | no | 5 | restaurar junto a `katVu0RotTransPers_shw` |
 | 9 | capVu0MulMatrix_r | `0x1A0180` | A | ret0 | sí | ninguno (mismos opcodes que MulMatrix2) | no observada | no | 6 | sombra cuando se observe |
 | 10 | capCopyMatrix | `0x1A01F0` | A | ret0 | sí | ninguno (`lqc2`/`sqc2`) | no observada | no | 6 | ídem |
