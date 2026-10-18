@@ -513,3 +513,30 @@ arriba). Los diecinueve patches actualmente activos:
     Tests en `ps2_memory_tests.cpp`: cadena de 10 000 tags completa, 5 000
     llamadas a un mismo subprograma (no es un ciclo) y los cuatro casos de
     error. Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.
+
+23. `GAMEPLAY_001L_vu0_clip_div_ftoi_semantics.patch` (convención B).
+    Semántica de tres instrucciones VU0 en modo macro, en el traductor
+    (`vu_translator.cpp`, `vu_translation_helpers.cpp`), tomada del
+    intérprete de PCSX2 (`VUops.cpp`: `_vuCLIP`, `_vuDIV`, `floatToInt`):
+    - `VCLIPw`: compara `x`, `y`, `z` con `|w|` sobre los bits IEEE
+      (signo-magnitud). Bits `+x 0x01`, `−x 0x02`, `+y 0x04`, `−y 0x08`,
+      `+z 0x10`, `−z 0x20`; un `w` desnormal cuenta como el mayor desnormal.
+      Antes el orden de los bits estaba invertido (`−x` en el bit 0) y se
+      comparaba con `w` en lugar de `|w|`, así que un punto con `w < 0` salía
+      marcado en casi todos los planos.
+    - `VDIV`: operandos por `vuDouble`. Una división entre 0 da
+      `±0x7F7FFFFF` según el XOR de los signos (antes daba `0`), y el
+      cociente se satura igual que en PCSX2.
+    - `VFTOIn`: `|valor| ≥ 2^31` (también `Inf` y `NaN`) satura a
+      `0x7FFFFFFF` o `0x80000000` según el signo. Antes `cvttps` devolvía
+      siempre `0x80000000`.
+
+    `VSQRT`, `VRSQRT` y la falta de saturación de desbordamiento en
+    `VADD`/`VMUL` no cambian.
+
+    Con el mismo TOML, regenerar cambia 15 cuerpos de DMC. Pruebas:
+    - Test de emisión en `code_generator_tests.cpp`, con las palabras
+      reales `vclipw.xyz`, `vdiv` y `vftoi4`.
+    - Arnés offline que ejecuta los cuerpos generados frente a un modelo
+      PCSX2 y a un oráculo matemático de `CLIP`, descrito en
+      `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.

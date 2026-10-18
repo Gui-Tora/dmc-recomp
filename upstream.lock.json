@@ -91,6 +91,10 @@
     {
       "path": "patches/GAMEPLAY_001L_dma_chain_walk_budget.patch",
       "sha256": "feb356dfef7aad1752822eb346836e74446d21f3b485c3887809b45a28bf3faa"
+    },
+    {
+      "path": "patches/GAMEPLAY_001L_vu0_clip_div_ftoi_semantics.patch",
+      "sha256": "e603f6a409b058c32db7ae2214137b77609f9bb5c1370e2205aa5dcea65038a0"
     }
   ],
   "patch_identity": {
@@ -99,5 +103,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "e5b59d679733225e637254649f10a742b9a40b5b"
+  "patched_commit": "6595edf820c180b121b7cd0dbfa7fc8e89475cfd"
 }

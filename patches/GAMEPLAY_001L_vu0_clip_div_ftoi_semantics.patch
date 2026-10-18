@@ -1,0 +1,118 @@
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..6d9cb00 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -75,7 +75,16 @@ namespace ps2recomp
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        // PCSX2 VUops.cpp _vuDIV: operands through vuDouble (denormal -> signed 0, Inf/NaN -> signed max);
++        // ft == 0 gives +/-0x7F7FFFFF by the XOR of the raw signs; the quotient is clamped the same way.
++        return fmt::format("{{ uint32_t fsv[4]; uint32_t ftv[4]; std::memcpy(fsv, &ctx->vu0_vf[{}], 16); std::memcpy(ftv, &ctx->vu0_vf[{}], 16); "
++                           "const uint32_t fsb = fsv[{}]; const uint32_t ftb = ftv[{}]; "
++                           "auto vuClamp = [](uint32_t b) -> uint32_t {{ const uint32_t e = b & 0x7F800000u; return e == 0u ? (b & 0x80000000u) : (e == 0x7F800000u ? ((b & 0x80000000u) | 0x7F7FFFFFu) : b); }}; "
++                           "uint32_t fsc = vuClamp(fsb), ftc = vuClamp(ftb); float fsf; float ftf; std::memcpy(&fsf, &fsc, 4); std::memcpy(&ftf, &ftc, 4); "
++                           "uint32_t qb; "
++                           "if (ftf == 0.0f) qb = ((fsb ^ ftb) & 0x80000000u) ? 0xFF7FFFFFu : 0x7F7FFFFFu; "
++                           "else {{ const float q = fsf / ftf; std::memcpy(&qb, &q, 4); qb = vuClamp(qb); }} "
++                           "std::memcpy(&ctx->vu0_q, &qb, 4); }}", fs_reg, ft_reg, fsf, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+@@ -753,9 +762,14 @@ namespace ps2recomp
+         uint8_t dest_mask = inst.vectorInfo.vectorField;
+         float scale = (shift == 0) ? 1.0f : static_cast<float>(1 << shift);
+ 
++        // PCSX2 VUops.cpp floatToInt: scale by 2^shift, truncate; |value| >= 2^31 (exponent field >= 0x4F000000,
++        // Inf and NaN included) saturates to 0x7FFFFFFF or 0x80000000 by sign.
+         return fmt::format("{{ __m128 src = ctx->vu0_vf[{}]; "
+                            "src = _mm_mul_ps(src, _mm_set1_ps({})); "
+-                           "__m128i res_i = _mm_cvttps_epi32(src); "
++                           "const __m128i bits = _mm_castps_si128(src); "
++                           "const __m128i big = _mm_cmpgt_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_set1_epi32(0x4EFFFFFF)); "
++                           "const __m128i sat = _mm_xor_si128(_mm_set1_epi32(0x7FFFFFFF), _mm_srai_epi32(bits, 31)); "
++                           "__m128i res_i = _mm_blendv_epi8(_mm_cvttps_epi32(src), sat, big); "
+                            "__m128 res = _mm_castsi128_ps(res_i); "
+                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+diff --git a/ps2xRecomp/src/lib/vu_translator.cpp b/ps2xRecomp/src/lib/vu_translator.cpp
+index d0fc95d..9b9791c 100644
+--- a/ps2xRecomp/src/lib/vu_translator.cpp
++++ b/ps2xRecomp/src/lib/vu_translator.cpp
+@@ -266,19 +266,18 @@ namespace ps2recomp
+                     uint8_t field = inst.function & 0x3;
+                     std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
+ 
++                    // CLIP judges fs.xyz against |ft.w| on the raw IEEE bits (PCSX2 VUops.cpp _vuCLIP): +x 0x01,
++                    // -x 0x02, +y 0x04, -y 0x08, +z 0x10, -z 0x20; a denormal w counts as the largest denormal.
++                    (void)shuffle_pattern;
+                     return fmt::format(
+-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
+-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
+-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
+-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
+-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
+-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
+-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
+-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
+-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
+-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
+-                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
+-                        inst.rd, inst.rt, inst.rt, shuffle_pattern);
++                        "{{ uint32_t fs[4]; uint32_t ft[4]; std::memcpy(fs, &ctx->vu0_vf[{}], 16); std::memcpy(ft, &ctx->vu0_vf[{}], 16); "
++                        "const int32_t lim = (ft[{}] & 0x7F800000u) ? (int32_t)(ft[{}] & 0x7FFFFFFFu) : 0x007FFFFF; "
++                        "uint32_t flags = 0; "
++                        "if ((int32_t)fs[0] > lim) flags |= 0x01u; if ((int32_t)(fs[0] ^ 0x80000000u) > lim) flags |= 0x02u; "
++                        "if ((int32_t)fs[1] > lim) flags |= 0x04u; if ((int32_t)(fs[1] ^ 0x80000000u) > lim) flags |= 0x08u; "
++                        "if ((int32_t)fs[2] > lim) flags |= 0x10u; if ((int32_t)(fs[2] ^ 0x80000000u) > lim) flags |= 0x20u; "
++                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | flags) & 0xFFFFFFu; }}",
++                        inst.rd, inst.rt, field, field);
+                 }
+                 case VU0_S2_VNOP:
+                     return fmt::format("// NOP operation, no action needed for VU0");
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 1a1f370..bfbac4a 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -2,6 +2,7 @@
+ #include "ps2recomp/code_generator.h"
+ #include "ps2recomp/instructions.h"
+ #include "ps2recomp/ps2_recompiler.h"
++#include "ps2recomp/r5900_decoder.h"
+ #include "ps2recomp/types.h"
+ #include <filesystem>
+ #include <fstream>
+@@ -1294,6 +1295,32 @@ void register_code_generator_tests()
+                      "OPMSUB must preserve ACC after producing the cross product");
+         });
+ 
++        tc.Run("VU0 CLIP, DIV and FTOI follow the PCSX2 interpreter (sign-magnitude |w|, x/0, saturation)", [](TestCase &t) {
++            // Real words from a near-clip path: vclipw.xyz $vf12, $vf12w / vdiv $Q, $vf0w, $vf9w / vftoi4.xyzw $vf10, $vf9.
++            R5900Decoder decoder;
++            CodeGenerator gen({}, {});
++            const std::string clip = gen.translateInstruction(decoder.decodeInstruction(0x1000u, 0x4BCC61FFu));
++            const std::string div = gen.translateInstruction(decoder.decodeInstruction(0x1004u, 0x4BE903BCu));
++            const std::string ftoi = gen.translateInstruction(decoder.decodeInstruction(0x1008u, 0x4BEA497Du));
++
++            t.IsTrue(clip.find("ft[3] & 0x7FFFFFFFu") != std::string::npos, "CLIP must judge against |w| (w of either sign)");
++            t.IsTrue(clip.find("0x007FFFFF") != std::string::npos, "CLIP must treat a denormal w as the largest denormal");
++            t.IsTrue(clip.find("if ((int32_t)fs[0] > lim) flags |= 0x01u;") != std::string::npos, "CLIP bit 0 is +x (x > +|w|)");
++            t.IsTrue(clip.find("if ((int32_t)(fs[0] ^ 0x80000000u) > lim) flags |= 0x02u;") != std::string::npos, "CLIP bit 1 is -x (x < -|w|)");
++            t.IsTrue(clip.find("if ((int32_t)(fs[2] ^ 0x80000000u) > lim) flags |= 0x20u;") != std::string::npos, "CLIP bit 5 is -z");
++            t.IsTrue(clip.find("((ctx->vu0_clip_flags << 6) | flags) & 0xFFFFFFu") != std::string::npos, "CLIP shifts 6 bits and keeps 24");
++            t.IsTrue(clip.find("_mm_cmpgt_ps") == std::string::npos, "CLIP must not use a signed float compare against w");
++
++            t.IsTrue(div.find("0xFF7FFFFFu : 0x7F7FFFFFu") != std::string::npos, "DIV by zero gives +/-max by the XOR of the signs");
++            t.IsTrue(div.find(": 0.0f") == std::string::npos, "DIV by zero must not produce 0");
++            t.IsTrue(div.find("ftv[3]") != std::string::npos && div.find("fsv[3]") != std::string::npos, "DIV reads the w lanes");
++
++            t.IsTrue(ftoi.find("_mm_set1_ps(16.0f)") != std::string::npos, "FTOI4 scales by 16");
++            t.IsTrue(ftoi.find("0x4EFFFFFF") != std::string::npos, "FTOI saturates when |value| >= 2^31");
++            t.IsTrue(ftoi.find("_mm_set1_epi32(0x7FFFFFFF), _mm_srai_epi32(bits, 31)") != std::string::npos,
++                     "FTOI saturates to 0x7FFFFFFF or 0x80000000 by sign");
++        });
++
+         tc.Run("VU0 S2 vector ops use rd as source and rt as destination", [](TestCase &t) {
+             Instruction inst{};
+             inst.opcode = OPCODE_COP2;
