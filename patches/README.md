@@ -492,3 +492,24 @@ arriba). Los diecinueve patches actualmente activos:
     `IopHost::allocateIopHandle` (solo los usa `cri_dtx`, que DMC no carga).
     Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`
     (sección 11).
+
+22. `GAMEPLAY_001L_dma_chain_walk_budget.patch` (convención B). Recorrido de
+    cadenas DMA de origen (VIF0, VIF1, GIF) sin el límite fijo de 4096 tags:
+    - Antes se procesaban como mucho 4096 tags y el resto de la cadena se
+      descartaba en silencio. En la oficina de DMC las cadenas VIF1 miden
+      9 248-16 620 tags por fotograma, así que se perdía entre el 55 % y el
+      75 % de la geometría (personajes y escenario cercano incluidos).
+    - Ahora la cadena se recorre hasta su tag de fin (`refe`, `end`, `ret`
+      con la pila vacía, o IRQ con `TIE`). Los ciclos se detectan de forma
+      exacta: el mismo tag visitado con la misma pila de `CALL` (`ASP`,
+      `ASR0`, `ASR1`). El presupuesto de seguridad es de 2^18 tags (16 veces
+      la cadena más larga medida) y solo acota cadenas acíclicas
+      patológicas.
+    - Un ciclo, un presupuesto agotado, un `CALL` con `ASP = 2` o un tag
+      fuera de memoria se informan con `RUNTIME_ERROR`. No se encola nada y
+      `STR` queda activo: una transferencia incompleta nunca se presenta
+      como terminada.
+
+    Tests en `ps2_memory_tests.cpp`: cadena de 10 000 tags completa, 5 000
+    llamadas a un mismo subprograma (no es un ciclo) y los cuatro casos de
+    error. Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.
