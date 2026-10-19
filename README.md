@@ -387,12 +387,16 @@ python scripts/pipeline.py tools
 python scripts/pipeline.py identify original/YOUR_ELF_NAME
 ```
 
-**Known build issue (pre-existing, not yet fixed):** a fresh CMake configuration
-defaults to `PS2X_ENABLE_FFMPEG=OFF`, and `scripts/pipeline.py build` does not change it.
-With FFmpeg disabled the runtime does not compile: `Kernel/Stubs/MPEG.cpp` calls
-`MpegFfmpegDecoder::drained()`, which exists only in the FFmpeg code path (from patch 10,
-`BLOCKER_004_p423_p424_mpeg_movie_completion.patch`). Configure with FFmpeg enabled. These are
-the exact options used for the GAMEPLAY_001L from-scratch validation (Release, 0 errors):
+**FFmpeg.** MPEG/PSS movie video is decoded with FFmpeg. On Windows, CMake downloads a pinned
+prebuilt FFmpeg (`ps2xRuntime/CMakeLists.txt`, tag `n7.1-241205`) when `PS2X_ENABLE_FFMPEG=ON`.
+The root `CMakeLists.txt` of this repository seeds the option as `OFF`, so pass it explicitly:
+
+- `-DPS2X_ENABLE_FFMPEG=ON`: the validated configuration; movies have video.
+- `-DPS2X_ENABLE_FFMPEG=OFF`: no download; the runtime and its tests build (patch 25 fixed a
+  compile error in this mode), but movies have no video. Useful without network access or for
+  runtime-only work.
+
+These are the exact options used for the GAMEPLAY_001L from-scratch validation (Release, 0 errors):
 
 ```powershell
 # game (generated sources in <generated-dir>)
@@ -407,6 +411,9 @@ cmake -S vendor/PS2Recomp -B <tests-dir> -G "Visual Studio 17 2022" -A x64 `
       -DPS2X_ENABLE_RUNTIME_LOGS=OFF -DPS2X_ENABLE_SCCACHE=OFF
 cmake --build <tests-dir> --config Release --target ps2x_tests --parallel 4
 ```
+
+Runtime and tests were also validated with `-DPS2X_ENABLE_FFMPEG=OFF`: 0 errors, and the same 25
+pre-existing `ps2x_tests` failures as with FFmpeg on.
 
 Use short build directories (for example `C:/b/game`): deep paths can exceed the Windows path
 limit while CMake fetches third-party submodules (seen with `toml11`).

@@ -10,7 +10,7 @@ copy of the game to build and run anything.
 
 ## [Unreleased] — GAMEPLAY_001L (under review) — still NOT PLAYABLE
 
-### Fixed (general PS2Recomp runtime/recompiler patches 20–24)
+### Fixed (general PS2Recomp runtime/recompiler patches 20–25)
 
 - **20** IPU `IDEC` decoding plus `toIPU`/`fromIPU`/`fromSPR` DMA and `sceDmaRecvI`: the IPU movie-texture
   path no longer aborts after movie `0x231`.
@@ -23,6 +23,9 @@ copy of the game to build and run anything.
   and `|w|`, x/0 → ±max, float→int saturation).
 - **24** VIF1 `UNPACK V4-5` expands RGBA5551 like the hardware (`<<3`, alpha to bit 7). DMC stores its
   skinning weights there; 8× smaller weights collapsed skinned vertices towards the world origin.
+- **25** Builds with `PS2X_ENABLE_FFMPEG=OFF` compile again: the MPEG decoder stub gets `drained()`
+  (always true). Patch 10 had added the method only to the FFmpeg decoder. With FFmpeg on, the compiled
+  code is unchanged.
 
 ### Changed (DMC-specific)
 

@@ -941,3 +941,31 @@ El coste nuevo se concentra en VU1: ×2,3 llamadas, pero ×7 de tiempo, porque l
   - juego: solo `ps2_ipu.cpp` y `dmc_overrides.cpp` (este por la retirada de la sonda de recorte), 0 errores, exe `feee3cd3…`;
   - tests: solo `ps2_ipu.cpp` y `ps2_ipu_tests.cpp`; 450 tests, los mismos 25 fallos preexistentes, IPU 5/5.
 - No se repitió la build completa: el contenido funcional no cambió.
+
+## 19. Build sin FFmpeg: parche 25 (`analysis/local/gameplay_001l/ffmpeg_off/`)
+
+**Causa (HECHO):**
+
+- El parche 10 (`BLOCKER_004_p423_p424_mpeg_movie_completion.patch`, P4.2.4) añadió `MpegFfmpegDecoder::drained()` solo a la clase con FFmpeg. También añadió tres condiciones de fin de película que lo llaman sin `#if` (`Kernel/Stubs/MPEG.cpp`, líneas 3517, 3898 y 3953).
+- La clase sustituta sin FFmpeg (`#else`) tiene `feed`, `flush` y `reset`, pero no `drained()`. Es el único miembro que falta.
+- Upstream `main` no tiene el problema: no contiene ni el accesor ni esas condiciones.
+- Además, el `CMakeLists.txt` raíz del repositorio siembra `PS2X_ENABLE_FFMPEG=OFF` («Initial bring-up»). Una configuración nueva sin `-D` cae en ese modo. La build de trabajo tenía `ON` porque se configuró a mano.
+
+**Corrección: parche 25**, `GAMEPLAY_001L_mpeg_stub_drained_without_ffmpeg.patch`. Lock con 25 parches, `patched_commit e86516d5c335a443d53b40b79eabc210bbaf043a`.
+
+- El sustituto devuelve siempre `drained() = true`. Sin decodificador no hay nada en búfer ni ningún vaciado de fin de flujo pendiente.
+- Copiar la lógica de la clase con FFmpeg sería un error: allí solo pasa a `true` tras `flush()` con el decodificador inicializado. El sustituto nunca se inicializa, así que la película no terminaría nunca.
+- Con el valor fijo, el fin de película sin FFmpeg depende solo de los bytes ES consumidos, como antes de P4.2.4 y como en upstream.
+- No se modifica el parche 10.
+
+**Validación (HECHO):**
+
+- Sin FFmpeg (runtime + `ps2x_tests` en una configuración nueva):
+  - sin la corrección, exactamente los 3 errores `C2039 drained`; con ella, 0 errores;
+  - 450 tests y los mismos 25 fallos preexistentes.
+- Con FFmpeg:
+  - el preprocesado de `MPEG.cpp` con los flags reales es idéntico token a token;
+  - `MPEG.obj` antes y después es idéntico byte a byte (`6812eecb…`), así que el ejecutable validado de 001L no cambia;
+  - builds incrementales (solo `MPEG.cpp`), 0 errores; 450 tests y los mismos 25 fallos.
+- Replay de los 25 parches desde el árbol de trabajo y desde los bytes del índice de Git: coincide con el lock, y el vendor es idéntico en los 268 ficheros.
+- No se repitió la build completa ni hubo corridas largas.

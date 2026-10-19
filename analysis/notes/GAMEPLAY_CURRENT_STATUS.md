@@ -1,11 +1,11 @@
 # Estado actual del proyecto — punto de entrada para nuevos agentes
 
-Última actualización: 2026-10-18, cierre de GAMEPLAY_001L (parches 20–24: IPU, RPC, DMA, VU0, VIF V4-5; personajes de la oficina recuperados) — [GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md](GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md).
+Última actualización: 2026-10-19, cierre de GAMEPLAY_001L (parches 20–25: IPU, RPC, DMA, VU0, VIF V4-5, build sin FFmpeg; personajes de la oficina recuperados) — [GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md](GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md).
 Índice histórico completo: [RESEARCH_INDEX.md](RESEARCH_INDEX.md).
 Reglas del proyecto: [AGENTS.md](../../AGENTS.md) (obligatorias) y [README.md](../../README.md).
 
 > **Aviso:** `master` (`b6f7934`, PR #4) contiene el trabajo hasta 001K (19 parches). El trabajo de 001L
-> (parches 20–24, notas) está en la rama local `gameplay-001l`, **sin commit**, preparado para revisión. Lee la
+> (parches 20–25, notas) está en la rama `gameplay-001l`, publicada como Draft PR #5 y pendiente de revisión. Lee la
 > sección «Estado remoto frente a estado local».
 > **El juego no es jugable. DMC-Recomp es experimental.** `FIRST_PLAYABLE_FRAME` **no** está demostrado.
 
@@ -19,7 +19,7 @@ Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
 | ELF | `SLES_503.58`; SHA-256 `d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`; CRC32 `0x77654AD2`; entry `0x00100008` |
 | `CDMODULE.IRX` | SHA-256 `9d51f16d1ed861e508daa1389e6aaf4fe597687b3f0cd5feb920e62a479b34fa` |
 | `TSNDDRVM.IRX` | SHA-256 `c00b17f07aa0dfed089a517498074eec251c7b571f58a7649414ef88be7f31fd` |
-| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master`: 19 parches. Rama `gameplay-001l`: **24 parches** (`patched_commit` `54fbaadaa1ce7fee2b5235b0685b93c1e22f6b30`), vendor idéntico byte a byte al replay limpio |
+| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master`: 19 parches. Rama `gameplay-001l`: **25 parches** (`patched_commit` `e86516d5c335a443d53b40b79eabc210bbaf043a`), vendor idéntico byte a byte al replay limpio |
 | Límites de función | `.symtab` del ELF (*symtab-first*), no Ghidra. Ver [SYMTAB_BASELINE_PROMOTION.md](SYMTAB_BASELINE_PROMOTION.md) |
 | Herramientas | Rabbitizer (en ps2_recomp), Ghidra solo para navegación y xrefs, PCSX2 2.8.2 como oráculo (PINE de solo lectura + debugger manual del usuario) |
 | Repositorio | `https://github.com/Gui-Tora/dmc-recomp` (rama principal `master`) |
@@ -207,12 +207,17 @@ GAMEPLAY_001J está documentada en
 
 ## 10. Estado remoto frente a estado local
 
-**Verificado 2026-10-18, cierre de 001L:**
+**Verificado 2026-10-19, cierre de 001L:**
 
 - `origin/master = b6f7934` (PR #4, 001K). 001J y 001K están fusionadas.
 - `v0.1.0-alpha` publicada (`NOT PLAYABLE`).
-- Rama local `gameplay-001l` con el trabajo de 001L **sin commit**:
-  - parches 20–24 en `patches/` y `upstream.lock.json`;
+- Rama `gameplay-001l` con el trabajo de 001L:
+  - commits sobre `b6f7934`;
+  - publicada como **Draft PR #5**, sin fusionar;
+  - los commits del parche 25 y de la configuración de FFmpeg, aún sin push.
+
+  Contenido:
+  - parches 20–25 en `patches/` y `upstream.lock.json`;
   - `recomp/symtabfirst.toml` con 15 `ret0`;
   - `runtime/dmc_overrides.cpp`: restauraciones, `libipu`, conmutador de diagnóstico `DMC_RET0_NATIVE`;
   - `CMakeLists.txt` y las notas.
@@ -253,11 +258,15 @@ python scripts/pipeline.py run --seconds 60
 `pipeline.py` sincroniza el código generado en `analysis/local/symtabfirst/generated` y compila en
 `analysis/local/symtabfirst/build` ([SYMTAB_BASELINE_PROMOTION.md](SYMTAB_BASELINE_PROMOTION.md)).
 
-> **Aviso (comprobado en el cierre de 001L):** una configuración nueva deja `PS2X_ENABLE_FFMPEG=OFF` por
-> defecto, y `pipeline.py build` no lo cambia. Con FFmpeg desactivado, el runtime **no compila**:
-> `Kernel/Stubs/MPEG.cpp` llama a `MpegFfmpegDecoder::drained()`, que solo existe en la rama con FFmpeg. La
-> llamada viene del parche 10 (`BLOCKER_004_p423_p424_mpeg_movie_completion.patch`). Hay que configurar con
-> `-DPS2X_ENABLE_FFMPEG=ON`, como la build de trabajo. Pendiente de corregir en una fase propia.
+> **FFmpeg (cierre de 001L):**
+> - El `CMakeLists.txt` raíz siembra `PS2X_ENABLE_FFMPEG=OFF`, así que la opción debe pasarse de forma
+>   explícita.
+> - Con `ON` (la configuración validada), CMake descarga el FFmpeg precompilado fijado y las películas
+>   tienen vídeo.
+> - Con `OFF` no hay descarga y las películas quedan sin vídeo. Hasta el parche 25 el runtime no compilaba
+>   en este modo: `drained()` del parche 10 solo existía con FFmpeg.
+> - Con el parche 25, runtime y tests compilan en ambos modos: 450 tests y los mismos 25 fallos.
+> - Opciones exactas de CMake: README, sección «Build».
 
 Pasos locales del mantenedor (scripts bajo `analysis/local/`, no versionados):
 
