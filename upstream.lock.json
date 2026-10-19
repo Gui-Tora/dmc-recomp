@@ -99,6 +99,10 @@
     {
       "path": "patches/GAMEPLAY_001L_vif_v45_unpack_fix.patch",
       "sha256": "acf0da39c6ad1a5bf95a4342b9fde6290b12a701db5efa21642e04b308c536bb"
+    },
+    {
+      "path": "patches/GAMEPLAY_001L_mpeg_stub_drained_without_ffmpeg.patch",
+      "sha256": "1dc88f8e9d533a250d64adc6ad0af87caaafaa8329060528df475de7bcb54996"
     }
   ],
   "patch_identity": {
@@ -107,5 +111,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "54fbaadaa1ce7fee2b5235b0685b93c1e22f6b30"
+  "patched_commit": "e86516d5c335a443d53b40b79eabc210bbaf043a"
 }

@@ -560,3 +560,15 @@ arriba). Los diecinueve patches actualmente activos:
 
     Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`,
     sección 16.
+
+25. `GAMEPLAY_001L_mpeg_stub_drained_without_ffmpeg.patch` (convención B).
+    `Kernel/Stubs/MPEG.cpp`: el sustituto del decodificador MPEG para builds sin FFmpeg
+    (`PS2X_ENABLE_FFMPEG=OFF`) recibe `drained()`, que devuelve siempre `true`.
+    - El parche 10 (BLOCKER_004 p423/p424) añadió `drained()` solo a la clase con FFmpeg, y tres
+      condiciones de fin de película lo llaman sin `#if`. Sin FFmpeg el runtime no compilaba.
+    - Sin decodificador no hay nada en búfer ni ningún vaciado de fin de flujo pendiente, así que el fin
+      de película depende solo de los bytes ES consumidos, como antes de P4.2.4 y como en upstream.
+    - Con FFmpeg el código no cambia: el preprocesado es idéntico token a token y `MPEG.obj` es idéntico
+      byte a byte.
+    - Validación: 450 tests y los mismos 25 fallos preexistentes, tanto con FFmpeg ON como OFF.
+      Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`, sección 19.
