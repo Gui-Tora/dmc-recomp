@@ -592,3 +592,20 @@ arriba). Los diecinueve patches actualmente activos:
       campo de 224.
     - Los checkpoints existentes guardan las estructuras de display creadas en el arranque con el HLE
       anterior, y `g_gparam` no forma parte del checkpoint; el cambio solo se aplica tras un arranque en frío.
+
+27. `VISUAL_001_pcrtc_circuit_presentation.patch` (convención B). `gs/gs_cpu_backend.cpp`: composición de
+    los dos circuitos del PCRTC según `DISPLAY` y `SMODE2`.
+    - Por circuito: ancho `(DW+1)/(MAGH+1)` y `DH+1` líneas de ráster. En modo campo (`SMODE2` = 3) se leen
+      `(DH+1)/2` filas y cada fila cubre dos líneas; en los demás modos, una fila por línea (el caso de q101,
+      buffers FRAME de 448 filas, no cambia).
+    - Los circuitos se colocan en `DX/DY` dentro de la unión de ambos, con la mezcla `PMODE` de antes
+      (`ALP`/`MMOD`, `SLBG`, `BGCOLOR`).
+    - Corrige la banda verde (el circuito 1 leía 64 filas desde FBP 504 y daba la vuelta a FBP 0) y la franja
+      desplazada (el circuito 1 se pintaba en la fila 0). La salida de DMC pasa de 512×224 a 512×448.
+    - No se entrelazan campos ni se desplaza por paridad: el frame llega al presentador de forma asíncrona
+      respecto al swap del juego, y la paridad del VSync en ese momento no identifica el campo del buffer.
+    - Tests: 5 nuevos (filas de campo y posición `DY` sin vuelta de VRAM, dos circuitos en `DX/DY` con
+      mezcla y `SLBG`, 448 líneas en modo campo, sin mezcla con el campo anterior, FRAME lee todas las filas).
+      El test preexistente «line-doubles interlaced field output» usaba `SMODE2` = 1 (FRAME) con el
+      comentario «field mode»; pasa a `SMODE2` = 3 y ahora pasa.
+    - Validación: 458 tests, 24 fallos preexistentes (25 antes; ninguno nuevo).
