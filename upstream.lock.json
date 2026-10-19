@@ -103,6 +103,14 @@
     {
       "path": "patches/GAMEPLAY_001L_mpeg_stub_drained_without_ffmpeg.patch",
       "sha256": "1dc88f8e9d533a250d64adc6ad0af87caaafaa8329060528df475de7bcb54996"
+    },
+    {
+      "path": "patches/VISUAL_001_hle_libgraph_display_env.patch",
+      "sha256": "dfd8974b1ef8ad92efc3457cb9a5abbc5d451d186b08e4b82eb0acb4a1ce29fb"
+    },
+    {
+      "path": "patches/VISUAL_001_pcrtc_circuit_presentation.patch",
+      "sha256": "87389d52fecaa71489712bae5229d4b5b86a560c3da3ada5c51205b61ae01aae"
     }
   ],
   "patch_identity": {
@@ -111,5 +119,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "e86516d5c335a443d53b40b79eabc210bbaf043a"
+  "patched_commit": "e58f58b93897d28a8fa5f47f9f8c2e73601f5b23"
 }

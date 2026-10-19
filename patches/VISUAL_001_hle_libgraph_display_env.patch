@@ -1,0 +1,361 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 7dc6904..f0004f3 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -71,6 +71,77 @@ namespace ps2_stubs
+             uint32_t arg2 = 0u;
+         };
+ 
++        // libgraph sceGsSetDefDispEnv display rules, recovered by disassembly (VISUAL_001, SLES_503.58
++        // @0x1002E8; sceGsSetDefDBuffDc @0x101B48 calls it for disp[0] and disp[1] with dx = dy = 0).
++        // Every value comes from the video mode that sceGsResetGraph stored in g_gparam:
++        //   PMODE 0x66; SMODE2 2 (progressive), 1 (interlaced FRAME) or 3 (interlaced FIELD);
++        //   MAGH = (w + 2559) / w - 1 and DW = (MAGH + 1) * w - 1, i.e. the buffer spans ~2560 video clocks;
++        //   DX = dx * (MAGH + 1) + 636 (NTSC) or 656 (PAL);
++        //   DY = dy + 50 / 72 (interlaced NTSC / PAL) or dy + 25 / 36 (progressive);
++        //   DH = 2h - 1 in interlaced FIELD mode (DH counts frame lines), h - 1 otherwise; BGCOLOR 0.
++        // For any other omode the original prints an error and does not write DISPLAY.
++        struct GsDefDispEnv
++        {
++            uint64_t pmode = 0u;
++            uint64_t smode2 = 0u;
++            uint64_t dispfb = 0u;
++            uint64_t display = 0u;
++            bool hasDisplay = false;
++        };
++
++        GsDefDispEnv computeGsDefDispEnv(uint32_t psmArg, uint32_t wArg, uint32_t hArg, uint32_t dxArg, uint32_t dyArg)
++        {
++            // The original sign-extends every argument from 16 bits.
++            const int32_t psm = static_cast<int16_t>(psmArg & 0xFFFFu);
++            const int32_t w = static_cast<int16_t>(wArg & 0xFFFFu);
++            const int32_t h = static_cast<int16_t>(hArg & 0xFFFFu);
++            const int32_t dx = static_cast<int16_t>(dxArg & 0xFFFFu);
++            const int32_t dy = static_cast<int16_t>(dyArg & 0xFFFFu);
++
++            GsDefDispEnv env{};
++            env.pmode = 0x66u;
++            env.smode2 = (g_gparam.interlace == 0u) ? 2u : ((g_gparam.ffmode != 0u) ? 3u : 1u);
++            env.dispfb = (static_cast<uint64_t>(((w + 63) >> 6) & 0x3F) << 9) |
++                         (static_cast<uint64_t>(psm & 0xF) << 15);
++
++            const bool ntsc = g_gparam.omode == 2u;
++            const bool pal = g_gparam.omode == 3u;
++            if ((!ntsc && !pal) || w == 0)
++                return env;
++
++            const bool interlaced = g_gparam.interlace == 1u;
++            const int32_t mag = (w + 0x9FF) / w;
++            const int32_t baseX = pal ? 0x290 : 0x27C;
++            const int32_t baseY = interlaced ? (pal ? 0x48 : 0x32) : (pal ? 0x24 : 0x19);
++            const int32_t dh = (interlaced && g_gparam.ffmode != 0u) ? (h * 2 - 1) : (h - 1);
++            env.display = static_cast<uint64_t>((dx * mag + baseX) & 0xFFF) |
++                          (static_cast<uint64_t>((dy + baseY) & 0xFFF) << 12) |
++                          (static_cast<uint64_t>(static_cast<uint32_t>(mag - 1)) << 23) |
++                          (static_cast<uint64_t>(static_cast<uint32_t>(mag * w - 1)) << 32) |
++                          (static_cast<uint64_t>(static_cast<uint32_t>(dh)) << 44);
++            env.hasDisplay = true;
++            return env;
++        }
++
++        // Fills one GsDispEnvMem as sceGsSetDefDispEnv does; DISPLAY keeps the guest's previous value when the
++        // video mode has no display rule.
++        void fillGsDefDispEnv(GsDispEnvMem &out, const GsDefDispEnv &env, uint64_t previousDisplay)
++        {
++            out.pmode = env.pmode;
++            out.smode2 = env.smode2;
++            out.dispfb = env.dispfb;
++            out.display = env.hasDisplay ? env.display : previousDisplay;
++            out.bgcolor = 0u;
++        }
++
++        uint64_t readGuestU64(uint8_t *rdram, uint32_t addr)
++        {
++            uint64_t value = 0u;
++            if (const uint8_t *ptr = getConstMemPtr(rdram, addr))
++                std::memcpy(&value, ptr, sizeof(value));
++            return value;
++        }
++
+         GsTrailingArgs2 decodeGsTrailingArgs2(uint8_t *rdram, R5900Context *ctx)
+         {
+             const uint32_t reg8 = getRegU32(ctx, 8);
+@@ -887,11 +958,9 @@ namespace ps2_stubs
+         }
+ 
+         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
+-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+-        const uint64_t smode2 =
+-            (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
+-            (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
+-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
++        // VISUAL_001: both display envs come from the libgraph sceGsSetDefDispEnv rules (PMODE, SMODE2 and
++        // DISPLAY follow the video mode in g_gparam). Only DISPFB keeps the P4.1/P4.1.10 values below.
++        const GsDefDispEnv defDisp = computeGsDefDispEnv(psm, w, h, 0u, 0u);
+ 
+         const int32_t drawWidth = static_cast<int32_t>(w);
+         const int32_t drawHeight = static_cast<int32_t>(h);
+@@ -946,12 +1015,10 @@ namespace ps2_stubs
+         const uint64_t dispfb1 = makeDispFb(gsDBuffDcTailFbp, fbw, psm, 0u, 0u);
+ 
+         GsDBuffDcMem db{};
+-        db.disp[0].pmode = pmode;
+-        db.disp[0].smode2 = smode2;
++        fillGsDefDispEnv(db.disp[0], defDisp, readGuestU64(rdram, envAddr + offsetof(GsDispEnvMem, display)));
++        fillGsDefDispEnv(db.disp[1], defDisp,
++                         readGuestU64(rdram, envAddr + sizeof(GsDispEnvMem) + offsetof(GsDispEnvMem, display)));
+         db.disp[0].dispfb = dispfb0;
+-        db.disp[0].display = display;
+-        db.disp[0].bgcolor = 0u;
+-        db.disp[1] = db.disp[0];
+         db.disp[1].dispfb = dispfb1;
+ 
+         const bool seedClear = clear != 0u;
+@@ -996,12 +1063,9 @@ namespace ps2_stubs
+         }
+ 
+         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
+-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+-        const uint64_t smode2 =
+-            (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
+-            (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
++        // VISUAL_001: same libgraph sceGsSetDefDispEnv rules as sceGsSetDefDBuffDc.
++        const GsDefDispEnv defDisp = computeGsDefDispEnv(psm, w, h, 0u, 0u);
+         const uint64_t dispfb = makeDispFb(0u, fbw, psm, 0u, 0u);
+-        const uint64_t display = makeDisplay(636u, 32u, 0u, 0u, w - 1u, h - 1u);
+ 
+         const int32_t drawWidth = static_cast<int32_t>(w);
+         const int32_t drawHeight = static_cast<int32_t>(h);
+@@ -1014,12 +1078,11 @@ namespace ps2_stubs
+         }
+ 
+         GsDBuffMem db{};
+-        db.disp[0].pmode = pmode;
+-        db.disp[0].smode2 = smode2;
++        fillGsDefDispEnv(db.disp[0], defDisp, readGuestU64(rdram, envAddr + offsetof(GsDispEnvMem, display)));
++        fillGsDefDispEnv(db.disp[1], defDisp,
++                         readGuestU64(rdram, envAddr + sizeof(GsDispEnvMem) + offsetof(GsDispEnvMem, display)));
+         db.disp[0].dispfb = dispfb;
+-        db.disp[0].display = display;
+-        db.disp[0].bgcolor = 0u;
+-        db.disp[1] = db.disp[0];
++        db.disp[1].dispfb = dispfb;
+ 
+         db.giftag0 = {makeGiftagAplusD(14u), 0x0E0E0E0E0E0E0E0EULL};
+         seedGsDrawEnv1(db.draw0, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+@@ -1049,11 +1112,15 @@ namespace ps2_stubs
+         if (h == 0)
+             h = 448;
+ 
+-        uint32_t fbw = (w + 63) / 64;
+-        uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
+-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+-
+-        writeGsDispEnv(rdram, envAddr, display, dispfb);
++        // VISUAL_001: libgraph rules (see computeGsDefDispEnv); writes PMODE, SMODE2, DISPFB, DISPLAY and
++        // BGCOLOR like the original.
++        if (uint8_t *ptr = getMemPtr(rdram, envAddr))
++        {
++            GsDispEnvMem env{};
++            std::memcpy(&env, ptr, sizeof(env));
++            fillGsDefDispEnv(env, computeGsDefDispEnv(psm, w, h, dx, dy), env.display);
++            std::memcpy(ptr, &env, sizeof(env));
++        }
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 8343775..35e14ca 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -16,6 +16,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <cstring>
++#include <string>
+ #include <thread>
+ #include <vector>
+ 
+@@ -350,6 +351,31 @@ namespace
+         return readReferencePSMCT32Pixel(vram, frameBaseToBlock(fbp), fbw, x, y);
+     }
+ 
++    uint64_t referenceDisplay(uint32_t dx, uint32_t dy, uint32_t magh, uint32_t magv, uint32_t dw, uint32_t dh)
++    {
++        return static_cast<uint64_t>(dx) |
++               (static_cast<uint64_t>(dy) << 12) |
++               (static_cast<uint64_t>(magh) << 23) |
++               (static_cast<uint64_t>(magv) << 27) |
++               (static_cast<uint64_t>(dw) << 32) |
++               (static_cast<uint64_t>(dh) << 44);
++    }
++
++    uint64_t referenceDispFb(uint32_t fbp, uint32_t fbw, uint32_t psm)
++    {
++        return static_cast<uint64_t>(fbp) | (static_cast<uint64_t>(fbw) << 9) | (static_cast<uint64_t>(psm) << 15);
++    }
++
++    void resetGraphForTest(PS2Runtime &runtime, std::vector<uint8_t> &rdram, uint32_t interlace, uint32_t omode, uint32_t ffmode)
++    {
++        R5900Context ctx{};
++        setRegU32(ctx, 4, 0u);
++        setRegU32(ctx, 5, interlace);
++        setRegU32(ctx, 6, omode);
++        setRegU32(ctx, 7, ffmode);
++        ps2_stubs::sceGsResetGraph(rdram.data(), &ctx, &runtime);
++    }
++
+     void expectGuestHeapReusable(TestCase &t, PS2Runtime &runtime, const char *message)
+     {
+         const uint32_t expectedBase = runtime.guestHeapBase();
+@@ -535,6 +561,9 @@ void register_ps2_gs_tests()
+             constexpr uint32_t kXYOffset1Offset = kDraw01Offset + 0x20u;
+             constexpr uint32_t kXYOffset1AddrOffset = kDraw01Offset + 0x28u;
+ 
++            // NTSC interlaced FRAME mode: DH is h-1 and MAGH/DW follow the libgraph rules.
++            resetGraphForTest(runtime, rdram, 1u, 2u, 0u);
++
+             R5900Context ctx{};
+             setRegU32(ctx, 4, kEnvAddr);
+             setRegU32(ctx, 5, 0u);
+@@ -557,7 +586,8 @@ void register_ps2_gs_tests()
+             std::memcpy(&xyoffset10Addr, rdram.data() + kEnvAddr + kXYOffset1AddrOffset, sizeof(xyoffset10Addr));
+ 
+             t.Equals((dispfb0 >> 9) & 0x3Fu, 10ull, "dbuff display env should seed FBW from width");
+-            t.Equals((display0 >> 32) & 0x0FFFull, 639ull, "dbuff display env should seed DW from width");
++            t.Equals(((display0 >> 32) & 0x0FFFull) + 1ull, 640ull * (((display0 >> 23) & 0xFull) + 1ull),
++                     "dbuff display env should seed DW as width times the MAGH magnification");
+             t.Equals((display0 >> 44) & 0x07FFull, 447ull, "dbuff display env should seed DH from height");
+             t.Equals((frame10 >> 16) & 0x3Full, 10ull, "dbuff draw env should seed FRAME FBW from width");
+             t.Equals(frame10Addr, 0x4Cull, "dbuff draw env should seed FRAME_1 register id");
+@@ -579,8 +609,8 @@ void register_ps2_gs_tests()
+ 
+             t.Equals(runtime.memory().gs().dispfb1 & 0x1FFull, 151ull,
+                      "sceGsSwapDBuffDc should program GS to the selected display page");
+-            t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 639ull,
+-                     "sceGsSwapDBuffDc should preserve the display width from the seeded env");
++            t.Equals(runtime.memory().gs().display1, display0,
++                     "sceGsSwapDBuffDc should preserve the display geometry from the seeded env");
+         });
+ 
+         tc.Run("sceGsSetDefDBuffDc seeds a clear packet and swap clears the draw buffer", [](TestCase &t)
+@@ -705,6 +735,119 @@ void register_ps2_gs_tests()
+                      "sceGsSwapDBuffDc should honor a clear packet seeded from register-based trailing args");
+         });
+ 
++        tc.Run("sceGsSetDefDispEnv follows the libgraph display rules of the selected video mode", [](TestCase &t)
++        {
++            // Expected values from the libgraph sceGsSetDefDispEnv in SLES_503.58 (0x1002E8):
++            // PMODE 0x66; SMODE2 from interlace/ffmode; MAGH = (w+2559)/w - 1, DW = (MAGH+1)*w - 1;
++            // NTSC base DX 636 / DY 50 (interlaced) or 25; PAL base DX 656 / DY 72 (interlaced) or 36;
++            // DH = 2h-1 in interlaced FIELD mode, h-1 otherwise; BGCOLOR 0.
++            struct Case
++            {
++                const char *name;
++                uint32_t interlace, omode, ffmode, psm, w, h, dx, dy;
++                uint64_t smode2;
++                uint64_t display;
++            };
++            const Case cases[] = {
++                {"PAL field 512x224", 1u, 3u, 1u, 0u, 512u, 224u, 0u, 0u, 3u, referenceDisplay(656u, 72u, 4u, 0u, 2559u, 447u)},
++                {"PAL frame 640x448", 1u, 3u, 0u, 0u, 640u, 448u, 0u, 0u, 1u, referenceDisplay(656u, 72u, 3u, 0u, 2559u, 447u)},
++                {"PAL progressive 640x256", 0u, 3u, 0u, 0u, 640u, 256u, 0u, 0u, 2u, referenceDisplay(656u, 36u, 3u, 0u, 2559u, 255u)},
++                {"NTSC field 640x224 at (4,6)", 1u, 2u, 1u, 2u, 640u, 224u, 4u, 6u, 3u, referenceDisplay(652u, 56u, 3u, 0u, 2559u, 447u)},
++                {"NTSC frame 512x448", 1u, 2u, 0u, 0u, 512u, 448u, 0u, 0u, 1u, referenceDisplay(636u, 50u, 4u, 0u, 2559u, 447u)},
++                {"NTSC progressive 320x240 at (2,3)", 0u, 2u, 0u, 0u, 320u, 240u, 2u, 3u, 2u, referenceDisplay(652u, 28u, 7u, 0u, 2559u, 239u)},
++            };
++            for (const Case &c : cases)
++            {
++                PS2Runtime runtime;
++                t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
++                std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++                resetGraphForTest(runtime, rdram, c.interlace, c.omode, c.ffmode);
++
++                constexpr uint32_t kEnvAddr = 0x6000u;
++                std::memset(rdram.data() + kEnvAddr, 0xCD, 40u);
++                R5900Context ctx{};
++                setRegU32(ctx, 4, kEnvAddr);
++                setRegU32(ctx, 5, c.psm);
++                setRegU32(ctx, 6, c.w);
++                setRegU32(ctx, 7, c.h);
++                setRegU32(ctx, 8, c.dx);
++                setRegU32(ctx, 9, c.dy);
++                ps2_stubs::sceGsSetDefDispEnv(rdram.data(), &ctx, &runtime);
++
++                uint64_t env[5]{};
++                std::memcpy(env, rdram.data() + kEnvAddr, sizeof(env));
++                const std::string name = c.name;
++                t.Equals(env[0], 0x66ull, (name + ": PMODE").c_str());
++                t.Equals(env[1], c.smode2, (name + ": SMODE2").c_str());
++                t.Equals(env[2], referenceDispFb(0u, (c.w + 63u) / 64u, c.psm), (name + ": DISPFB").c_str());
++                t.Equals(env[3], c.display, (name + ": DISPLAY").c_str());
++                t.Equals(env[4], 0ull, (name + ": BGCOLOR").c_str());
++            }
++        });
++
++        tc.Run("sceGsSetDefDispEnv leaves DISPLAY untouched for an unsupported video mode", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++            resetGraphForTest(runtime, rdram, 0u, 0x50u, 0u);
++
++            constexpr uint32_t kEnvAddr = 0x6000u;
++            std::memset(rdram.data() + kEnvAddr, 0xCD, 40u);
++            R5900Context ctx{};
++            setRegU32(ctx, 4, kEnvAddr);
++            setRegU32(ctx, 5, 0u);
++            setRegU32(ctx, 6, 640u);
++            setRegU32(ctx, 7, 480u);
++            ps2_stubs::sceGsSetDefDispEnv(rdram.data(), &ctx, &runtime);
++
++            uint64_t env[5]{};
++            std::memcpy(env, rdram.data() + kEnvAddr, sizeof(env));
++            t.Equals(env[0], 0x66ull, "unsupported mode: PMODE is still written");
++            t.Equals(env[1], 2ull, "unsupported mode: SMODE2 is still written");
++            t.Equals(env[2], referenceDispFb(0u, 10u, 0u), "unsupported mode: DISPFB is still written");
++            t.Equals(env[3], 0xCDCDCDCDCDCDCDCDull, "unsupported mode: DISPLAY is not written");
++            t.Equals(env[4], 0ull, "unsupported mode: BGCOLOR is still written");
++        });
++
++        tc.Run("sceGsSetDefDBuffDc builds both display envs with the PAL field-mode rules", [](TestCase &t)
++        {
++            PS2Runtime runtime;
++            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
++            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++            resetGraphForTest(runtime, rdram, 1u, 3u, 1u);
++
++            constexpr uint32_t kEnvAddr = 0x7000u;
++            std::memset(rdram.data() + kEnvAddr, 0xCD, 0x330u);
++            R5900Context ctx{};
++            setRegU32(ctx, 4, kEnvAddr);
++            setRegU32(ctx, 5, 0u);
++            setRegU32(ctx, 6, 512u);
++            setRegU32(ctx, 7, 224u);
++            ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
++
++            uint64_t disp0[5]{}, disp1[5]{};
++            std::memcpy(disp0, rdram.data() + kEnvAddr, sizeof(disp0));
++            std::memcpy(disp1, rdram.data() + kEnvAddr + 0x28u, sizeof(disp1));
++            const uint64_t expectedDisplay = referenceDisplay(656u, 72u, 4u, 0u, 2559u, 447u);
++            for (const uint64_t *d : {disp0, disp1})
++            {
++                t.Equals(d[0], 0x66ull, "dbuffdc PAL field: PMODE");
++                t.Equals(d[1], 3ull, "dbuffdc PAL field: SMODE2");
++                t.Equals(d[3], expectedDisplay, "dbuffdc PAL field: DISPLAY");
++                t.Equals(d[4], 0ull, "dbuffdc PAL field: BGCOLOR");
++            }
++            t.Equals(disp0[2], referenceDispFb(0u, 8u, 0u), "dbuffdc PAL field: disp[0] DISPFB stays at FBP 0");
++            t.Equals(disp1[2] & ~0x1FFull, disp0[2] & ~0x1FFull,
++                     "dbuffdc PAL field: disp[1] DISPFB differs from disp[0] only in the tail-patched FBP");
++
++            // PCSX2 reference (same ELF, office scene, state 07): DISPLAY2 = DX 656, DY 104, MAGH 4, DW 2559,
++            // DH 447. The game itself adds 32 to DY after sceGsSetDefDBuffDc; the rest comes from libgraph.
++            const uint64_t pcsx2Display2 = referenceDisplay(656u, 104u, 4u, 0u, 2559u, 447u);
++            t.Equals(expectedDisplay + (32ull << 12), pcsx2Display2,
++                     "dbuffdc PAL field: DISPLAY plus the game's DY offset reproduces the PCSX2 register");
++        });
++
+         tc.Run("clearFramebufferContext clears the requested context even if another context is active", [](TestCase &t)
+         {
+             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

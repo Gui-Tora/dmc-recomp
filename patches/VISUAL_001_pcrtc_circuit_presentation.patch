@@ -1,0 +1,486 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index abc7787..cd8bf0d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -341,21 +341,45 @@ namespace
+                                      ((a >= 0x40u) ? 0x8000u : 0u));
+     }
+ 
+-    void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
++    // PCRTC geometry of one display circuit (VISUAL_001). DISPLAY counts video clocks horizontally (MAGH+1
++    // clocks per buffer pixel) and raster lines vertically; with SMODE2.INT set those are frame lines, which
++    // is why libgraph programs DH = 2h-1 for an h-row FIELD-mode buffer. In FIELD mode (INT=1, FFMD=1) each
++    // field shows (DH+1)/2 lines, so only that many rows are read from the buffer; otherwise every raster line
++    // shows its own row. MAGV+1 consecutive lines share one row.
++    struct GSCircuitLayout
+     {
++        uint32_t dx = 0u;
++        uint32_t dy = 0u;
++        uint32_t magh = 0u;
++        uint32_t magv = 0u;
++        uint32_t width = 0u; // buffer pixels per row
++        uint32_t lines = 0u; // raster lines covered (DH+1)
++        uint32_t rows = 0u;  // buffer rows read for one field (FIELD mode) or frame
++    };
++
++    GSCircuitLayout decodeCircuitLayout(uint64_t display64, bool fieldMode)
++    {
++        GSCircuitLayout layout{};
++        layout.dx = static_cast<uint32_t>(display64 & 0x0FFFu);
++        layout.dy = static_cast<uint32_t>((display64 >> 12) & 0x07FFu);
++        layout.magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
++        layout.magv = static_cast<uint32_t>((display64 >> 27) & 0x03u);
+         const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
+         const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
+-        const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
+ 
+-        outWidth = (dw + 1u) / (magh + 1u);
+-        outHeight = dh + 1u;
+-        if (outWidth < 64u || outHeight < 64u)
++        layout.width = (dw + 1u) / (layout.magh + 1u);
++        layout.lines = dh + 1u;
++        if (layout.width < 64u || layout.lines < 64u)
+         {
+-            outWidth = kDefaultDisplayWidth;
+-            outHeight = kDefaultDisplayHeight;
++            layout.width = kDefaultDisplayWidth;
++            layout.lines = kDefaultDisplayHeight;
++            layout.magh = 0u;
++            layout.magv = 0u;
+         }
+-        outWidth = std::min<uint32_t>(outWidth, kHostFrameWidth);
+-        outHeight = std::min<uint32_t>(outHeight, kHostFrameHeight);
++        layout.width = std::min<uint32_t>(layout.width, kHostFrameWidth);
++        const uint32_t fieldLines = fieldMode ? (layout.lines + 1u) / 2u : layout.lines;
++        layout.rows = std::min<uint32_t>((fieldLines + layout.magv) / (layout.magv + 1u), kHostFrameHeight);
++        return layout;
+     }
+ 
+     GSFrameReg decodeDisplayFrame(uint64_t dispfb64)
+@@ -1748,13 +1772,14 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+ {
+     PresentationFrame result{};
+     const GSPmodeState pmode = decodePmode(request.pmode);
++    // SMODE2: INT (bit 0) interlaced, FFMD (bit 1) FIELD mode.
++    const bool fieldMode = (request.smode2 & 0x3ull) == 0x3ull;
+     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
+     const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
+-    uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
+-    decodeDisplaySize(request.display1, width1, height1);
+-    decodeDisplaySize(request.display2, width2, height2);
++    const GSCircuitLayout layout1 = decodeCircuitLayout(request.display1, fieldMode);
++    const GSCircuitLayout layout2 = decodeCircuitLayout(request.display2, fieldMode);
+     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+     if (!valid1 && !valid2)
+@@ -1802,45 +1827,110 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+         return true;
+     };
+ 
++    // Each enabled circuit is read at its own size (width x rows) and then placed on a common output raster:
++    // x in buffer pixels of the finest enabled magnification, y in raster lines, both relative to the
++    // top-left of the enabled circuits (DX/DY are output positions, not read offsets).
++    struct PlacedCircuit
++    {
++        const GSCircuitLayout *layout = nullptr;
++        const std::vector<uint8_t> *pixels = nullptr;
++        uint32_t outX = 0u;
++        uint32_t outY = 0u;
++        uint32_t outWidth = 0u;
++    };
++    uint32_t unit = 1u;
++    auto placeCircuits = [&](PlacedCircuit *circuits, size_t count)
++    {
++        unit = circuits[0].layout->magh + 1u;
++        uint32_t minDX = circuits[0].layout->dx;
++        uint32_t minDY = circuits[0].layout->dy;
++        for (size_t i = 1; i < count; ++i)
++        {
++            unit = std::min(unit, circuits[i].layout->magh + 1u);
++            minDX = std::min(minDX, circuits[i].layout->dx);
++            minDY = std::min(minDY, circuits[i].layout->dy);
++        }
++        uint32_t width = 0u, height = 0u;
++        for (size_t i = 0; i < count; ++i)
++        {
++            PlacedCircuit &c = circuits[i];
++            c.outX = (c.layout->dx - minDX) / unit;
++            c.outY = c.layout->dy - minDY;
++            c.outWidth = c.layout->width * (c.layout->magh + 1u) / unit;
++            width = std::max(width, c.outX + c.outWidth);
++            height = std::max(height, c.outY + c.layout->lines);
++        }
++        result.width = std::min<uint32_t>(width, kHostFrameWidth);
++        result.height = std::min<uint32_t>(height, kHostFrameHeight);
++        result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
++    };
++    // Buffer row of circuit c shown on output line y, if any. In FIELD mode the buffer holds one field: field
++    // row k covers raster lines 2k and 2k+1 of the circuit. The presenter does not weave the other field or
++    // shift by the field parity: the frame it is given is latched asynchronously to the game's swap, so the
++    // VSync parity at the latch does not identify the field the displayed buffer was drawn for (VISUAL_001).
++    auto circuitRow = [&](const PlacedCircuit &c, uint32_t y, const uint8_t *&row) -> bool
++    {
++        if (y < c.outY || y - c.outY >= c.layout->lines)
++            return false;
++        const uint32_t line = fieldMode ? (y - c.outY) >> 1 : y - c.outY;
++        const uint32_t sourceRow = line / (c.layout->magv + 1u);
++        if (sourceRow >= c.layout->rows)
++            return false;
++        row = c.pixels->data() + static_cast<size_t>(sourceRow) * kHostFrameWidth * 4u;
++        return true;
++    };
++    auto sourcePixel = [&](const PlacedCircuit &c, const uint8_t *row, uint32_t ox) -> const uint8_t *
++    {
++        return row + static_cast<size_t>(ox * unit / (c.layout->magh + 1u)) * 4u;
++    };
++
+     if (valid1 && valid2)
+     {
+         GSFrameReg selected1{}, selected2{};
+         std::vector<uint8_t> crt1, crt2;
+         bool preferred1 = false, preferred2 = false;
+-        if (copySource(displayFrame1, origin1, width1, height1, false, true, selected1, crt1, preferred1) &&
+-            copySource(displayFrame2, origin2, width2, height2, false, true, selected2, crt2, preferred2))
++        if (copySource(displayFrame1, origin1, layout1.width, layout1.rows, false, true, selected1, crt1, preferred1) &&
++            copySource(displayFrame2, origin2, layout2.width, layout2.rows, false, true, selected2, crt2, preferred2))
+         {
+-            result.width = std::max(width1, width2);
+-            result.height = std::max(height1, height2);
+-            result.pixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
++            PlacedCircuit circuits[2];
++            circuits[0].layout = &layout1;
++            circuits[0].pixels = &crt1;
++            circuits[1].layout = &layout2;
++            circuits[1].pixels = &crt2;
++            placeCircuits(circuits, 2u);
++            const PlacedCircuit &c1 = circuits[0];
++            const PlacedCircuit &c2 = circuits[1];
+             const uint8_t bgR = static_cast<uint8_t>(request.bgcolor);
+             const uint8_t bgG = static_cast<uint8_t>(request.bgcolor >> 8u);
+             const uint8_t bgB = static_cast<uint8_t>(request.bgcolor >> 16u);
+             for (uint32_t y = 0; y < result.height; ++y)
++            {
++                uint8_t *line = result.pixels.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u;
+                 for (uint32_t x = 0; x < result.width; ++x)
+                 {
+-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
++                    uint8_t *dst = line + x * 4u;
+                     dst[0] = bgR;
+                     dst[1] = bgG;
+                     dst[2] = bgB;
+                     dst[3] = pmode.alp;
+                 }
+-            if (!pmode.slbg)
+-                for (uint32_t y = 0; y < height2; ++y)
+-                    std::memcpy(result.pixels.data() + y * kHostFrameWidth * 4u, crt2.data() + y * kHostFrameWidth * 4u, width2 * 4u);
+-            for (uint32_t y = 0; y < height1; ++y)
+-                for (uint32_t x = 0; x < width1; ++x)
+-                {
+-                    const uint8_t *src = crt1.data() + (y * kHostFrameWidth + x) * 4u;
+-                    uint8_t *dst = result.pixels.data() + (y * kHostFrameWidth + x) * 4u;
+-                    const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
+-                    dst[0] = blendPresentationChannel(src[0], dst[0], factor);
+-                    dst[1] = blendPresentationChannel(src[1], dst[1], factor);
+-                    dst[2] = blendPresentationChannel(src[2], dst[2], factor);
+-                    dst[3] = pmode.amod ? dst[3] : src[3];
+-                }
++                const uint8_t *row = nullptr;
++                if (!pmode.slbg && circuitRow(c2, y, row))
++                    for (uint32_t ox = 0; ox < c2.outWidth && c2.outX + ox < result.width; ++ox)
++                        std::memcpy(line + (c2.outX + ox) * 4u, sourcePixel(c2, row, ox), 4u);
++                if (circuitRow(c1, y, row))
++                    for (uint32_t ox = 0; ox < c1.outWidth && c1.outX + ox < result.width; ++ox)
++                    {
++                        const uint8_t *src = sourcePixel(c1, row, ox);
++                        uint8_t *dst = line + (c1.outX + ox) * 4u;
++                        const uint32_t factor = pmode.mmod ? pmode.alp : std::min<uint32_t>(255u, static_cast<uint32_t>(src[3]) * 2u);
++                        dst[0] = blendPresentationChannel(src[0], dst[0], factor);
++                        dst[1] = blendPresentationChannel(src[1], dst[1], factor);
++                        dst[2] = blendPresentationChannel(src[2], dst[2], factor);
++                        dst[3] = pmode.amod ? dst[3] : src[3];
++                    }
++            }
+             normalizePresentationAlpha(result.pixels, result.width, result.height);
+-            // Both display circuits were read at full display height; keep every source row.
+             result.displayFbp = displayFrame1.fbp;
+             result.sourceFbp = selected1.fbp;
+             return result;
+@@ -1849,12 +1939,22 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+ 
+     const GSFrameReg &displayFrame = valid1 ? displayFrame1 : displayFrame2;
+     const GSDisplayReadOrigin &origin = valid1 ? origin1 : origin2;
+-    result.width = valid1 ? width1 : width2;
+-    result.height = valid1 ? height1 : height2;
++    const GSCircuitLayout &layout = valid1 ? layout1 : layout2;
+     GSFrameReg selected = displayFrame;
+-    if (!copySource(displayFrame, origin, result.width, result.height, true, false, selected, result.pixels, result.usedPreferred))
++    std::vector<uint8_t> source;
++    if (!copySource(displayFrame, origin, layout.width, layout.rows, true, false, selected, source, result.usedPreferred))
+         return {};
+-    // CopyFrameToHostRgba already read every display row, including in FIELD mode.
++    PlacedCircuit circuit;
++    circuit.layout = &layout;
++    circuit.pixels = &source;
++    placeCircuits(&circuit, 1u);
++    for (uint32_t y = 0; y < result.height; ++y)
++    {
++        const uint8_t *row = nullptr;
++        if (circuitRow(circuit, y, row))
++            std::memcpy(result.pixels.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u, row,
++                        static_cast<size_t>(result.width) * 4u);
++    }
+     normalizePresentationAlpha(result.pixels, result.width, result.height);
+     result.displayFbp = displayFrame.fbp;
+     result.sourceFbp = selected.fbp;
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 35e14ca..4a7a522 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -366,6 +366,31 @@ namespace
+         return static_cast<uint64_t>(fbp) | (static_cast<uint64_t>(fbw) << 9) | (static_cast<uint64_t>(psm) << 15);
+     }
+ 
++    template <typename ColorOfRow>
++    void fillReferenceFrameRows(std::vector<uint8_t> &vram,
++                                uint32_t fbp,
++                                uint32_t fbw,
++                                uint32_t width,
++                                uint32_t firstRow,
++                                uint32_t endRow,
++                                ColorOfRow colorOfRow)
++    {
++        for (uint32_t y = firstRow; y < endRow; ++y)
++        {
++            const uint32_t color = colorOfRow(y);
++            for (uint32_t x = 0; x < width; ++x)
++                writeReferenceFramePSMCT32Pixel(vram, fbp, fbw, x, y, color);
++        }
++    }
++
++    uint32_t latchedRgb(const std::vector<uint8_t> &frame, uint32_t width, uint32_t x, uint32_t y)
++    {
++        const size_t off = (static_cast<size_t>(y) * width + x) * 4u;
++        return static_cast<uint32_t>(frame[off]) |
++               (static_cast<uint32_t>(frame[off + 1u]) << 8) |
++               (static_cast<uint32_t>(frame[off + 2u]) << 16);
++    }
++
+     void resetGraphForTest(PS2Runtime &runtime, std::vector<uint8_t> &rdram, uint32_t interlace, uint32_t omode, uint32_t ffmode)
+     {
+         R5900Context ctx{};
+@@ -1829,7 +1854,7 @@ void register_ps2_gs_tests()
+             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+             GSRegisters regs{};
+             regs.pmode = 0x0001ull;
+-            regs.smode2 = 0x0001ull; // interlaced, field mode
++            regs.smode2 = 0x0003ull; // INT=1, FFMD=1: interlaced, field mode
+             regs.dispfb1 =
+                 0ull |
+                 (10ull << 9) |
+@@ -1883,6 +1908,204 @@ void register_ps2_gs_tests()
+                      "field presentation should still preserve different source content across field rows");
+         });
+ 
++        tc.Run("latched host presentation reads (DH+1)/2 field rows per circuit and places them at DY", [](TestCase &t)
++        {
++            // Two-circuit FIELD-mode layout with the libgraph PAL registers: circuit 2 shows a 512x224 field
++            // buffer; circuit 1 shows a 32-row band at the end of local memory (FBP 504-511), 352 raster lines
++            // lower. Circuit 1 must read exactly 32 rows: a 64-row read would wrap into FBP 0.
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            auto fieldRow = [](uint32_t r) { return 0x80101000u | (r & 0xFFu) | ((r >> 8) << 8); };
++            constexpr uint32_t kBand = 0x80221100u | 0xEEu;
++            constexpr uint32_t kClearedBackBuffer = 0x801D2417u; // (23,36,29)
++            fillReferenceFrameRows(vram, 56u, 8u, 512u, 0u, 224u, fieldRow);
++            fillReferenceFrameRows(vram, 504u, 8u, 512u, 0u, 32u, [](uint32_t) { return kBand; });
++            fillReferenceFrameRows(vram, 0u, 8u, 512u, 0u, 32u, [](uint32_t) { return kClearedBackBuffer; });
++
++            GSRegisters regs{};
++            regs.pmode = 0xFF67ull;
++            regs.smode2 = 0x3ull;
++            regs.dispfb1 = referenceDispFb(504u, 8u, GS_PSM_CT32);
++            regs.display1 = referenceDisplay(656u, 456u, 4u, 0u, 2559u, 63u);
++            regs.dispfb2 = referenceDispFb(56u, 8u, GS_PSM_CT32);
++            regs.display2 = referenceDisplay(656u, 104u, 4u, 0u, 2559u, 447u);
++            regs.vsyncTick.store(2u);
++
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
++            gs.latchHostPresentationFrame();
++
++            std::vector<uint8_t> frame;
++            uint32_t width = 0u, height = 0u;
++            t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, width, height), "field layout should present");
++            t.Equals(width, 512u, "field layout width is (DW+1)/(MAGH+1)");
++            t.Equals(height, 448u, "field layout height is DH+1 raster lines");
++            if (width != 512u || height != 448u)
++                return;
++
++            uint32_t clearedRows = 0u;
++            for (uint32_t y = 0; y < height; ++y)
++                if (latchedRgb(frame, width, 0u, y) == (kClearedBackBuffer & 0xFFFFFFu))
++                    ++clearedRows;
++            t.Equals(clearedRows, 0u, "no presented line may come from FBP 0 through a wrapped circuit-1 read");
++
++            t.Equals(latchedRgb(frame, width, 0u, 0u), fieldRow(0u) & 0xFFFFFFu, "line 0 is field row 0");
++            t.Equals(latchedRgb(frame, width, 0u, 350u), fieldRow(175u) & 0xFFFFFFu, "line 350 is field row 175");
++            t.Equals(latchedRgb(frame, width, 0u, 352u), kBand & 0xFFFFFFu, "circuit 1 starts at line DY1-DY2 = 352");
++            t.Equals(latchedRgb(frame, width, 511u, 414u), kBand & 0xFFFFFFu, "circuit 1 covers 64 raster lines");
++            t.Equals(latchedRgb(frame, width, 0u, 416u), fieldRow(208u) & 0xFFFFFFu, "circuit 2 resumes below circuit 1");
++            t.Equals(latchedRgb(frame, width, 0u, 446u), fieldRow(223u) & 0xFFFFFFu, "line 446 is the last field row");
++        });
++
++        tc.Run("latched host presentation composes two circuits at their DX/DY positions with PMODE blending", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            constexpr uint32_t kCrt2 = 0xFF0000C8u; // (200,0,0)
++            constexpr uint32_t kCrt1 = 0x4000C800u; // (0,200,0), alpha 0x40
++            fillReferenceFrameRows(vram, 0u, 4u, 256u, 0u, 128u, [](uint32_t) { return kCrt2; });
++            fillReferenceFrameRows(vram, 100u, 1u, 64u, 0u, 64u, [](uint32_t) { return kCrt1; });
++
++            auto present = [&](uint64_t pmode, uint64_t bgcolor, std::vector<uint8_t> &frame, uint32_t &w, uint32_t &h)
++            {
++                GSRegisters regs{};
++                regs.pmode = pmode;
++                regs.smode2 = 0u;
++                regs.bgcolor = bgcolor;
++                regs.dispfb1 = referenceDispFb(100u, 1u, GS_PSM_CT32);
++                regs.display1 = referenceDisplay(164u, 52u, 0u, 0u, 63u, 63u);
++                regs.dispfb2 = referenceDispFb(0u, 4u, GS_PSM_CT32);
++                regs.display2 = referenceDisplay(100u, 20u, 0u, 0u, 255u, 127u);
++                GS gs;
++                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
++                gs.latchHostPresentationFrame();
++                return gs.copyLatchedHostPresentationFrame(frame, w, h);
++            };
++
++            std::vector<uint8_t> frame;
++            uint32_t w = 0u, h = 0u;
++            // EN1 | EN2 | MMOD, ALP 0x80: constant 50% blend of circuit 1 over circuit 2.
++            t.IsTrue(present(0x8023ull, 0ull, frame, w, h), "two-circuit layout should present");
++            t.Equals(w, 256u, "composite width is the union of both circuits");
++            t.Equals(h, 128u, "composite height is the union of both circuits");
++            if (w != 256u || h != 128u)
++                return;
++            constexpr uint32_t kBlend = 100u | (100u << 8);
++            t.Equals(latchedRgb(frame, w, 0u, 0u), kCrt2 & 0xFFFFFFu, "origin shows circuit 2 only");
++            t.Equals(latchedRgb(frame, w, 63u, 31u), kCrt2 & 0xFFFFFFu, "circuit 1 does not start before its DX/DY");
++            t.Equals(latchedRgb(frame, w, 64u, 32u), kBlend, "circuit 1 starts at (DX1-DX2, DY1-DY2)");
++            t.Equals(latchedRgb(frame, w, 127u, 95u), kBlend, "circuit 1 ends after DW1+1 x DH1+1");
++            t.Equals(latchedRgb(frame, w, 128u, 96u), kCrt2 & 0xFFFFFFu, "circuit 2 is visible after circuit 1");
++
++            // EN1 | EN2 | SLBG, MMOD 0: circuit 1 blended with its own alpha (0x40 -> 128/255) over BGCOLOR.
++            t.IsTrue(present(0x0087ull, 10ull | (20ull << 8) | (30ull << 16), frame, w, h), "SLBG layout should present");
++            if (w != 256u || h != 128u)
++                return;
++            t.Equals(latchedRgb(frame, w, 0u, 0u), 10u | (20u << 8) | (30u << 16), "SLBG shows BGCOLOR instead of circuit 2");
++            t.Equals(latchedRgb(frame, w, 64u, 32u), 5u | (110u << 8) | (15u << 16), "circuit 1 alpha-blends over BGCOLOR");
++        });
++
++        tc.Run("latched host presentation outputs DH+1 raster lines for a PAL field buffer in either field", [](TestCase &t)
++        {
++            // FIELD mode: the buffer holds one 224-row field and DH+1 = 448 counts frame lines, so every field row
++            // covers two raster lines. The result must not depend on the VSync parity at the latch, which is not
++            // tied to the field the buffer was drawn for.
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            auto fieldRow = [](uint32_t r) { return 0x80300000u | (r & 0xFFu) | ((r >> 8) << 8); };
++            fillReferenceFrameRows(vram, 0u, 8u, 512u, 0u, 224u, fieldRow);
++
++            auto present = [&](uint64_t tick, std::vector<uint8_t> &frame, uint32_t &w, uint32_t &h)
++            {
++                GSRegisters regs{};
++                regs.pmode = 0x66ull;
++                regs.smode2 = 0x3ull;
++                regs.dispfb2 = referenceDispFb(0u, 8u, GS_PSM_CT32);
++                regs.display2 = referenceDisplay(656u, 72u, 4u, 0u, 2559u, 447u);
++                regs.vsyncTick.store(tick);
++                GS gs;
++                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
++                gs.latchHostPresentationFrame();
++                return gs.copyLatchedHostPresentationFrame(frame, w, h);
++            };
++
++            for (uint64_t tick : {4ull, 5ull})
++            {
++                std::vector<uint8_t> frame;
++                uint32_t w = 0u, h = 0u;
++                t.IsTrue(present(tick, frame, w, h), "field buffer should present");
++                t.Equals(w, 512u, "PAL field width");
++                t.Equals(h, 448u, "PAL field output keeps 448 raster lines instead of 224 buffer rows");
++                if (w != 512u || h != 448u)
++                    return;
++                t.Equals(latchedRgb(frame, w, 0u, 0u), fieldRow(0u) & 0xFFFFFFu, "row 0 on line 0");
++                t.Equals(latchedRgb(frame, w, 0u, 1u), fieldRow(0u) & 0xFFFFFFu, "row 0 also covers line 1");
++                t.Equals(latchedRgb(frame, w, 0u, 2u), fieldRow(1u) & 0xFFFFFFu, "row 1 on line 2");
++                t.Equals(latchedRgb(frame, w, 0u, 3u), fieldRow(1u) & 0xFFFFFFu, "row 1 also covers line 3");
++                t.Equals(latchedRgb(frame, w, 0u, 446u), fieldRow(223u) & 0xFFFFFFu, "row 223 on line 446");
++                t.Equals(latchedRgb(frame, w, 0u, 447u), fieldRow(223u) & 0xFFFFFFu, "row 223 on line 447");
++            }
++        });
++
++        tc.Run("latched host presentation does not mix the previously displayed field buffer into FIELD output", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            auto evenRow = [](uint32_t r) { return 0x80000000u | (r & 0xFFu) | ((r >> 8) << 8) | (0x11u << 16); };
++            auto oddRow = [](uint32_t r) { return 0x80000000u | (r & 0xFFu) | ((r >> 8) << 8) | (0x22u << 16); };
++            fillReferenceFrameRows(vram, 56u, 8u, 512u, 0u, 224u, evenRow);
++            fillReferenceFrameRows(vram, 0u, 8u, 512u, 0u, 224u, oddRow);
++
++            GSRegisters regs{};
++            regs.pmode = 0x66ull;
++            regs.smode2 = 0x3ull;
++            regs.display2 = referenceDisplay(656u, 72u, 4u, 0u, 2559u, 447u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
++
++            regs.dispfb2 = referenceDispFb(56u, 8u, GS_PSM_CT32);
++            regs.vsyncTick.store(10u);
++            gs.latchHostPresentationFrame();
++            regs.dispfb2 = referenceDispFb(0u, 8u, GS_PSM_CT32);
++            regs.vsyncTick.store(11u);
++            gs.latchHostPresentationFrame();
++
++            std::vector<uint8_t> frame;
++            uint32_t w = 0u, h = 0u;
++            t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, w, h), "second field should present");
++            t.Equals(h, 448u, "second field height");
++            if (w != 512u || h != 448u)
++                return;
++            for (uint32_t k : {0u, 100u, 223u})
++            {
++                t.Equals(latchedRgb(frame, w, 0u, 2u * k), oddRow(k) & 0xFFFFFFu, "line 2k shows the displayed buffer");
++                t.Equals(latchedRgb(frame, w, 0u, 2u * k + 1u), oddRow(k) & 0xFFFFFFu, "line 2k+1 shows the displayed buffer");
++            }
++        });
++
++        tc.Run("latched host presentation reads every buffer row in interlaced FRAME mode", [](TestCase &t)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            auto frameRow = [](uint32_t r) { return 0x80400000u | (r & 0xFFu) | ((r >> 8) << 8); };
++            fillReferenceFrameRows(vram, 0u, 10u, 640u, 0u, 448u, frameRow);
++
++            GSRegisters regs{};
++            regs.pmode = 0x66ull;
++            regs.smode2 = 0x1ull; // INT=1, FFMD=0: the buffer holds the whole frame
++            regs.dispfb2 = referenceDispFb(0u, 10u, GS_PSM_CT32);
++            regs.display2 = referenceDisplay(656u, 72u, 3u, 0u, 2559u, 447u);
++            regs.vsyncTick.store(7u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
++            gs.latchHostPresentationFrame();
++
++            std::vector<uint8_t> frame;
++            uint32_t w = 0u, h = 0u;
++            t.IsTrue(gs.copyLatchedHostPresentationFrame(frame, w, h), "frame mode should present");
++            t.Equals(w, 640u, "frame mode width");
++            t.Equals(h, 448u, "frame mode height");
++            if (w != 640u || h != 448u)
++                return;
++            for (uint32_t y : {0u, 1u, 2u, 3u, 446u, 447u})
++                t.Equals(latchedRgb(frame, w, 0u, y), frameRow(y) & 0xFFFFFFu, "frame mode shows buffer row y on line y");
++        });
++
+         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)
+         {
+             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
