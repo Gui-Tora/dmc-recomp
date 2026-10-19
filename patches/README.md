@@ -572,3 +572,23 @@ arriba). Los diecinueve patches actualmente activos:
       byte a byte.
     - Validación: 450 tests y los mismos 25 fallos preexistentes, tanto con FFmpeg ON como OFF.
       Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`, sección 19.
+
+26. `VISUAL_001_hle_libgraph_display_env.patch` (convención B). `Kernel/Stubs/GS.cpp`: los HLE de
+    `sceGsSetDefDispEnv`, `sceGsSetDefDBuffDc` y `sceGsSetDefDBuff` calculan `PMODE`, `SMODE2` y `DISPLAY` con
+    las reglas de libgraph y el modo de vídeo que `sceGsResetGraph` guarda en `g_gparam`.
+    - Antes: `DISPLAY` fijo (DX 636, DY 32, MAGH 0, `w−1`, `h−1`) y `PMODE` 0x8007 para cualquier modo de vídeo.
+      En DMC (PAL, entrelazado, campo, 512×224) daba DX 636, DY 64 (con los +32 del juego), MAGH 0, DW 511 y
+      DH 223, frente a DX 656, DY 104, MAGH 4, DW 2559 y DH 447 en PCSX2.
+    - Reglas (desensamblado de `sceGsSetDefDispEnv` en `SLES_503.58`, 0x1002E8): `PMODE` 0x66; `SMODE2`
+      2/1/3 (progresivo, FRAME, FIELD); `MAGH = (w+2559)/w − 1`, `DW = (MAGH+1)·w − 1`; bases DX 636/656 y
+      DY 50/72 (entrelazado) o 25/36 (progresivo) para NTSC/PAL; `DH = 2h−1` en modo campo y `h−1` en los
+      demás. Con otro `omode` no se escribe `DISPLAY`, como en el original.
+    - Se conservan los `DISPFB` de P4.1/P4.1.10. `sceGsSetDefDispEnv` escribe además `PMODE`, `SMODE2` y
+      `BGCOLOR`, como el original. `sceGsSetDefDBuff` no está en este ELF; usa las mismas reglas por analogía
+      con `sceGsSetDefDBuffDc` (inferencia).
+    - Tests: 3 nuevos (seis modos PAL/NTSC, `omode` desconocido, caso DMC contra PCSX2) y el test de
+      `sceGsSetDefDBuffDc` pasa a comprobar `DW = ancho·(MAGH+1)` en modo FRAME NTSC.
+    - Depende del parche 27: con el presentador anterior, `DH = 2h−1` haría leer 448 filas de un buffer de
+      campo de 224.
+    - Los checkpoints existentes guardan las estructuras de display creadas en el arranque con el HLE
+      anterior, y `g_gparam` no forma parte del checkpoint; el cambio solo se aplica tras un arranque en frío.
