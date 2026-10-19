@@ -19,7 +19,7 @@ Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
 | ELF | `SLES_503.58`; SHA-256 `d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`; CRC32 `0x77654AD2`; entry `0x00100008` |
 | `CDMODULE.IRX` | SHA-256 `9d51f16d1ed861e508daa1389e6aaf4fe597687b3f0cd5feb920e62a479b34fa` |
 | `TSNDDRVM.IRX` | SHA-256 `c00b17f07aa0dfed089a517498074eec251c7b571f58a7649414ef88be7f31fd` |
-| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master`: 19 parches. Rama `gameplay-001l`: **25 parches** (`patched_commit` `e86516d5c335a443d53b40b79eabc210bbaf043a`), vendor idéntico byte a byte al replay limpio |
+| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master` (tras integrar 001L): 25 parches (`patched_commit` `e86516d5c335a443d53b40b79eabc210bbaf043a`). Rama `visual-001-letterbox`, en revisión: **27 parches** (`patched_commit` `e58f58b93897d28a8fa5f47f9f8c2e73601f5b23`), vendor idéntico byte a byte al replay limpio |
 | Límites de función | `.symtab` del ELF (*symtab-first*), no Ghidra. Ver [SYMTAB_BASELINE_PROMOTION.md](SYMTAB_BASELINE_PROMOTION.md) |
 | Herramientas | Rabbitizer (en ps2_recomp), Ghidra solo para navegación y xrefs, PCSX2 2.8.2 como oráculo (PINE de solo lectura + debugger manual del usuario) |
 | Repositorio | `https://github.com/Gui-Tora/dmc-recomp` (rama principal `master`) |
@@ -38,10 +38,10 @@ generales del runtime van en `patches/`.
 | Checkpoint de desarrollo Main Menu | formato v2; runtime ABI 2 en el parche 14 (`gameplay-001i`) |
 | CDMODULE `fno=2 mode=1/2/8/0xA`, `fno=1/8`, SeReplace | validado; parche 14 (`gameplay-001i`) |
 | Película `0x232` tras NEW GAME | reproducida completa con los parches 14 + 15 |
-| Escena posterior a la película | cinemática en tiempo real de la oficina **ya no se detiene**: con el parche 17 (TSNDDRVM) `Event_voice_call` encuentra el stream XAG listo y, en una corrida Release de ~46 min, el script llegó a su final (tick 32366); sigue el vídeo `0x231`, la carga del escenario siguiente y el bloqueo `sceDmaRecvI` (IPU/scratchpad en `Movie_texture`). Defectos visuales: oscuridad, tinte verde, huecos, circuito 1 mal colocado (VISUAL_001/004/005/006) |
+| Escena posterior a la película | cinemática en tiempo real de la oficina **ya no se detiene**: con el parche 17 (TSNDDRVM) `Event_voice_call` encuentra el stream XAG listo y, en una corrida Release de ~46 min, el script llegó a su final (tick 32366); sigue el vídeo `0x231`, la carga del escenario siguiente y el bloqueo `sceDmaRecvI` (IPU/scratchpad en `Movie_texture`). Defectos visuales: oscuridad, tinte verde, huecos (VISUAL_004/005/006); el circuito 1 mal colocado y la banda verdosa están resueltos (VISUAL_001, parches 26 y 27) |
 | Audio | **voz/pista XAG de la cinemática audible** (parche 17; confirmado por el usuario 2026-10-15), a velocidad real y por tanto desincronizada con un juego más lento; efectos (TQ), BGM y audio de películas PSS siguen mudos |
 | `sceDmaRecvI` / `Movie_texture` (IPU) | superado (parche 20): la corrida autorizada pasó de `0x231` a la escena del castillo, donde abre el menú de estado; ningún personaje visible ni respuesta al movimiento |
-| Oficina: personajes y geometría | recuperados en 001L: matrices de personaje (`ecossin`), cadenas DMA completas (parche 22), luces (`Get_light_str`) y skinning (`UNPACK V4-5`, parche 24). Trish y el escenario se ven; quedan una franja horizontal en la presentación y figuras oscuras pendientes de comparar con PCSX2 |
+| Oficina: personajes y geometría | recuperados en 001L: matrices de personaje (`ecossin`), cadenas DMA completas (parche 22), luces (`Get_light_str`) y skinning (`UNPACK V4-5`, parche 24). Trish y el escenario se ven. La franja y la banda de la presentación están resueltas en VISUAL_001 (parches 26 y 27); quedan figuras oscuras pendientes de comparar con PCSX2 |
 | 20 `ret0` VU0 | 5 restauradas (`capVu0MulMatrix2`, `capVu0AddVectorXYZ`, `capVu0SubVectorXYZ`, `_capVu0ecossin`, `Get_light_str`); **15 pendientes**, 7 de ellas (recorte) como experimento ([GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md)) |
 
 ## 3. Última ejecución comprobada (local, 2026-10-18, cierre de 001L)
@@ -161,6 +161,10 @@ generales del runtime van en `patches/`.
   pesos de skinning; sin la expansión, los vértices colapsaban hacia el origen (cuña negra, Trish deformada).
 - **001L:** el GS por software dibuja ahora el fotograma completo. La franja horizontal del letterbox es un
   defecto de la ruta de presentación del host: no aparece en la VRAM.
+- **VISUAL_001 (parches 26 y 27):** el HLE de libgraph programa `DISPLAY`/`PMODE`/`SMODE2` según el modo de vídeo
+  y el presentador compone los dos circuitos del PCRTC (filas de campo, posición `DX/DY`). La imagen pasa a
+  512×448 sin franja ni banda. Detalle y límites de la validación:
+  [VISUAL_001_LETTERBOX_BAND.md](VISUAL_001_LETTERBOX_BAND.md), §13.
 
 ## 8. Próximos bloqueadores (orden por evidencia)
 
@@ -168,8 +172,10 @@ generales del runtime van en `patches/`.
 
 Orden actual:
 
-1. **Franja horizontal de presentación** en la oficina (siguiente fase).
-2. **PERF_001:** ≈3–5 VSync/s en la oficina, con VU1 compilado y la cadena DMA completa (5,1 medidos en la build limpia del cierre).
+1. ~~Franja horizontal de presentación~~ **Resuelta en VISUAL_001** (parches 26 y 27). Pendientes derivados:
+   compatibilidad de checkpoints antiguos, `g_gparam` en el checkpoint, carga del checkpoint nuevo, escalado
+   horizontal 4:3 (ver la nota, §13).
+2. **PERF_001** (siguiente fase): ≈3–5 VSync/s en la oficina, con VU1 compilado y la cadena DMA completa (5,1 medidos en la build limpia del cierre).
 3. Escena posterior a `0x231`: no hay personaje visible ni respuesta al movimiento.
 4. 15 `ret0`, con las 7 de recorte como experimento, más los 6 casos `InterpNode 0/0`.
 5. Figuras oscuras de primer plano pendientes de comparar con PCSX2.
@@ -195,7 +201,7 @@ Lista histórica de 001J:
 
 ## 9. Próxima fase (propuesta, no iniciada)
 
-**Tras el cierre de 001L:** corregir la franja horizontal de presentación y después PERF_001. La lista
+**Tras el cierre de VISUAL_001:** PERF_001. La lista
 siguiente es la propuesta histórica de 001J/001K, ya cumplida.
 
 1. Revisar y publicar GAMEPLAY_001K (programas VU1 compilados; parche 19).

@@ -8,7 +8,28 @@ recompiled game code, binaries built from it, checkpoints, memory dumps or
 any other material derived from the game. You need your own legally obtained
 copy of the game to build and run anything.
 
-## [Unreleased] — GAMEPLAY_001L (under review) — still NOT PLAYABLE
+## [Unreleased] — VISUAL_001 (under review) — still NOT PLAYABLE
+
+### Fixed (general PS2Recomp runtime patches 26–27)
+
+- **26** libgraph HLE: `sceGsSetDefDispEnv`, `sceGsSetDefDBuffDc` and `sceGsSetDefDBuff` derive `PMODE`,
+  `SMODE2` and `DISPLAY` from the video mode set by `sceGsResetGraph` (MAGH/DW from the width, NTSC/PAL
+  DX/DY bases, `DH = 2h−1` in field mode), as the SDK does. They were fixed values for any mode.
+- **27** Host presentation composes both PCRTC circuits: each circuit uses its own `DISPLAY` geometry, field
+  mode reads `(DH+1)/2` rows (each covering two raster lines), and circuits are placed at `DX/DY` with the
+  usual `PMODE` blending.
+- Together they remove the displaced strip and the green band of the letterboxed office scene, and the
+  picture goes from a flattened 512×224 to 512×448. A cold boot produces the same display registers as
+  PCSX2.
+
+### Known limitations
+
+- Checkpoints saved before patches 26–27 carry the old display setup (and the HLE `g_gparam` is not part of
+  a checkpoint), so they look worse with the new presentation; the checkpoint compatibility identity does
+  not reject them yet.
+- The picture is shown at its buffer aspect (pillarboxed), not stretched to 4:3; fields are not woven.
+
+## [Unreleased] — GAMEPLAY_001L (merged in PR #5, not released)
 
 ### Fixed (general PS2Recomp runtime/recompiler patches 20–25)
 

@@ -42,10 +42,15 @@ project, not a playable port.
   GAMEPLAY_001K predates GAMEPLAY_001L: back then the runtime silently
   dropped most of each frame's VIF1 DMA chain (characters were not drawn);
   now the full chain reaches VU1 and the GS
-- Known visual defects: a horizontal band in the letterboxed presentation
-  (host presentation path), dark foreground figures still to be compared
-  with the original, and 15 VU0 helper functions still replaced by
-  diagnostic `ret0` stand-ins
+- Known visual defects: dark foreground figures still to be compared with
+  the original, and 15 VU0 helper functions still replaced by diagnostic
+  `ret0` stand-ins. The horizontal band and the green strip of the
+  letterboxed presentation are fixed (VISUAL_001, patches 26–27); the
+  picture is now 512×448 but is shown at its buffer aspect, not stretched
+  to 4:3
+- Checkpoints saved before patches 26–27 keep the old display setup and
+  look worse with the new presentation; use one created after a cold boot
+  with them (see `analysis/notes/VISUAL_001_LETTERBOX_BAND.md`)
 - Movie/PSS frames now render as recognizable, legible imagery (logo
   text, fire/smoke animation) after a GS double-buffer display
   environment fix, but playback is not yet fully correct (see

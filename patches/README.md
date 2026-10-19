@@ -592,6 +592,7 @@ arriba). Los diecinueve patches actualmente activos:
       campo de 224.
     - Los checkpoints existentes guardan las estructuras de display creadas en el arranque con el HLE
       anterior, y `g_gparam` no forma parte del checkpoint; el cambio solo se aplica tras un arranque en frío.
+      Documentación: `analysis/notes/VISUAL_001_LETTERBOX_BAND.md`.
 
 27. `VISUAL_001_pcrtc_circuit_presentation.patch` (convención B). `gs/gs_cpu_backend.cpp`: composición de
     los dos circuitos del PCRTC según `DISPLAY` y `SMODE2`.
@@ -609,3 +610,4 @@ arriba). Los diecinueve patches actualmente activos:
       El test preexistente «line-doubles interlaced field output» usaba `SMODE2` = 1 (FRAME) con el
       comentario «field mode»; pasa a `SMODE2` = 3 y ahora pasa.
     - Validación: 458 tests, 24 fallos preexistentes (25 antes; ninguno nuevo).
+      Documentación: `analysis/notes/VISUAL_001_LETTERBOX_BAND.md`.
