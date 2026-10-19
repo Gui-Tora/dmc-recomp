@@ -396,7 +396,20 @@ The root `CMakeLists.txt` of this repository seeds the option as `OFF`, so pass 
   compile error in this mode), but movies have no video. Useful without network access or for
   runtime-only work.
 
-These are the exact options used for the GAMEPLAY_001L from-scratch validation (Release, 0 errors):
+With `scripts/pipeline.py`, choose the mode explicitly (the option is always passed to CMake and
+recorded in `analysis/local/built.json`):
+
+```powershell
+python scripts/pipeline.py build                # same as --ffmpeg on (validated configuration)
+python scripts/pipeline.py build --ffmpeg off   # no FFmpeg download; movies without video
+```
+
+With `--ffmpeg on` the pipeline first checks that the pinned prebuilt is already in the build
+directory or can be downloaded. If not, it stops with a diagnostic instead of failing later in the
+build. No other pipeline command changes.
+
+Manual CMake commands. These are the exact options used for the GAMEPLAY_001L from-scratch
+validation (Release, 0 errors):
 
 ```powershell
 # game (generated sources in <generated-dir>)

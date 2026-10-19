@@ -251,7 +251,7 @@ python scripts/pipeline.py tools
 python scripts/pipeline.py identify original/SLES_503.58
 python scripts/pipeline.py prepare --elf original/SLES_503.58   # --toml por defecto: recomp/symtabfirst.toml
 python scripts/pipeline.py generate
-python scripts/pipeline.py build
+python scripts/pipeline.py build            # --ffmpeg on (por defecto) | --ffmpeg off
 python scripts/pipeline.py run --seconds 60
 ```
 
