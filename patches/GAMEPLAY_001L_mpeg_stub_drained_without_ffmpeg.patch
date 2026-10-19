@@ -1,0 +1,18 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 9f64777..52d6660 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -474,6 +474,13 @@ namespace ps2_stubs
+                 return true;
+             }
+ 
++            // No decoder, so nothing is ever buffered and no end-of-stream flush can be pending. The P4.2.4
++            // end-of-movie gates then depend only on the consumed ES bytes, as before P4.2.4.
++            bool drained() const
++            {
++                return true;
++            }
++
+             void reset() {}
+         };
+ #endif

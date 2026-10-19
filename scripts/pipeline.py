@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.request
 import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -381,7 +382,49 @@ def sync_active(folder, files):
     return active
 
 
-def build(_):
+def ffmpeg_prebuilt():
+    """Pinned prebuilt FFmpeg (tag, URL) exactly as ps2xRuntime/CMakeLists.txt downloads it (Windows)."""
+    text = (VENDOR / 'ps2xRuntime/CMakeLists.txt').read_text(encoding='utf-8')
+    tag = re.search(r'set\(FFMPEG_PREBUILT_TAG "([^"]+)"\)', text)
+    url = re.search(r'set\(FFMPEG_PREBUILT_URL\s+"([^"]+)"\)', text)
+    if not tag or not url:
+        raise RuntimeError('No se encuentra FFMPEG_PREBUILT_TAG/URL en vendor/PS2Recomp/ps2xRuntime/CMakeLists.txt; '
+                           'revisar el runtime o compilar con --ffmpeg off.')
+    return tag.group(1), url.group(1).replace('${FFMPEG_PREBUILT_TAG}', tag.group(1))
+
+
+def ffmpeg_preflight(build_dir):
+    """With FFmpeg on, CMake downloads the pinned prebuilt during the build. Fail early with a clear
+    diagnostic when it is neither staged in build_dir nor reachable, instead of a late ExternalProject error."""
+    tag, url = ffmpeg_prebuilt()
+    staged = build_dir / 'ThirdParty/ffmpeg-prefix/src/ffmpeg_external/bin/avcodec.lib'
+    if staged.is_file():
+        return f'FFmpeg {tag}: ya descargado en {staged.parent}'
+    try:
+        request = urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'dmc-recomp-pipeline'})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status = response.status
+    except Exception as exc:  # noqa: BLE001 - any failure means the build would fail later
+        raise RuntimeError(
+            f'--ffmpeg on: el FFmpeg precompilado {tag} no esta en {staged.parent} y no se puede descargar '
+            f'({url}: {exc}). Opciones: dar acceso a esa URL y repetir, o compilar sin video MPEG/PSS con '
+            f'--ffmpeg off.')
+    if status >= 400:
+        raise RuntimeError(f'--ffmpeg on: {url} responde {status}; compilar con --ffmpeg off o revisar la URL fijada.')
+    return f'FFmpeg {tag}: se descargara durante el build desde {url}'
+
+
+def runtime_configure_args(build_dir, active, ffmpeg):
+    """cmake configure line of `build`. PS2X_ENABLE_FFMPEG is always passed explicitly: the root CMakeLists.txt
+    seeds it OFF and an existing cache would otherwise keep whatever value it had."""
+    return [cmake(), '-S', ROOT, '-B', build_dir, '-G', 'Visual Studio 17 2022', '-A', 'x64',
+            f'-DDMC_GENERATED_DIR={active.as_posix()}',
+            f'-DDMC_MSVC_MP_JOBS={PARALLEL_JOBS}',
+            f'-DPS2X_ENABLE_FFMPEG={"ON" if ffmpeg else "OFF"}']
+
+
+def build(args):
+    ffmpeg = getattr(args, 'ffmpeg', 'on') == 'on'
     receipt, folder, gen = generated()
     # generated() -> prepared() -> upstream() already validated vendor against
     # the lock; snapshot the raw state here (not just effective_commit()) so a
@@ -393,9 +436,11 @@ def build(_):
     # Same reasoning as sync_active(): the promoted symtab-first build's CMake cache
     # has C:/.../analysis/local/symtabfirst/build baked in absolute-path form.
     build_dir = ROOT / 'analysis/local/symtabfirst/build'
-    run([cmake(), '-S', ROOT, '-B', build_dir, '-G', 'Visual Studio 17 2022', '-A', 'x64',
-         f'-DDMC_GENERATED_DIR={active.as_posix()}',
-         f'-DDMC_MSVC_MP_JOBS={PARALLEL_JOBS}'], 'configure-runtime')
+    if ffmpeg:
+        print(ffmpeg_preflight(build_dir), flush=True)
+    else:
+        print('FFmpeg desactivado (--ffmpeg off): las peliculas MPEG/PSS no tendran video.', flush=True)
+    run(runtime_configure_args(build_dir, active, ffmpeg), 'configure-runtime')
     run([cmake(), '--build', build_dir, '--config', 'Debug', '--target', 'ps2EntryRunner',
          '--parallel', str(PARALLEL_JOBS)], 'build-runtime')
     after = vendor_state()
@@ -406,7 +451,7 @@ def build(_):
             'estado de vendor. Repetir build sobre un vendor estable.')
     exe = executable(build_dir / 'bin', 'dmc-recomp')
     save(LOCAL / 'built.json', dict(generated=gen, exe=str(exe), exe_sha256=digest(exe),
-                                     vendor_commit=after[0]))
+                                     vendor_commit=after[0], ffmpeg='on' if ffmpeg else 'off'))
 
 
 def launch(args):
@@ -438,6 +483,10 @@ def main():
         command.set_defaults(function=function)
         if name == 'run':
             command.add_argument('--seconds', type=int, default=60)
+        if name == 'build':
+            command.add_argument('--ffmpeg', choices=('on', 'off'), default='on',
+                                 help='FFmpeg-backed MPEG/PSS video (default: on, the validated configuration). '
+                                      'off builds without movie video and needs no FFmpeg download.')
     command = commands.add_parser('identify')
     command.add_argument('elf', type=Path)
     command.set_defaults(function=identify)

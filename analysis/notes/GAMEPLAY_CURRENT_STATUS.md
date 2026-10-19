@@ -1,12 +1,13 @@
 # Estado actual del proyecto — punto de entrada para nuevos agentes
 
-Última actualización: 2026-10-15, cierre de GAMEPLAY_001J (TSNDDRVM/XAG, la cinemática de la oficina ya no se detiene, preparación de v0.1.0-alpha) — [GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md](GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md).
+Última actualización: 2026-10-19, cierre de GAMEPLAY_001L (parches 20–25: IPU, RPC, DMA, VU0, VIF V4-5, build sin FFmpeg; personajes de la oficina recuperados) — [GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md](GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md).
 Índice histórico completo: [RESEARCH_INDEX.md](RESEARCH_INDEX.md).
 Reglas del proyecto: [AGENTS.md](../../AGENTS.md) (obligatorias) y [README.md](../../README.md).
 
-> **Aviso:** `master` (`f3c4e33`, PR #2) contiene el avance de 001D–001I. El trabajo de 001J (parches 16–18,
-> notas) está en la rama local `gameplay-001j`, preparado para PR y pendiente de autorización. Lee la sección «Estado remoto frente a estado local».
-> **El juego no es jugable.** El primer frame jugable **no** está demostrado.
+> **Aviso:** `master` (`b6f7934`, PR #4) contiene el trabajo hasta 001K (19 parches). El trabajo de 001L
+> (parches 20–25, notas) está en la rama `gameplay-001l`, publicada como Draft PR #5 y pendiente de revisión. Lee la
+> sección «Estado remoto frente a estado local».
+> **El juego no es jugable. DMC-Recomp es experimental.** `FIRST_PLAYABLE_FRAME` **no** está demostrado.
 
 Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
 
@@ -18,7 +19,7 @@ Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
 | ELF | `SLES_503.58`; SHA-256 `d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`; CRC32 `0x77654AD2`; entry `0x00100008` |
 | `CDMODULE.IRX` | SHA-256 `9d51f16d1ed861e508daa1389e6aaf4fe597687b3f0cd5feb920e62a479b34fa` |
 | `TSNDDRVM.IRX` | SHA-256 `c00b17f07aa0dfed089a517498074eec251c7b571f58a7649414ef88be7f31fd` |
-| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master`: 15 parches (`patched_commit` `6bea2eb0…`). Rama `gameplay-001j`: **18 parches** (`patched_commit` `585c347e4cf3e26c804b561b3f2d5aa27b0fe1ae`), vendor idéntico byte a byte al replay limpio |
+| Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master`: 19 parches. Rama `gameplay-001l`: **25 parches** (`patched_commit` `e86516d5c335a443d53b40b79eabc210bbaf043a`), vendor idéntico byte a byte al replay limpio |
 | Límites de función | `.symtab` del ELF (*symtab-first*), no Ghidra. Ver [SYMTAB_BASELINE_PROMOTION.md](SYMTAB_BASELINE_PROMOTION.md) |
 | Herramientas | Rabbitizer (en ps2_recomp), Ghidra solo para navegación y xrefs, PCSX2 2.8.2 como oráculo (PINE de solo lectura + debugger manual del usuario) |
 | Repositorio | `https://github.com/Gui-Tora/dmc-recomp` (rama principal `master`) |
@@ -39,9 +40,23 @@ generales del runtime van en `patches/`.
 | Película `0x232` tras NEW GAME | reproducida completa con los parches 14 + 15 |
 | Escena posterior a la película | cinemática en tiempo real de la oficina **ya no se detiene**: con el parche 17 (TSNDDRVM) `Event_voice_call` encuentra el stream XAG listo y, en una corrida Release de ~46 min, el script llegó a su final (tick 32366); sigue el vídeo `0x231`, la carga del escenario siguiente y el bloqueo `sceDmaRecvI` (IPU/scratchpad en `Movie_texture`). Defectos visuales: oscuridad, tinte verde, huecos, circuito 1 mal colocado (VISUAL_001/004/005/006) |
 | Audio | **voz/pista XAG de la cinemática audible** (parche 17; confirmado por el usuario 2026-10-15), a velocidad real y por tanto desincronizada con un juego más lento; efectos (TQ), BGM y audio de películas PSS siguen mudos |
-| 20 `ret0` VU0 | 3 restauradas localmente (`capVu0MulMatrix2`, `capVu0AddVectorXYZ`, `capVu0SubVectorXYZ`); **17 pendientes** ([GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md)) |
+| `sceDmaRecvI` / `Movie_texture` (IPU) | superado (parche 20): la corrida autorizada pasó de `0x231` a la escena del castillo, donde abre el menú de estado; ningún personaje visible ni respuesta al movimiento |
+| Oficina: personajes y geometría | recuperados en 001L: matrices de personaje (`ecossin`), cadenas DMA completas (parche 22), luces (`Get_light_str`) y skinning (`UNPACK V4-5`, parche 24). Trish y el escenario se ven; quedan una franja horizontal en la presentación y figuras oscuras pendientes de comparar con PCSX2 |
+| 20 `ret0` VU0 | 5 restauradas (`capVu0MulMatrix2`, `capVu0AddVectorXYZ`, `capVu0SubVectorXYZ`, `_capVu0ecossin`, `Get_light_str`); **15 pendientes**, 7 de ellas (recorte) como experimento ([GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md)) |
 
-## 3. Última ejecución comprobada (local, 2026-10-15, estado publicado)
+## 3. Última ejecución comprobada (local, 2026-10-18, cierre de 001L)
+
+- **Build limpia** (vendor = base + 24 parches, código regenerado desde el TOML del repositorio, `-DPS2X_ENABLE_FFMPEG=ON`):
+  Release `e13ccbbe0aef87be…`, 10 191 unidades, 0 errores.
+- **`ps2x_tests`:** 450; 25 fallos, el mismo conjunto preexistente.
+- **Prueba corta:**
+  - checkpoint `dmc_checkpoint_mainmenu_abi2_tsnd_v1.dmck`, NEW GAME, `0x232`, oficina hasta el tick 24420;
+  - 0 errores `[DMA]` y ningún error fatal;
+  - la oficina sin cuña negra, la pared de trofeos y Trish en la moto;
+  - ≈5,1 VSync/s con VU1 compilado.
+- Detalle: nota de 001L, sección 17.
+
+### Estado publicado anterior (2026-10-15)
 
 - **Ejecutables reproducibles** (vendor = base + 18 parches, sin instrumentación):
   - Release: `a1934eb32f7967b8a59512aff1909c18abc1e4f847fc5f9f9faade5231956d25`;
@@ -109,8 +124,12 @@ generales del runtime van en `patches/`.
 - 20 funciones VU0 sustituidas por `ret0` durante el bring-up.
 - Estado detallado, grupos A/B/C y prioridades en
   [GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md).
-- Defectos del traductor (sin parche): CLIP, MAC, escritura a `vf0`, DIV/0, SQRT, FTOI y redondeo. Ver
-  [GAMEPLAY_001F_RET0_BATCH_AUDIT.md](GAMEPLAY_001F_RET0_BATCH_AUDIT.md).
+- Defectos del traductor:
+  - **corregidos en el parche 23 (001L):** `VCLIPw` (orden de bits y `|w|`), `VDIV` (x/0 → ±max) y `VFTOI`
+    (saturación), con la semántica del intérprete de PCSX2;
+  - **sin parche:** MAC/saturación de `VADD`/`VMUL` (`±Inf` donde PCSX2 da `±FLT_MAX`; causa de los 6 casos
+    `InterpNode 0/0` pendientes), `SQRT`/`RSQRT` y redondeo.
+  - Ver [GAMEPLAY_001F_RET0_BATCH_AUDIT.md](GAMEPLAY_001F_RET0_BATCH_AUDIT.md) y la nota de 001L, sección 14.
 - Defecto de runtime: **`vf0 = (0,0,0,0)`** en todos los hilos salvo el principal.
   - Causa: `StartThread` e invocaciones `GsCallback` crean contextos con `memset 0` (HECHO, 001I).
   - En hardware `vf0 = (0,0,0,1)` es constante.
@@ -135,9 +154,28 @@ generales del runtime van en `patches/`.
 - Sin desbordes XGKICK ni agotamiento de presupuesto VU1 con la corrección.
 - **HECHO:** 0 cadenas VIF1 con TTE=0 pierden datos con la semántica nueva (medición de la película más la
   escena).
-- Residual UNKNOWN: `kMaxChainTags = 4096` trunca cadenas más largas.
+- ~~Residual UNKNOWN: `kMaxChainTags = 4096` trunca cadenas más largas.~~ **Resuelto en 001L (parche 22):** las
+  cadenas de la oficina miden 9–17 k tags; ahora se recorren completas, con detección exacta de ciclos y
+  presupuesto de 2^18.
+- **001L, parche 24:** `UNPACK V4-5` expande RGBA5551 como el hardware (`<<3`, A al bit 7). DMC guarda ahí los
+  pesos de skinning; sin la expansión, los vértices colapsaban hacia el origen (cuña negra, Trish deformada).
+- **001L:** el GS por software dibuja ahora el fotograma completo. La franja horizontal del letterbox es un
+  defecto de la ruta de presentación del host: no aparece en la VRAM.
 
 ## 8. Próximos bloqueadores (orden por evidencia)
+
+**Actualización 001L:** los puntos 1 (`sceDmaRecvI`) y 6 (CLIP/DIV/FTOI) están resueltos o encauzados.
+
+Orden actual:
+
+1. **Franja horizontal de presentación** en la oficina (siguiente fase).
+2. **PERF_001:** ≈3–5 VSync/s en la oficina, con VU1 compilado y la cadena DMA completa (5,1 medidos en la build limpia del cierre).
+3. Escena posterior a `0x231`: no hay personaje visible ni respuesta al movimiento.
+4. 15 `ret0`, con las 7 de recorte como experimento, más los 6 casos `InterpNode 0/0`.
+5. Figuras oscuras de primer plano pendientes de comparar con PCSX2.
+6. Checkpoint posterior a la intro y audio (sin cambios).
+
+Lista histórica de 001J:
 
 1. **`sceDmaRecvI` / `Movie_texture`:** decodificación IPU por hardware (toIPU → IPU → scratchpad → fromSPR) usada
    por niebla, fondos y pantallas de estado. El runtime no emula IPU ni DMA de scratchpad.
@@ -157,6 +195,9 @@ generales del runtime van en `patches/`.
 
 ## 9. Próxima fase (propuesta, no iniciada)
 
+**Tras el cierre de 001L:** corregir la franja horizontal de presentación y después PERF_001. La lista
+siguiente es la propuesta histórica de 001J/001K, ya cumplida.
+
 1. Revisar y publicar GAMEPLAY_001K (programas VU1 compilados; parche 19).
 2. **GAMEPLAY_001L:** superar `sceDmaRecvI` / `Movie_texture` (HLE con FFmpeg; borrador en
    `analysis/local/gameplay_001j/provisional_ipu/`).
@@ -164,7 +205,25 @@ generales del runtime van en `patches/`.
 GAMEPLAY_001J está documentada en
 [GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md](GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md).
 
-## 10. Estado remoto frente a estado local (verificado 2026-10-15, cierre de 001J)
+## 10. Estado remoto frente a estado local
+
+**Verificado 2026-10-19, cierre de 001L:**
+
+- `origin/master = b6f7934` (PR #4, 001K). 001J y 001K están fusionadas.
+- `v0.1.0-alpha` publicada (`NOT PLAYABLE`).
+- Rama `gameplay-001l` con el trabajo de 001L:
+  - commits sobre `b6f7934`;
+  - publicada como **Draft PR #5**, sin fusionar;
+  - los commits del parche 25 y de la configuración de FFmpeg, aún sin push.
+
+  Contenido:
+  - parches 20–25 en `patches/` y `upstream.lock.json`;
+  - `recomp/symtabfirst.toml` con 15 `ret0`;
+  - `runtime/dmc_overrides.cpp`: restauraciones, `libipu`, conmutador de diagnóstico `DMC_RET0_NATIVE`;
+  - `CMakeLists.txt` y las notas.
+- Instrumentación de 001L retirada, con copias en `analysis/local/gameplay_001l/retired/`.
+
+Tabla histórica de 001J:
 
 - `origin/master = f3c4e33`: PR #2 fusionado (parches 14 y 15, 17 `ret0`, notas de 001I). Sin releases ni tags.
 - La rama local `gameplay-001j` (desde `f3c4e33`) contiene el trabajo de 001J **sin commit**, pendiente de
@@ -192,12 +251,22 @@ python scripts/pipeline.py tools
 python scripts/pipeline.py identify original/SLES_503.58
 python scripts/pipeline.py prepare --elf original/SLES_503.58   # --toml por defecto: recomp/symtabfirst.toml
 python scripts/pipeline.py generate
-python scripts/pipeline.py build
+python scripts/pipeline.py build            # --ffmpeg on (por defecto) | --ffmpeg off
 python scripts/pipeline.py run --seconds 60
 ```
 
 `pipeline.py` sincroniza el código generado en `analysis/local/symtabfirst/generated` y compila en
 `analysis/local/symtabfirst/build` ([SYMTAB_BASELINE_PROMOTION.md](SYMTAB_BASELINE_PROMOTION.md)).
+
+> **FFmpeg (cierre de 001L):**
+> - El `CMakeLists.txt` raíz siembra `PS2X_ENABLE_FFMPEG=OFF`, así que la opción debe pasarse de forma
+>   explícita.
+> - Con `ON` (la configuración validada), CMake descarga el FFmpeg precompilado fijado y las películas
+>   tienen vídeo.
+> - Con `OFF` no hay descarga y las películas quedan sin vídeo. Hasta el parche 25 el runtime no compilaba
+>   en este modo: `drained()` del parche 10 solo existía con FFmpeg.
+> - Con el parche 25, runtime y tests compilan en ambos modos: 450 tests y los mismos 25 fallos.
+> - Opciones exactas de CMake: README, sección «Build».
 
 Pasos locales del mantenedor (scripts bajo `analysis/local/`, no versionados):
 

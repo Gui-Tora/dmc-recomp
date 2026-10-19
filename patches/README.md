@@ -438,3 +438,137 @@ arriba). Los diecinueve patches actualmente activos:
     generado. Sin programas compilados registrados se comporta como el
     intérprete. Documentación y validación:
     `analysis/notes/GAMEPLAY_001K_VU1_PERFORMANCE_DESIGN.md`.
+
+20. `GAMEPLAY_001L_ipu_idec_spr_dma.patch` (convención B). IPU y los canales
+    DMA que lo rodean, ejecutados de forma síncrona:
+    - `ipu/ps2_ipu.{h,cpp}` (cabecera privada, no la incluye el código
+      generado): FIFO de entrada y salida, `BCLR`, `IDEC` (salida RGB32;
+      MPEG-2 intra, tablas B.14/B.15, IDCT entera de referencia y CSC del
+      IPU), `FDEC`, `SETIQ`, `SETVQ`, `SETTH` y `IPU_CTRL.RST`; D4 toIPU
+      (normal y cadena de origen, con tags leídos solo cuando el IPU necesita
+      datos), D3 fromIPU (normal) y D8 fromSPR (normal e intercalado con
+      `D_SQWC`). `VDEC`, `BDEC`, `CSC`, `PACK` y los modos IDEC que no usa
+      DMC (`OFM`, `DTD`, `SGN`, `DTE`, `AS`, `QST`, `MP1`, umbrales de
+      `SETTH`) se notifican como error, sin salida ni finalización ficticia.
+    - `ps2_memory.cpp`: registros `0x10002000-0x1000203F`, FIFO de entrada
+      por `sq` a `0x10007010` y escrituras de `CHCR` de D3, D4 y D8. El
+      estado vive en `ps2_memory.cpp` (sin cambios en `ps2_memory.h`).
+      `IPU_CTRL.RST` se borra solo tras el reset (antes se leía de vuelta).
+    - `sceDmaRecvI`: semántica de libdma (MADR salvo `0xFFFFFFFF`, QWC y
+      `CHCR` con `MOD=intercalado`, `DIR=0`, `STR`); solo fromSPR.
+    - `sceIpuSync`: el modo 1 devuelve `BUSY`; el modo 0 informa si el IPU
+      sigue ocupado en lugar de darlo por terminado.
+    - `sceIpuInit`: las direcciones de `setD4_CHCR` y de las tablas IQ/VQ son
+      configurables (`ps2_ipu::setLibIpuInitLayout`); por defecto, las que
+      ya usaba el stub. DMC fija las suyas en `runtime/dmc_overrides.cpp`.
+
+    Tests en `ps2_ipu_tests.cpp`; dos expectativas de
+    `ps2_runtime_expansion_tests.cpp` pasan a `IPU_CTRL = 0` tras el reset.
+    Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.
+
+21. `GAMEPLAY_001L_sif_rpc_iop_server_handles.patch` (convención B). Separa los
+    servidores RPC del IOP gestionados por HLE de la RAM del EE:
+    - `SifBindRpc` a un SID que ningún servidor EE ha registrado ya no toma un
+      descriptor de `rpcAllocServerAddr` (pool `0x01F10000` en RDRAM, que se
+      ponía a cero al vincular y se escribía en cada `SifCallRpc`). El
+      descriptor vive en `RpcServerState::hle` y `cd->server` recibe un handle
+      del espacio IOP (`0x1C1F0000 + n·0x80`, nunca una dirección de RDRAM;
+      distinto de cero, así que los bucles de bind siguen funcionando).
+    - `SifCallRpc` resuelve el servidor solo a través del registro (SID
+      vinculado y, si no, la entrada que nombra `cd->server`). Un
+      `cd->server` desconocido ya no se desreferencia.
+    - Los servidores registrados en el EE (`SifRegisterRpc`) conservan su
+      descriptor en RAM del EE, esté donde esté.
+    - Checkpoint: formato sin cambios. Al cargar, las entradas antiguas cuyo
+      `sd_ptr` es exactamente un hueco ya asignado del pool de RDRAM
+      (`slot < g_rpc_server_index`) se vuelven a vincular a un handle IOP;
+      los clientes lo toman en su siguiente llamada.
+    - `ps2_debug_panel.cpp` muestra el descriptor del runtime para estos
+      servidores.
+    - Tests en `ps2_sif_rpc_tests.cpp` (3 nuevos y la expectativa del
+      provisional pasa al rango IOP).
+
+    `rpcAllocServerAddr`/`rpcAllocPacketAddr` siguen existiendo para
+    `IopHost::allocateIopHandle` (solo los usa `cri_dtx`, que DMC no carga).
+    Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`
+    (sección 11).
+
+22. `GAMEPLAY_001L_dma_chain_walk_budget.patch` (convención B). Recorrido de
+    cadenas DMA de origen (VIF0, VIF1, GIF) sin el límite fijo de 4096 tags:
+    - Antes se procesaban como mucho 4096 tags y el resto de la cadena se
+      descartaba en silencio. En la oficina de DMC las cadenas VIF1 miden
+      9 248-16 620 tags por fotograma, así que se perdía entre el 55 % y el
+      75 % de la geometría (personajes y escenario cercano incluidos).
+    - Ahora la cadena se recorre hasta su tag de fin (`refe`, `end`, `ret`
+      con la pila vacía, o IRQ con `TIE`). Los ciclos se detectan de forma
+      exacta: el mismo tag visitado con la misma pila de `CALL` (`ASP`,
+      `ASR0`, `ASR1`). El presupuesto de seguridad es de 2^18 tags (16 veces
+      la cadena más larga medida) y solo acota cadenas acíclicas
+      patológicas.
+    - Un ciclo, un presupuesto agotado, un `CALL` con `ASP = 2` o un tag
+      fuera de memoria se informan con `RUNTIME_ERROR`. No se encola nada y
+      `STR` queda activo: una transferencia incompleta nunca se presenta
+      como terminada.
+
+    Tests en `ps2_memory_tests.cpp`: cadena de 10 000 tags completa, 5 000
+    llamadas a un mismo subprograma (no es un ciclo) y los cuatro casos de
+    error. Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.
+
+23. `GAMEPLAY_001L_vu0_clip_div_ftoi_semantics.patch` (convención B).
+    Semántica de tres instrucciones VU0 en modo macro, en el traductor
+    (`vu_translator.cpp`, `vu_translation_helpers.cpp`), tomada del
+    intérprete de PCSX2 (`VUops.cpp`: `_vuCLIP`, `_vuDIV`, `floatToInt`):
+    - `VCLIPw`: compara `x`, `y`, `z` con `|w|` sobre los bits IEEE
+      (signo-magnitud). Bits `+x 0x01`, `−x 0x02`, `+y 0x04`, `−y 0x08`,
+      `+z 0x10`, `−z 0x20`; un `w` desnormal cuenta como el mayor desnormal.
+      Antes el orden de los bits estaba invertido (`−x` en el bit 0) y se
+      comparaba con `w` en lugar de `|w|`, así que un punto con `w < 0` salía
+      marcado en casi todos los planos.
+    - `VDIV`: operandos por `vuDouble`. Una división entre 0 da
+      `±0x7F7FFFFF` según el XOR de los signos (antes daba `0`), y el
+      cociente se satura igual que en PCSX2.
+    - `VFTOIn`: `|valor| ≥ 2^31` (también `Inf` y `NaN`) satura a
+      `0x7FFFFFFF` o `0x80000000` según el signo. Antes `cvttps` devolvía
+      siempre `0x80000000`.
+
+    `VSQRT`, `VRSQRT` y la falta de saturación de desbordamiento en
+    `VADD`/`VMUL` no cambian.
+
+    Con el mismo TOML, regenerar cambia 15 cuerpos de DMC. Pruebas:
+    - Test de emisión en `code_generator_tests.cpp`, con las palabras
+      reales `vclipw.xyz`, `vdiv` y `vftoi4`.
+    - Arnés offline que ejecuta los cuerpos generados frente a un modelo
+      PCSX2 y a un oráculo matemático de `CLIP`, descrito en
+      `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`.
+
+24. `GAMEPLAY_001L_vif_v45_unpack_fix.patch` (convención B). `UNPACK V4-5` de VIF1
+    (`ps2_vif1_interpreter.cpp`): el formato RGBA 5:5:5:1 de 16 bits se expande
+    como en PCSX2 (`Vif_Unpack.cpp`, `UNPACK_V4_5`): `R`, `G` y `B` `<< 3` (0–248) y `A`
+    al bit 7 (0/0x80).
+    - Antes los campos se escribían sin desplazar (0–31 y 0/1).
+    - DMC guarda ahí los pesos de skinning (5 bits, suma 31) y su programa VU1 los
+      escala por 1/248. Con valores 8 veces menores, los vértices de la vía mezclada
+      colapsaban hacia el origen del mundo y formaban polígonos gigantes: la cuña
+      negra de la oficina y una Trish deformada.
+    - No cambia ningún otro formato, ni el tratamiento de máscara/`ROW`: igual que
+      en PCSX2, `V4-5` no suma `ROW`.
+
+    Tests en `ps2_memory_tests.cpp`:
+    - `0x0000`, `0xFFFF`, `0x001F`, `0x03E0`, `0x7C00`, `0x8000`;
+    - tres valores reales de pesos del modelo;
+    - un caso con `STCYCL CL=5 WL=1` que comprueba la posición final en la memoria VU1.
+
+    Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`,
+    sección 16.
+
+25. `GAMEPLAY_001L_mpeg_stub_drained_without_ffmpeg.patch` (convención B).
+    `Kernel/Stubs/MPEG.cpp`: el sustituto del decodificador MPEG para builds sin FFmpeg
+    (`PS2X_ENABLE_FFMPEG=OFF`) recibe `drained()`, que devuelve siempre `true`.
+    - El parche 10 (BLOCKER_004 p423/p424) añadió `drained()` solo a la clase con FFmpeg, y tres
+      condiciones de fin de película lo llaman sin `#if`. Sin FFmpeg el runtime no compilaba.
+    - Sin decodificador no hay nada en búfer ni ningún vaciado de fin de flujo pendiente, así que el fin
+      de película depende solo de los bytes ES consumidos, como antes de P4.2.4 y como en upstream.
+    - Con FFmpeg el código no cambia: el preprocesado es idéntico token a token y `MPEG.obj` es idéntico
+      byte a byte.
+    - Validación: 450 tests y los mismos 25 fallos preexistentes, tanto con FFmpeg ON como OFF.
+      Documentación: `analysis/notes/GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md`, sección 19.

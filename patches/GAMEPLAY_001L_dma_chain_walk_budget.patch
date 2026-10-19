@@ -1,0 +1,270 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 8af0027..4eb5386 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ namespace
+@@ -232,6 +233,46 @@ namespace
+         return nreg == 0u ? 16u : nreg;
+     }
+ 
++    // Source-chain walk limits. A chain that reaches the same tag with the same CALL stack (ASP, ASR0, ASR1)
++    // loops forever, so cycles are detected exactly; the tag budget only bounds pathological acyclic chains.
++    // Measured: Devil May Cry's office scene sends VIF1 chains of 9,248-16,620 tags per frame; the budget is
++    // 16x that maximum, rounded up to a power of two.
++    constexpr uint32_t kDmaChainTagBudget = 1u << 18;
++
++    struct DmaChainState
++    {
++        uint32_t tadr;
++        uint32_t asp;
++        uint32_t asr0;
++        uint32_t asr1;
++        bool operator==(const DmaChainState &o) const
++        {
++            return tadr == o.tadr && asp == o.asp && asr0 == o.asr0 && asr1 == o.asr1;
++        }
++    };
++
++    struct DmaChainStateHash
++    {
++        size_t operator()(const DmaChainState &s) const noexcept
++        {
++            uint64_t h = (static_cast<uint64_t>(s.tadr) << 2) | s.asp;
++            h ^= static_cast<uint64_t>(s.asr0) * 0x9E3779B97F4A7C15ull;
++            h ^= static_cast<uint64_t>(s.asr1) * 0xC2B2AE3D27D4EB4Full;
++            return static_cast<size_t>(h ^ (h >> 29));
++        }
++    };
++
++    const char *dmaChannelName(uint32_t channelBase)
++    {
++        switch (channelBase)
++        {
++        case 0x10008000u: return "VIF0";
++        case 0x10009000u: return "VIF1";
++        case 0x1000A000u: return "GIF";
++        default: return "?";
++        }
++    }
++
+     // IPU device and its DMA host, one per PS2Memory (state lives here so ps2_memory.h stays unchanged).
+     struct IpuState
+     {
+@@ -1436,7 +1477,6 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1490,11 +1530,26 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         appendData(localTagAddr + 16u, qwCount);
+                     };
+ 
+-                    int tagsProcessed = 0;
++                    uint32_t tagsProcessed = 0;
+                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
++                    // Why the walk stopped; anything but a terminating tag leaves the channel running (STR set)
++                    // and queues nothing, so an incomplete transfer is never reported as finished.
++                    const char *chainError = nullptr;
++                    std::unordered_set<DmaChainState, DmaChainStateHash> chainStates;
+ 
+-                    while (tagsProcessed < kMaxChainTags)
++                    while (true)
+                     {
++                        if (tagsProcessed >= kDmaChainTagBudget)
++                        {
++                            chainError = "tag budget exceeded";
++                            break;
++                        }
++                        const DmaChainState state{tagAddr, asp, asp >= 1u ? asr0 : 0u, asp >= 2u ? asr1 : 0u};
++                        if (!chainStates.insert(state).second)
++                        {
++                            chainError = "cycle (tag revisited with the same CALL stack)";
++                            break;
++                        }
+                         const uint32_t currentTagAddr = tagAddr;
+                         const bool tagInSPR = isScratchpad(tagAddr);
+                         uint32_t physTag = 0;
+@@ -1504,6 +1559,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         }
+                         catch (...)
+                         {
++                            chainError = "tag address not mapped";
+                             break;
+                         }
+                         const uint8_t *tagBase;
+@@ -1519,7 +1575,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             tagMax = PS2_RAM_SIZE;
+                         }
+                         if (physTag + 16 > tagMax)
++                        {
++                            chainError = "tag address outside memory";
+                             break;
++                        }
+ 
+                         const uint8_t *tp = tagBase + physTag;
+                         uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
+@@ -1568,6 +1627,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                                     asr1 = retAddr;
+                                     asp = 2u;
+                                 }
++                                else
++                                {
++                                    chainError = "CALL with a full address stack (ASP=2)";
++                                }
+                             }
+                             tagAddr = addr;
+                             break;
+@@ -1603,6 +1666,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         // Same semantics as upstream ran-j/PS2Recomp 75d729c (#244).
+                         const bool transferTagData =
+                             (channelBase == 0x10009000u || channelBase == 0x10008000u) && (chcr & 0x40u) != 0u;
++                        if (chainError)
++                        {
++                            tagAddr = currentTagAddr;
++                            break;
++                        }
+                         if (transferTagData)
+                             appendCompactVif1TagData(currentTagAddr, 0u);
+ 
+@@ -1614,6 +1682,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                     }
+ 
++                    if (chainError)
++                    {
++                        static std::atomic<uint32_t> s_chainErrorLogs{0u};
++                        if (s_chainErrorLogs.fetch_add(1u, std::memory_order_relaxed) < 64u)
++                        {
++                            RUNTIME_ERROR("[DMA] " << dmaChannelName(channelBase) << " source chain stopped: " << chainError
++                                                   << " after " << tagsProcessed << " tags at TADR 0x" << std::hex
++                                                   << tagAddr << std::dec << "; transfer left running (STR set)\n");
++                        }
++                        chainBuf.clear();
++                    }
++
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 00e97a6..aa97e32 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -12,6 +12,8 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <vector>
++#include <string>
++#include <functional>
+ 
+ namespace
+ {
+@@ -1626,6 +1628,99 @@ void register_ps2_memory_tests()
+             t.IsTrue((mem.readIORegister(0x1000E010u) & 0x2u) != 0u, "VIF1 DMA completion should raise D_STAT channel bit");
+         });
+ 
++        tc.Run("DMA source chain longer than 4096 tags is walked to its END", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            constexpr uint32_t kGifCh = 0x1000A000u;
++            constexpr uint32_t kBase = 0x00100000u;
++            constexpr uint32_t kTags = 10000u; // DMC office chains measure 9,248-16,620 tags per frame
++            uint8_t *rdram = mem.getRDRAM();
++            for (uint32_t i = 0; i < kTags; ++i)
++            {
++                const uint32_t at = kBase + i * 32u;
++                writeDmaTag(rdram, at, makeDmaTag(1u, 1u, 0u, false)); // CNT qwc=1
++                std::memset(rdram + at + 16u, static_cast<int>(i & 0xFFu), 16u);
++            }
++            writeDmaTag(rdram, kBase + kTags * 32u, makeDmaTag(0u, 7u, 0u, false)); // END
++            size_t bytes = 0;
++            bool lastPayloadOk = false;
++            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
++            {
++                bytes += sizeBytes;
++                lastPayloadOk = sizeBytes >= 16u && data[sizeBytes - 1u] == static_cast<uint8_t>((kTags - 1u) & 0xFFu);
++            });
++            mem.writeIORegister(kGifCh + 0x30u, kBase);
++            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
++            mem.processPendingTransfers();
++            t.Equals(bytes, static_cast<size_t>(kTags) * 16u, "every CNT payload of the 10000-tag chain is transferred");
++            t.IsTrue(lastPayloadOk, "the payload of the last tag arrives (no truncation at 4096)");
++            t.Equals(mem.m_ioRegisters[kGifCh + 0x00u] & 0x100u, 0u, "a chain that reaches END completes (STR cleared)");
++        });
++
++        tc.Run("DMA source chain calling one subroutine thousands of times is not a cycle", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            constexpr uint32_t kGifCh = 0x1000A000u;
++            constexpr uint32_t kBase = 0x00100000u;
++            constexpr uint32_t kSub = 0x00080000u;
++            constexpr uint32_t kCalls = 5000u;
++            uint8_t *rdram = mem.getRDRAM();
++            writeDmaTag(rdram, kSub, makeDmaTag(1u, 6u, 0u, false)); // RET qwc=1
++            for (uint32_t i = 0; i < kCalls; ++i)
++                writeDmaTag(rdram, kBase + i * 16u, makeDmaTag(0u, 5u, kSub, false)); // CALL qwc=0
++            writeDmaTag(rdram, kBase + kCalls * 16u, makeDmaTag(0u, 7u, 0u, false));   // END
++            size_t bytes = 0;
++            mem.setGifPacketCallback([&](const uint8_t *, uint32_t sizeBytes) { bytes += sizeBytes; });
++            mem.writeIORegister(kGifCh + 0x30u, kBase);
++            mem.writeIORegister(kGifCh + 0x00u, 0x104u);
++            mem.processPendingTransfers();
++            t.Equals(bytes, static_cast<size_t>(kCalls) * 16u, "each CALL/RET pair transfers the subroutine payload");
++            t.Equals(mem.m_ioRegisters[kGifCh + 0x00u] & 0x100u, 0u, "the chain completes");
++        });
++
++        tc.Run("DMA source chain errors leave the channel running and transfer nothing", [](TestCase &t)
++        {
++            constexpr uint32_t kGifCh = 0x1000A000u;
++            auto run = [&](const std::function<void(uint8_t *)> &build, uint32_t tadr, const char *what)
++            {
++                PS2Memory mem;
++                t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++                build(mem.getRDRAM());
++                size_t packets = 0;
++                mem.setGifPacketCallback([&](const uint8_t *, uint32_t) { ++packets; });
++                mem.writeIORegister(kGifCh + 0x30u, tadr);
++                mem.writeIORegister(kGifCh + 0x00u, 0x104u);
++                mem.processPendingTransfers();
++                t.Equals(packets, static_cast<size_t>(0u), std::string(what) + ": nothing is reported as transferred");
++                t.IsTrue((mem.m_ioRegisters[kGifCh + 0x00u] & 0x100u) != 0u, std::string(what) + ": STR stays set");
++            };
++            run([](uint8_t *rdram)
++                {
++                    writeDmaTag(rdram, 0x00030000u, makeDmaTag(1u, 1u, 0u, false));        // CNT
++                    writeDmaTag(rdram, 0x00030020u, makeDmaTag(1u, 2u, 0x00030000u, false)); // NEXT back
++                },
++                0x00030000u, "NEXT cycle");
++            run([](uint8_t *rdram)
++                {
++                    writeDmaTag(rdram, 0x00031000u, makeDmaTag(0u, 5u, 0x00031100u, false)); // CALL
++                    writeDmaTag(rdram, 0x00031100u, makeDmaTag(0u, 5u, 0x00031200u, false)); // CALL
++                    writeDmaTag(rdram, 0x00031200u, makeDmaTag(0u, 5u, 0x00031300u, false)); // third CALL
++                    writeDmaTag(rdram, 0x00031300u, makeDmaTag(1u, 7u, 0u, false));
++                },
++                0x00031000u, "CALL with ASP=2");
++            run([](uint8_t *rdram) { writeDmaTag(rdram, 0x00032000u, makeDmaTag(0u, 2u, 0x7FFFFFF0u, false)); },
++                0x00032000u, "NEXT outside memory");
++            run([](uint8_t *rdram)
++                {
++                    // 2^18 + 1 distinct CNT tags without END: acyclic but over the safety budget.
++                    for (uint32_t i = 0; i <= (1u << 18); ++i)
++                        writeDmaTag(rdram, 0x00100000u + i * 16u, makeDmaTag(0u, 1u, 0u, false));
++                },
++                0x00100000u, "tag budget");
++        });
++
+         tc.Run("GIF DMA chain CALL sources payload from TADR+16", [](TestCase &t)
+         {
+             PS2Memory mem;

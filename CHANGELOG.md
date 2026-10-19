@@ -8,7 +8,44 @@ recompiled game code, binaries built from it, checkpoints, memory dumps or
 any other material derived from the game. You need your own legally obtained
 copy of the game to build and run anything.
 
-## [Unreleased] — GAMEPLAY_001K (under review)
+## [Unreleased] — GAMEPLAY_001L (under review) — still NOT PLAYABLE
+
+### Fixed (general PS2Recomp runtime/recompiler patches 20–25)
+
+- **20** IPU `IDEC` decoding plus `toIPU`/`fromIPU`/`fromSPR` DMA and `sceDmaRecvI`: the IPU movie-texture
+  path no longer aborts after movie `0x231`.
+- **21** SIF RPC: HLE IOP RPC servers use host-side handles instead of a pool in EE RAM that overwrote game
+  data (resource `0x6A`).
+- **22** VIF1/GIF/VIF0 source-chain DMA: whole chains are walked (DMC's office chains are 9–17 k tags; the
+  old 4096-tag limit silently dropped most of each frame), with exact cycle detection, a 2^18-tag safety
+  budget and explicit errors.
+- **23** Recompiler: VU0 macro `VCLIPw`, `VDIV` and `VFTOIn` follow the PCSX2 interpreter (clip bit order
+  and `|w|`, x/0 → ±max, float→int saturation).
+- **24** VIF1 `UNPACK V4-5` expands RGBA5551 like the hardware (`<<3`, alpha to bit 7). DMC stores its
+  skinning weights there; 8× smaller weights collapsed skinned vertices towards the world origin.
+- **25** Builds with `PS2X_ENABLE_FFMPEG=OFF` compile again: the MPEG decoder stub gets `drained()`
+  (always true). Patch 10 had added the method only to the FFmpeg decoder. With FFmpeg on, the compiled
+  code is unchanged.
+
+### Changed (DMC-specific)
+
+- `_capVu0ecossin` and `Get_light_str` run their native bodies (15 `ret0` stand-ins remain).
+- Game override with libipu's `sceIpuInit` table layout for this ELF.
+
+### Observed (office cutscene)
+
+- Characters and geometry are drawn: Trish on the motorbike, the trophy wall, lit doors. The large black
+  foreground wedge is gone.
+- Still open:
+  - a horizontal band in the letterboxed presentation;
+  - dark foreground figures not yet compared with the original;
+  - six `InterpNode 0/0` corner cases of the experimental near-clip path;
+  - 15 `ret0` stand-ins.
+- Performance: about 3–5 VSync/s in the office (5.1 measured on a clean Release build with compiled VU1).
+  The whole frame now reaches VU1/GS.
+- No first playable frame.
+
+## [Unreleased] — GAMEPLAY_001K (merged in PR #4, not released)
 
 ### Added
 
