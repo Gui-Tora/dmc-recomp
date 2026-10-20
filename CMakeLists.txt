@@ -37,6 +37,12 @@ if(dmc_vu1c_sources)
     # per-source include directory: the generated game sources keep their compile flags unchanged
     set_source_files_properties(${dmc_vu1c_sources} TARGET_DIRECTORY ps2EntryRunner PROPERTIES
         INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/vendor/PS2Recomp/ps2xRuntime/src/lib")
+    # PERF_001: one generated function per image grows past MSVC's size limit (C4883 "function size
+    # suppresses optimizations"); keep optimizing it in Release. Only these generated VU1 sources.
+    if(MSVC)
+        set_source_files_properties(${dmc_vu1c_sources} TARGET_DIRECTORY ps2EntryRunner PROPERTIES
+            COMPILE_OPTIONS "$<$<CONFIG:Release>:/d2OptimizeHugeFunctions>")
+    endif()
 endif()
 target_include_directories(ps2EntryRunner BEFORE PRIVATE "${DMC_GENERATED_DIR}")
 set_target_properties(ps2EntryRunner PROPERTIES OUTPUT_NAME dmc-recomp
