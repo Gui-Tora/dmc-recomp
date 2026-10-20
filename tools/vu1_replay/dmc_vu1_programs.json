@@ -15,7 +15,22 @@
         {"kind": 0, "pc": "0x0000", "note": "MSCAL, once per frame"},
         {"kind": 1, "pc": "0x00b8", "note": "MSCNT after the MSCAL program"},
         {"kind": 1, "pc": "0x0300", "note": "MSCNT after the XGKICK/E-bit exit at 0x02f8"},
-        {"kind": 1, "pc": "0x0348", "note": "MSCNT after the 0x0310 exit (seen in game from VSync ~23873)"}
+        {"kind": 1, "pc": "0x0348", "note": "MSCNT after the 0x0310 exit (seen in game from VSync ~23873)"},
+        {"kind": 0, "pc": "0x0f00", "note": "MSCAL used since the full DMA chains (PERF_001 P1-A; first seen at VSync 13132 from the VISUAL_001 main-menu checkpoint)"},
+        {"kind": 0, "pc": "0x1b00", "note": "MSCAL used since the full DMA chains (PERF_001 P1-A; first seen at VSync 13132 from the VISUAL_001 main-menu checkpoint)"},
+        {"kind": 0, "pc": "0x2100", "note": "MSCAL used since the full DMA chains (PERF_001 P1-A; first seen at VSync 13132 from the VISUAL_001 main-menu checkpoint)"},
+        {"kind": 0, "pc": "0x2700", "note": "MSCAL used since the full DMA chains (PERF_001 P1-A; first seen at VSync 13132 from the VISUAL_001 main-menu checkpoint)"},
+        {"kind": 1, "pc": "0x0fc0", "note": "MSCNT used since the full DMA chains (PERF_001 P1-A)"},
+        {"kind": 1, "pc": "0x13a8", "note": "MSCNT used since the full DMA chains (PERF_001 P1-A)"},
+        {"kind": 1, "pc": "0x13f0", "note": "MSCNT used since the full DMA chains (PERF_001 P1-A)"},
+        {"kind": 1, "pc": "0x1bc0", "note": "MSCNT used since the full DMA chains (PERF_001 P1-A)"},
+        {"kind": 1, "pc": "0x2098", "note": "MSCNT used since the full DMA chains (PERF_001 P1-A)"},
+        {"kind": 1, "pc": "0x27c8", "note": "MSCNT used since the full DMA chains (PERF_001 P1-A)"},
+        {"kind": 1, "pc": "0x2bc8", "note": "MSCNT used since the full DMA chains (PERF_001 P1-A)"}
+      ],
+      "deferred_entries": [
+        {"kind": 1, "pc": "0x20e0", "note": "PERF_001 P1-A: generated without rejection but not yet executed in a verify run (first seen at VSync 16990 in the office benchmark); kept out of the compiled set until verified"},
+        {"kind": 1, "pc": "0x2c10", "note": "PERF_001 P1-A: generated without rejection but not yet executed in a verify run (first seen at VSync 16645 in the office benchmark); kept out of the compiled set until verified"}
       ]
     }
   ]
