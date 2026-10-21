@@ -489,3 +489,61 @@ Release y solo con MSVC. No cambian el generador, el manifiesto (11 entradas nue
 - Siguiente cuello de botella: el GS por software (P2/P3 de §6), no iniciado.
 
 **`FIRST_PLAYABLE_FRAME` sigue pendiente. DMC-Recomp todavía no es jugable.**
+
+## 10. P3: atajo de fracción cero en el muestreo bilineal (2026-10-20, parche 28)
+
+**Cambio:** en `SampleTexture` (`gs_cpu_backend.cpp`), si `fx == 0 && fy == 0` se devuelve `samplePoint(u0, v0)`
+sin leer los otros tres texels ni interpolar. No cambian las coordenadas, el wrap/clamp, PSM/CLUT/TEXA, la
+fórmula bilineal, `lroundf` ni la tabla `std::function`.
+
+**Equivalencia** (HECHO, análisis del código):
+
+- Con pesos exactamente 0, `lerpChannel` calcula `top = c00 + (c10 − c00)·0 = c00` y `c00 + (bottom − top)·0 =
+  c00`, para `c` en 0..255 y diferencias finitas. Lo mismo vale si el compilador contrae a FMA, y el cero con
+  signo no altera la suma.
+- `lround(c00) = c00` y `clampU8` no lo modifica. Los 4 bytes resultantes son los de `c00`.
+- `samplePoint` (wrap, `ReadVramUnlocked`, `LookupCLUT`, `applyTexa`, 5551→8888) solo lee, así que omitir tres
+  llamadas no tiene efectos.
+- Las fracciones NaN o infinitas no son iguales a 0 y siguen el camino general.
+- **Casos que evita:** las muestras centradas en el texel. En la oficina son el 16,5 % de las muestras
+  bilineales (114 k por VSync, contador de §3), sobre todo en sprites con UV 1:1.
+
+**Tests** (`ps2x_tests`):
+
+- Corpus diferencial de 168 casos:
+  - 6 PSM (CT32, CT24, CT16, CT16S, T8 y T4, con CLUT CT32 o CT16);
+  - 4 modos de clamp;
+  - sprites con fracción cero, casi cero y grande, con origen interior y cruzando el borde;
+  - TEXA, TFX y mezcla aleatorios, y triángulos STQ.
+  - Los hashes de VRAM se registraron con el runtime **anterior** al cambio y se exige igualdad exacta.
+  - 148 de los 168 marcos son distintos entre sí; hay 20 casos cuya salida no depende de la textura (limitación
+    del corpus).
+- Test semántico: el bilineal en el centro del texel da exactamente el mismo marco que el muestreo puntual (4
+  PSM × 4 modos de clamp).
+- **Ambos pasan antes y después del cambio.**
+- Prueba de mutación (devolver `u1` en vez de `u0`): ambos fallan. El cambio se revirtió de inmediato.
+- Suite: 460 tests, los mismos 24 fallos preexistentes.
+
+**Rendimiento** (una corrida, sin sondas, `native`, FFmpeg ON, mismo checkpoint y misma ventana; ejecutable
+`33e289ba…`):
+
+| | C: P1-A (6,42) | P3 |
+|---|---|---|
+| VSync/s | 6,42 | **6,76** (+5,3 %) |
+| ms de pared por VSync | 155,8 | **147,9** (−7,9) |
+| VU1, ms por VSync | 55,5 | 55,4 |
+| Envío PATH1, ms por VSync | 45,8 | 44,8 |
+| Resto (incluye sprites por DMA), ms por VSync | 54,5 | **47,6** |
+| Llamadas VU1 por VSync / interpretadas | 1 067 / 1,9 % | 1 058 / 2,0 % |
+
+- INFERENCIA: la mejora no se explica por ruido.
+  - El componente que el cambio no toca (VU1) varía un 0,2 %.
+  - La bajada se concentra en el resto, donde están los sprites con UV 1:1.
+  - Su tamaño cuadra con unas 114 k muestras por VSync que se ahorran 3 lecturas y 4 interpolaciones cada una.
+- Solo hay una corrida por configuración, así que no se ha medido la dispersión entre corridas.
+
+**Integración:**
+
+- Parche 28 `patches/PERF_001_gs_bilinear_zero_fraction.patch` (sha256 `6bbc8a12…41c3`).
+- Lock: 28 parches, `patched_commit` `e3d4250d793372be74a2bcd65363810d577aa00d`. El replay coincide con el lock y
+  el vendor es idéntico; los parches 1–27 no cambian.

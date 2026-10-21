@@ -1,0 +1,285 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index cd8bf0d..d88dd6f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1038,6 +1038,13 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+     const float fx = sampleU - static_cast<float>(u0);
+     const float fy = sampleV - static_cast<float>(v0);
+ 
++    // Both weights exactly zero (texel-centred sample): lerpChannel(c00, c10, c01, c11, 0, 0) evaluates
++    // c00 + d * 0 = c00 exactly for every channel (c in 0..255, d finite), and lround/clampU8 return it
++    // unchanged, so the filtered texel is c00 bit for bit. samplePoint only reads, so skipping the other
++    // three taps has no side effect. NaN/Inf weights compare unequal and keep the general path.
++    if (fx == 0.0f && fy == 0.0f)
++        return samplePoint(u0, v0);
++
+     const uint32_t c00 = samplePoint(u0, v0);
+     const uint32_t c10 = samplePoint(u1, v0);
+     const uint32_t c01 = samplePoint(u0, v1);
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 4a7a522..06b0c7a 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -12,6 +12,7 @@
+ #include "Stubs/Helpers/Support.h"
+ #include "Stubs/GS.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
+@@ -3780,6 +3781,254 @@ void register_ps2_gs_tests()
+                      "linear filtering should preserve the shared opaque alpha from the CLUT entries");
+         });
+ 
++        tc.Run("GS bilinear sampling corpus matches the reference output (zero and non-zero fractions)", [](TestCase &t)
++        {
++            // Differential corpus for SampleTexture's bilinear path. Every case draws into a cleared 64x32 CT32
++            // frame and the frame page is hashed. kGolden was recorded with the runtime BEFORE the zero-fraction
++            // shortcut (PERF_001 P3); the shortcut must reproduce every hash exactly.
++            // Coverage: PSM CT32/CT24/CT16/CT16S/T8/T4 (CLUT CT32 and CT16), the four CLAMP modes, sprites whose
++            // per-pixel bilinear fractions are exactly zero (UV span == pixel span), near zero (span + 1 texel) and
++            // large (half span), origins inside the texture and across its right/bottom edge, TEXA, TFX/TCC,
++            // alpha blending on and off, and STQ triangles with arbitrary fractions.
++            static const std::vector<uint64_t> kGolden = {
++                0xBC857D0F03F8B888ull, 0xC0F02C48F6BA0EECull, 0xE525BCCA07E58322ull,
++                0xEB96CC05C2CD260Aull, 0x7C93CD8E55F19944ull, 0xA0FF78F5A4A79909ull,
++                0x0D0CE250551B2032ull, 0xF6CBAAFD52A0D63Dull, 0x36338E96E68DB2BCull,
++                0xD9DB7FE20026F1F1ull, 0xEE86C4FE81D01F0Cull, 0x075C624BC2EAE511ull,
++                0x1E541BA7880A9049ull, 0x5956A81DF0E2E02Cull, 0x80283F29E298ED5Eull,
++                0x9F2DFC7C948EF48Aull, 0x0B9EE9CE53A1413Full, 0x7F2A06372E7AEA43ull,
++                0xA2F95DA912EA9343ull, 0xF99CFDA30EA4CE70ull, 0x4B514611EB8F397Eull,
++                0x03087198A4BB0B83ull, 0x1C61590E56F75CFBull, 0x070A5A375B4296E2ull,
++                0x2C9491C01ABD9E63ull, 0x90D9A806E7E620C5ull, 0xE731AC6F28EC5E66ull,
++                0xDC85913B3EFA1226ull, 0x234E0DD3B08167EDull, 0xA7A6F1371BBA2C20ull,
++                0xF910994E63878213ull, 0xE2C8B56EDECA3AABull, 0x675815EFD05FE783ull,
++                0x0BB19B590E847F2Bull, 0xF8A7A4A99FAD6F1Cull, 0x78CCEACDCEEDACA9ull,
++                0x675815EFD05FE783ull, 0x4559543B8A28D691ull, 0xCD60DAACB0261736ull,
++                0x128893EF97747BECull, 0xFE95131D514D4A0Cull, 0x827D07A7925A59A7ull,
++                0x3D17982BFAF4736Dull, 0xC36D6474FC5B17B5ull, 0x18BF344834DE41E7ull,
++                0xF558E56F47CA2C83ull, 0xC37E5ACA3DEBF483ull, 0x11792B0692C7B985ull,
++                0x5F16489EA0AC22D9ull, 0x6C49F25455BEE807ull, 0xBFEB6213EAC310DEull,
++                0x98EA16D084E3F097ull, 0x51D29F9B372F0C33ull, 0xA8393F93D83CA55Bull,
++                0xB3F9FFB3A12B4ADDull, 0x8722EBCA9A05E737ull, 0xACEB8832FDF0B075ull,
++                0x056248DBBAC63D7Eull, 0xB49A0E1A9FA101F2ull, 0xEBE6B2C831FFA51Dull,
++                0xED4261823FAB2251ull, 0x085875347C41C58Bull, 0x492547B8E3BA42E9ull,
++                0x7385D03E1A14B31Cull, 0x8F579FB4AFF30D8Eull, 0x6D16CE2344FCB93Aull,
++                0xAF6BD0D80DDC41B7ull, 0xA953E40478AF03E1ull, 0x1A4C6D7D90A6A1B6ull,
++                0xC00BB643E8CE7677ull, 0x0CA1EEB633985F7Bull, 0x9895AF597FB27C0Dull,
++                0x8BCF44E1118EAB46ull, 0x02CAA1C5069B4283ull, 0x9523461B519CEDA3ull,
++                0x8BFB0F625AB6203Eull, 0xDDAC26880DE6DA5Eull, 0xEC40235FCD225183ull,
++                0x266DEC6777EB5E42ull, 0x0FEEE4C8E1B30294ull, 0xE18A91BF0DF79E33ull,
++                0xEA15444E0EA59584ull, 0x675815EFD05FE783ull, 0x7F1FC9DAA31DC74Cull,
++                0x1FD914069FB6AC6Cull, 0x8A48F8143289E97Cull, 0x84625283548764DDull,
++                0xEDC7F756793448EFull, 0xC80CBBBE2099FFC4ull, 0xC4B16034EF1DE152ull,
++                0xA1D18798BE7CF571ull, 0xB309927D92C8A84Bull, 0xA10170318273602Bull,
++                0x714C5FA69B0E610Bull, 0x4663AE2D851B93F7ull, 0xB1B922E719A46F26ull,
++                0x0DA32E1212038BA7ull, 0x51E4278D282870F5ull, 0x0995F2F6E99CC786ull,
++                0x1C571CF8195FA1ABull, 0x54F383D431210C6Dull, 0x7FAA4419AC393E03ull,
++                0xE0BF5FDFCC787263ull, 0xB6204D54415FA96Cull, 0xFD21B8A73A808299ull,
++                0x5E8F7795940BAA03ull, 0xDAFD3C5530AF2CDDull, 0xE3334F1E7F227487ull,
++                0x9F8651A56C823CE3ull, 0x881A27E2623D3DB3ull, 0xE1FD3E0D6EAA8F49ull,
++                0x47C2305AE9D8F812ull, 0x79268493CCD96274ull, 0x5592DD401BED6383ull,
++                0x675815EFD05FE783ull, 0x6FB8DE5FE353A383ull, 0x0E3626161C3AFB83ull,
++                0x0E3626161C3AFB83ull, 0x6CC0B53D2FD056EBull, 0x8B9D7A09E24B6383ull,
++                0x0E3626161C3AFB83ull, 0x0E3626161C3AFB83ull, 0x6C12C9E6F08EFE27ull,
++                0x7A2D0724A440DB83ull, 0x0E3626161C3AFB83ull, 0x0BEB1C0B5D9814E7ull,
++                0x675815EFD05FE783ull, 0x7933D83C05548F83ull, 0x33EFE9DED7C6A583ull,
++                0x675815EFD05FE783ull, 0x675815EFD05FE783ull, 0xB4F68CECD582BF83ull,
++                0x2A001CCB0226FC9Eull, 0xA300AE85CB1E30E3ull, 0x325894C357C5EBEBull,
++                0x36F6C92D5D70FB83ull, 0x0E3626161C3AFB83ull, 0xDD716B59F8163583ull,
++                0x41A1704367D22A56ull, 0x19CBBD1084158953ull, 0x0E3626161C3AFB83ull,
++                0x675815EFD05FE783ull, 0xFDEE92F97CBE4F83ull, 0x058A95127525D783ull,
++                0xAFDDCB1F35EFECE7ull, 0xD95CDAB618287F83ull, 0x61AD910AB9FB14DBull,
++                0xDD531C2C0159D2E0ull, 0xC2F5D8A2B2979FB2ull, 0xA0F8838C01041383ull,
++                0x029C85428A43B783ull, 0x0E3626161C3AFB83ull, 0x6FC861D2A563E583ull,
++                0xD77E843C69FB4E4Bull, 0x627F82EF26AC1783ull, 0x675815EFD05FE783ull,
++                0x675815EFD05FE783ull, 0x598D108DCE970383ull, 0x1DF8A2973F15DB03ull,
++                0x81D273BF02E4FB83ull, 0xEE51071F91937393ull, 0x0E3626161C3AFB83ull,
++                0x76F9E8113807E783ull, 0x0E3626161C3AFB83ull, 0x1E422320D20F8F83ull,
++                0x350F55A570AACF83ull, 0xE2F569BFB1B3A383ull, 0x71765450BFB7885Eull,
++            };
++            const size_t kGoldenCount = kGolden.size();
++
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            uint64_t rng = 0x9E3779B97F4A7C15ull;
++            auto next = [&rng]() -> uint64_t
++            {
++                rng ^= rng << 13;
++                rng ^= rng >> 7;
++                rng ^= rng << 17;
++                return rng;
++            };
++            for (size_t i = 8192u; i < vram.size(); i += 8u)
++            {
++                const uint64_t v = next();
++                std::memcpy(vram.data() + i, &v, sizeof(v));
++            }
++
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++
++            auto packFloat = [](float value) -> uint64_t
++            {
++                uint32_t bits = 0u;
++                std::memcpy(&bits, &value, sizeof(bits));
++                return bits;
++            };
++            auto frameHash = [&vram]() -> uint64_t
++            {
++                uint64_t h = 1469598103934665603ull;
++                for (size_t i = 0; i < 8192u; ++i)
++                    h = (h ^ vram[i]) * 1099511628211ull;
++                return h;
++            };
++
++            const uint8_t psms[] = {GS_PSM_CT32, GS_PSM_CT24, GS_PSM_CT16, GS_PSM_CT16S, GS_PSM_T8, GS_PSM_T4};
++            std::vector<uint64_t> hashes;
++            for (uint8_t psm : psms)
++            {
++                for (uint32_t wrap = 0; wrap < 4u; ++wrap)
++                {
++                    for (uint32_t variant = 0; variant < 7u; ++variant)
++                    {
++                        std::memset(vram.data(), 0, 8192u);
++                        const bool indexed = psm == GS_PSM_T8 || psm == GS_PSM_T4;
++                        const uint64_t tw = 5u, th = 4u; // 32x16 texture
++                        const uint64_t tbp = 64u + (next() % 4096u) * 32u;
++                        const uint64_t cbp = 64u + (next() % 4096u) * 32u;
++                        const uint64_t cpsm = (next() & 1u) ? GS_PSM_CT16 : GS_PSM_CT32;
++                        const uint64_t tfx = next() % 4u;
++                        const uint64_t tex0 = tbp | (1ull << 14) | (static_cast<uint64_t>(psm) << 20) | (tw << 26) |
++                                              (th << 30) | (1ull << 34) | (tfx << 35) |
++                                              (indexed ? ((cbp << 37) | (cpsm << 51) | ((next() % 16u) << 56)) : 0ull);
++                        // REGION modes: CLAMP uses [MINU, MAXU]; REPEAT uses MINU as mask and MAXU as fix.
++                        const uint64_t minU = (wrap == 3u) ? 0x0Fu : 3u, maxU = (wrap == 3u) ? 0x10u : 27u;
++                        const uint64_t minV = (wrap == 3u) ? 0x07u : 2u, maxV = (wrap == 3u) ? 0x08u : 13u;
++                        const uint64_t clamp = wrap | (static_cast<uint64_t>(wrap) << 2) | (minU << 4) | (maxU << 14) |
++                                               (minV << 24) | (maxV << 34);
++                        const bool blend = (next() & 1u) != 0u;
++                        gs.writeRegister(GS_REG_FRAME_1, (0ull << 0) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
++                        gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
++                        gs.writeRegister(GS_REG_SCISSOR_1, (0ull << 0) | (63ull << 16) | (0ull << 32) | (31ull << 48));
++                        gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
++                        gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
++                        gs.writeRegister(GS_REG_ALPHA_1, 0x44ull);
++                        gs.writeRegister(GS_REG_TEXA, (next() & 0xFFu) | ((next() & 1u) << 15) | ((next() & 0xFFu) << 32));
++                        gs.writeRegister(GS_REG_TEX0_1, tex0);
++                        gs.writeRegister(GS_REG_TEX1_1, (1ull << 5) | (1ull << 6));
++                        gs.writeRegister(GS_REG_CLAMP_1, clamp);
++                        gs.writeRegister(GS_REG_RGBAQ, (next() & 0xFFFFFFFFull) | (packFloat(1.0f) << 32));
++
++                        if (variant < 6u)
++                        {
++                            // Sprite of 16x16 pixels. span: 0 -> UV span == 16 texels (all fractions exactly zero),
++                            // 1 -> 17 texels (small non-zero fractions), 2 -> 8 texels (large fractions).
++                            const uint32_t span = variant % 3u;
++                            const bool edge = variant >= 3u;
++                            const uint64_t u0 = edge ? 27u : 2u, v0 = edge ? 11u : 1u;
++                            const uint64_t du = span == 0u ? 16u : (span == 1u ? 17u : 8u);
++                            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) |
++                                                              (blend ? (1ull << 6) : 0ull) | (1ull << 8));
++                            gs.writeRegister(GS_REG_UV, ((u0 << 4) << 0) | ((v0 << 4) << 16));
++                            gs.writeRegister(GS_REG_XYZ2, (8ull << 4) | ((8ull << 4) << 16));
++                            gs.writeRegister(GS_REG_UV, (((u0 + du) << 4) << 0) | (((v0 + du) << 4) << 16));
++                            gs.writeRegister(GS_REG_XYZ2, (24ull << 4) | ((24ull << 4) << 16));
++                        }
++                        else
++                        {
++                            // STQ triangle with arbitrary S/T (fractions mostly non-zero, some coordinates outside).
++                            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 4) |
++                                                              (blend ? (1ull << 6) : 0ull));
++                            const uint64_t xy[3] = {(2ull << 4) | ((1ull << 4) << 16), (40ull << 4) | ((3ull << 4) << 16),
++                                                    (5ull << 4) | ((30ull << 4) << 16)};
++                            for (int vtx = 0; vtx < 3; ++vtx)
++                            {
++                                const float s = static_cast<float>(static_cast<int>(next() % 1400u) - 200) / 1000.0f;
++                                const float tt = static_cast<float>(static_cast<int>(next() % 1400u) - 200) / 1000.0f;
++                                gs.writeRegister(GS_REG_ST, packFloat(s) | (packFloat(tt) << 32));
++                                gs.writeRegister(GS_REG_XYZ2, xy[vtx]);
++                            }
++                        }
++                        hashes.push_back(frameHash());
++                    }
++                }
++            }
++
++            if (kGoldenCount == 0u)
++            {
++                std::fprintf(stderr, "[GS:bilinear-golden] %zu\n", hashes.size());
++                for (size_t i = 0; i < hashes.size(); ++i)
++                    std::fprintf(stderr, "                0x%016llXull,%s", static_cast<unsigned long long>(hashes[i]),
++                                 (i % 3u) == 2u ? "\n" : "");
++                std::fprintf(stderr, "\n");
++                t.IsTrue(false, "golden hashes not recorded yet (printed above)");
++                return;
++            }
++            t.Equals(hashes.size(), kGoldenCount, "bilinear corpus size");
++            size_t mismatches = 0u;
++            for (size_t i = 0; i < hashes.size() && i < kGoldenCount; ++i)
++                if (hashes[i] != kGolden[i])
++                {
++                    if (mismatches == 0u)
++                        std::fprintf(stderr, "[GS:bilinear-golden] first mismatch at case %zu\n", i);
++                    ++mismatches;
++                }
++            t.Equals(mismatches, static_cast<size_t>(0u), "every bilinear corpus frame must match the reference hash");
++        });
++
++        tc.Run("GS bilinear sampling at texel centres equals point sampling", [](TestCase &t)
++        {
++            // A 16x16 sprite whose UV span is 16 texels samples every pixel at a texel centre: both bilinear
++            // weights are exactly zero, so the filtered result must be the texel itself (point sampling).
++            const uint8_t psms[] = {GS_PSM_CT32, GS_PSM_CT16, GS_PSM_T8, GS_PSM_T4};
++            for (uint8_t psm : psms)
++            {
++                for (uint32_t wrap = 0; wrap < 4u; ++wrap)
++                {
++                    auto render = [&](uint64_t tex1) -> std::vector<uint8_t>
++                    {
++                        std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++                        uint64_t rng = 0xD1B54A32D192ED03ull + psm * 7u + wrap;
++                        for (size_t i = 8192u; i < vram.size(); i += 8u)
++                        {
++                            rng ^= rng << 13;
++                            rng ^= rng >> 7;
++                            rng ^= rng << 17;
++                            std::memcpy(vram.data() + i, &rng, sizeof(rng));
++                        }
++                        GS gs;
++                        gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++                        const bool indexed = psm == GS_PSM_T8 || psm == GS_PSM_T4;
++                        const uint64_t tex0 = 640u | (1ull << 14) | (static_cast<uint64_t>(psm) << 20) | (5ull << 26) |
++                                              (4ull << 30) | (1ull << 34) | (1ull << 35) |
++                                              (indexed ? ((2048ull << 37) | (static_cast<uint64_t>(GS_PSM_CT32) << 51)) : 0ull);
++                        const uint64_t clamp = wrap | (static_cast<uint64_t>(wrap) << 2) | ((wrap == 3u ? 0x0Full : 3ull) << 4) |
++                                               ((wrap == 3u ? 0x10ull : 27ull) << 14) | ((wrap == 3u ? 0x07ull : 2ull) << 24) |
++                                               ((wrap == 3u ? 0x08ull : 13ull) << 34);
++                        gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
++                        gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
++                        gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (31ull << 48));
++                        gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
++                        gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
++                        gs.writeRegister(GS_REG_TEX0_1, tex0);
++                        gs.writeRegister(GS_REG_TEX1_1, tex1);
++                        gs.writeRegister(GS_REG_CLAMP_1, clamp);
++                        gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
++                        gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
++                        gs.writeRegister(GS_REG_UV, ((25ull << 4) << 0) | ((9ull << 4) << 16));
++                        gs.writeRegister(GS_REG_XYZ2, (8ull << 4) | ((8ull << 4) << 16));
++                        gs.writeRegister(GS_REG_UV, ((41ull << 4) << 0) | ((25ull << 4) << 16));
++                        gs.writeRegister(GS_REG_XYZ2, (24ull << 4) | ((24ull << 4) << 16));
++                        return std::vector<uint8_t>(vram.begin(), vram.begin() + 8192);
++                    };
++                    const std::vector<uint8_t> point = render(0ull);
++                    const std::vector<uint8_t> linear = render((1ull << 5) | (1ull << 6));
++                    t.IsTrue(point == linear, "bilinear at texel centres must equal point sampling");
++                    t.IsTrue(std::any_of(point.begin(), point.end(), [](uint8_t b) { return b != 0u; }),
++                             "the sprite must draw something");
++                }
++            }
++        });
++
+         tc.Run("GS CLAMP modes transform texture coordinates before sampling", [](TestCase &t)
+         {
+             auto renderConstantUv = [](uint64_t clampReg,

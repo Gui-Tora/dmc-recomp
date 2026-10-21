@@ -611,3 +611,19 @@ arriba). Los diecinueve patches actualmente activos:
       comentario «field mode»; pasa a `SMODE2` = 3 y ahora pasa.
     - Validación: 458 tests, 24 fallos preexistentes (25 antes; ninguno nuevo).
       Documentación: `analysis/notes/VISUAL_001_LETTERBOX_BAND.md`.
+
+28. `PERF_001_gs_bilinear_zero_fraction.patch` (convención B). `gs/gs_cpu_backend.cpp`, `SampleTexture`: cuando
+    las dos fracciones del filtrado bilineal son exactamente 0, devuelve el texel `c00` sin leer los otros tres.
+    - Equivalencia exacta: `lerpChannel(c00, …, 0, 0)` calcula `c00 + d·0 = c00` en cada canal (`c` en 0..255,
+      `d` finito); `lround` y `clampU8` lo devuelven igual. `samplePoint` solo lee (wrap, VRAM, CLUT, TEXA).
+      Las fracciones NaN o infinitas siguen el camino general. No cambian la fórmula, `lroundf` ni la tabla de
+      lectores.
+    - Tests:
+      - corpus diferencial de 168 casos (6 PSM, CLUT CT32/CT16, 4 modos de clamp, fracciones cero, casi cero
+        y grandes, bordes, TEXA, TFX, mezcla, triángulos STQ). Sus hashes de VRAM se registraron con el runtime
+        anterior y deben coincidir exactamente;
+      - bilineal en el centro del texel igual al muestreo puntual;
+      - una mutación del atajo hace fallar ambos.
+    - Validación: 460 tests, los mismos 24 fallos preexistentes.
+    - Oficina de DMC (VSync 16500–17000, `native`, sin sondas): 6,42 → 6,76 VSync/s (−7,9 ms por VSync).
+      Documentación: `analysis/notes/PERF_001_BASELINE.md`, sección 10.

@@ -111,6 +111,10 @@
     {
       "path": "patches/VISUAL_001_pcrtc_circuit_presentation.patch",
       "sha256": "87389d52fecaa71489712bae5229d4b5b86a560c3da3ada5c51205b61ae01aae"
+    },
+    {
+      "path": "patches/PERF_001_gs_bilinear_zero_fraction.patch",
+      "sha256": "6bbc8a12f93b9f8fe9352b701fac627e945ca614f1651fd4ad8617b5be1a41c3"
     }
   ],
   "patch_identity": {
@@ -119,5 +123,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "e58f58b93897d28a8fa5f47f9f8c2e73601f5b23"
+  "patched_commit": "e3d4250d793372be74a2bcd65363810d577aa00d"
 }
