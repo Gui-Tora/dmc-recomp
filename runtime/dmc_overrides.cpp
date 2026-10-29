@@ -35,7 +35,8 @@ namespace
         void hit(R5900Context *ctx)
         {
             ++callCount;
-            if (callCount == 1 || callCount % 50 == 0)
+            // Calls 1, 2, 4, 8, ...: logging every 50th call wrote ~10^6 lines (149 MB) in one castle run (katVu0Clip_ld).
+            if ((callCount & (callCount - 1u)) == 0u)
             {
                 std::fprintf(stderr,
                     "[dmc-stub-instrumentation] %s@0x%08X call #%u a0=0x%08X a1=0x%08X a2=0x%08X a3=0x%08X ra=0x%08X\n",
