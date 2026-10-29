@@ -1,0 +1,387 @@
+diff --git a/ps2xRecomp/src/lib/code_generator.cpp b/ps2xRecomp/src/lib/code_generator.cpp
+index c99a9d8f9d2b37a1c55df1728783ae6ca76d72da..a039f138788ea6b19313b074d24002a92299e21b 100644
+--- a/ps2xRecomp/src/lib/code_generator.cpp
++++ b/ps2xRecomp/src/lib/code_generator.cpp
+@@ -271,9 +271,47 @@ namespace ps2recomp
+         return MmiTranslator(*this).translate(inst);
+     }
+ 
++    namespace
++    {
++        // COP2 macro-mode FMAC instructions update the VU0 MAC flag register (read back by CFC2 $vi17).
++        // Special1 (fmt CO, function < 0x3C) writes vf[fd]; Special2 (function >= 0x3C) writes ACC. Both tables use
++        // the same codes for the MAC-writing group: ADD/SUB/MADD/MSUB bc (0x00-0x0F), MUL bc/q (0x18-0x1C), MULi
++        // (0x1E), q/i forms (0x20-0x27), ADD/MADD/MUL/SUB/MSUB (0x28-0x2A, 0x2C, 0x2D) and OPMSUB/OPMULA (0x2E).
++        // MAX/MINI, ABS, MOVE/MR32, FTOI/ITOF, CLIP, DIV/SQRT/RSQRT, NOP and the integer ops leave MAC unchanged
++        // (PCSX2 VUops.cpp: only applyBinaryMACOp/applyTernaryMACOp and _vuOPMULA/_vuOPMSUB call VU_MAC*_UPDATE).
++        bool isVu0MacWritingCode(uint32_t code)
++        {
++            return code <= 0x0Fu || (code >= 0x18u && code <= 0x1Cu) || code == 0x1Eu ||
++                   (code >= 0x20u && code <= 0x2Au) || code == 0x2Cu || code == 0x2Du || code == 0x2Eu;
++        }
++
++        // Appends the MAC update after the translated FMAC statement, computed from the destination as written
++        // (before CodeGenerator::translateInstruction discards a write to the hardwired vf0, so `op.w $vf0, ...`
++        // still sets the flags of its result, as PCSX2 does through RDzero).
++        std::string appendVu0MacUpdate(const Instruction &inst, std::string code)
++        {
++            if (inst.opcode != OPCODE_COP2 || inst.rs < COP2_CO)
++                return code;
++            const uint32_t special1 = inst.function & 0x3Fu;
++            const bool special2 = special1 >= 0x3Cu;
++            const uint32_t fn = special2 ? ((((inst.raw >> 6) & 0x1Fu) << 2) | (inst.raw & 0x3u)) : special1;
++            if (!isVu0MacWritingCode(fn))
++                return code;
++            const std::string target = special2 ? "ctx->vu0_acc" : fmt::format("ctx->vu0_vf[{}]", inst.sa);
++            if (code.find(target + " =") == std::string::npos)
++                return code; // the instruction was not translated as a write of its destination; leave MAC alone
++            const bool outerProduct = fn == 0x2Eu; // OPMULA / OPMSUB: x, y, z written, w flags preserved
++            const uint32_t lanes = outerProduct ? 0xEu : (inst.vectorInfo.vectorField & 0xFu);
++            const uint32_t keep = outerProduct ? 0x1111u : 0u;
++            code += fmt::format(" ctx->vu0_mac_flags = ps2Vu0MacUpdate(ctx->vu0_mac_flags, {}, 0x{:X}u, 0x{:X}u);",
++                                target, lanes, keep);
++            return code;
++        }
++    }
++
+     std::string CodeGenerator::translateVUInstruction(const Instruction &inst)
+     {
+-        return VuTranslator(*this).translate(inst);
++        return appendVu0MacUpdate(inst, VuTranslator(*this).translate(inst));
+     }
+ 
+     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(
+diff --git a/ps2xRecomp/src/lib/function_emitter.cpp b/ps2xRecomp/src/lib/function_emitter.cpp
+index 328c0e01a7876b7d7feb568fbb226af48d3ecd6b..a7801af0aef5a5f028af187496b1d4afb24c6440 100644
+--- a/ps2xRecomp/src/lib/function_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_emitter.cpp
+@@ -234,6 +234,16 @@ namespace ps2recomp
+         }
+ 
+         ss << "}\n";
+-        return ss.str();
++        std::string out = ss.str();
++        // VU0 MAC updates (CodeGenerator::translateVUInstruction) call into ps2_vu0_mac.h. It is included only by the
++        // files that use it, so generated files without COP2 FMAC instructions keep their exact previous contents.
++        if (useHeaders && out.find("ps2Vu0MacUpdate(") != std::string::npos)
++        {
++            const std::string anchor = "#include \"ps2_stubs.h\"\n";
++            const size_t at = out.find(anchor);
++            if (at != std::string::npos)
++                out.insert(at + anchor.size(), "#include \"ps2_vu0_mac.h\"\n");
++        }
++        return out;
+     }
+ }
+diff --git a/ps2xRecomp/src/lib/ps2_recompiler.cpp b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+index ab779a4f5159411a0fa3ea8cf38e38b5ac579e35..3d7d0b4f345a30bc2444f4005c3cf0f226221c4a 100644
+--- a/ps2xRecomp/src/lib/ps2_recompiler.cpp
++++ b/ps2xRecomp/src/lib/ps2_recompiler.cpp
+@@ -108,6 +108,7 @@ namespace ps2recomp
+             output << "#include \"ps2_recompiled_stubs.h\"\n";
+             output << "#include \"ps2_syscalls.h\"\n";
+             output << "#include \"ps2_stubs.h\"\n";
++            output << "#include \"ps2_vu0_mac.h\"\n";
+             output << "#ifdef _DEBUG\n";
+             output << "#include \"ps2_log.h\"\n";
+             output << "#endif\n";
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index bfbac4abc890c262d0065e7a82f585c6ee19d823..07dbe32471b644d781dabaf926ad78b5ab3968f9 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -1321,6 +1321,83 @@ void register_code_generator_tests()
+                      "FTOI saturates to 0x7FFFFFFF or 0x80000000 by sign");
+         });
+ 
++        tc.Run("VU0 FMAC macro instructions update the MAC flags; non-FMAC ones do not", [](TestCase &t) {
++            // GAMEPLAY_003: real words from atari_check_4 (SLES_503.58 0x15DCA0). CFC2 $vi17 reads ctx->vu0_mac_flags.
++            R5900Decoder decoder;
++            CodeGenerator gen({}, {});
++            auto tr = [&](uint32_t word) { return gen.translateInstruction(decoder.decodeInstruction(0x15DD00u, word)); };
++            const std::string vmulx = tr(0x4B128A2Au);   // vmul.x      $vf8, $vf17, $vf18
++            const std::string vsubqx = tr(0x4B000264u);  // vsubq.x     $vf9, $vf0, $Q
++            const std::string vsubxw = tr(0x4A290004u);  // vsubx.w     $vf0, $vf0, $vf9x
++            const std::string opmula = tr(0x4BD0A2FEu);  // vopmula.xyz $ACC, $vf20, $vf16
++            const std::string opmsub = tr(0x4BD4862Eu);  // vopmsub.xyz $vf24, $vf16, $vf20
++            const std::string vaddzx = tr(0x4B118C42u);  // vaddz.x     $vf17, $vf17, $vf17z
++
++            t.IsTrue(vmulx.find("ctx->vu0_mac_flags = ps2Vu0MacUpdate(ctx->vu0_mac_flags, ctx->vu0_vf[8], 0x8u, 0x0u);") != std::string::npos,
++                     "vmul.x updates MAC from vf8, x only, other fields cleared");
++            t.IsTrue(vsubqx.find("ps2Vu0MacUpdate(ctx->vu0_mac_flags, ctx->vu0_vf[9], 0x8u, 0x0u)") != std::string::npos,
++                     "vsubq.x updates MAC from vf9.x");
++            t.IsTrue(vaddzx.find("ps2Vu0MacUpdate(ctx->vu0_mac_flags, ctx->vu0_vf[17], 0x8u, 0x0u)") != std::string::npos,
++                     "vaddz.x updates MAC from vf17.x");
++            t.IsTrue(opmula.find("ps2Vu0MacUpdate(ctx->vu0_mac_flags, ctx->vu0_acc, 0xEu, 0x1111u)") != std::string::npos,
++                     "vopmula updates x/y/z from ACC and keeps the w flags");
++            t.IsTrue(opmsub.find("ps2Vu0MacUpdate(ctx->vu0_mac_flags, ctx->vu0_vf[24], 0xEu, 0x1111u)") != std::string::npos,
++                     "vopmsub updates x/y/z from vf24 and keeps the w flags");
++
++            const size_t mac0 = vsubxw.find("ps2Vu0MacUpdate(ctx->vu0_mac_flags, ctx->vu0_vf[0], 0x1u, 0x0u)");
++            const size_t hard = vsubxw.find("ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f); /* vf0 is hardwired */");
++            t.IsTrue(mac0 != std::string::npos, "vsubx.w with fd = vf0 still updates the w flags from its result");
++            t.IsTrue(hard != std::string::npos && mac0 < hard,
++                     "the MAC update reads the result before the vf0 write is discarded");
++
++            for (uint32_t word : {0x4A138BBCu /* vdiv */, 0x4A0002FFu /* vnop */, 0x4BDCC1FFu /* vclipw */,
++                                  0x4BCA513Cu /* vitof0 */, 0x4BEA497Du /* vftoi4 */, 0x48488800u /* cfc2 $vi17 */})
++            {
++                const std::string out = tr(word);
++                t.IsTrue(out.find("vu0_mac_flags =") == std::string::npos,
++                         "DIV/NOP/CLIP/ITOF/FTOI/CFC2 must not write the MAC flags");
++            }
++        });
++
++        tc.Run("VU0 MAC updates cover exactly the FMAC opcodes of both macro tables", [](TestCase &t) {
++            // Special1 (fd destination) and Special2 (ACC destination) share the codes of the MAC-writing group.
++            R5900Decoder decoder;
++            CodeGenerator gen({}, {});
++            auto isMac = [](uint32_t c) {
++                return c <= 0x0Fu || (c >= 0x18u && c <= 0x1Cu) || c == 0x1Eu || (c >= 0x20u && c <= 0x2Au) ||
++                       c == 0x2Cu || c == 0x2Du || c == 0x2Eu;
++            };
++            size_t wrong = 0;
++            for (uint32_t code = 0; code < 0x30u; ++code)
++            {
++                // Special1: fmt CO with dest mask .xz (0xA), ft = 5, fs = 6, fd = 7, function = code
++                const uint32_t s1 = 0x4A000000u | (0xAu << 21) | (5u << 16) | (6u << 11) | (7u << 6) | code;
++                const std::string out1 = gen.translateInstruction(decoder.decodeInstruction(0x2000u, s1));
++                const bool mac1 = out1.find("ps2Vu0MacUpdate(") != std::string::npos;
++                const bool want1 = isMac(code);
++                const bool lanes1 = code == 0x2Eu ? out1.find("ctx->vu0_vf[7], 0xEu, 0x1111u") != std::string::npos
++                                                  : out1.find("ctx->vu0_vf[7], 0xAu, 0x0u") != std::string::npos;
++                if (mac1 != want1 || (want1 && !lanes1))
++                {
++                    ++wrong;
++                    std::fprintf(stderr, "[MAC] special1 code 0x%02X mac=%d want=%d\n", code, mac1, want1);
++                }
++                // Special2: function = 0x3C | (code & 3), bits 10-6 = code >> 2
++                const uint32_t s2 = 0x4A000000u | (0xAu << 21) | (5u << 16) | (6u << 11) | ((code >> 2) << 6) |
++                                    0x3Cu | (code & 3u);
++                const std::string out2 = gen.translateInstruction(decoder.decodeInstruction(0x2004u, s2));
++                const bool mac2 = out2.find("ps2Vu0MacUpdate(") != std::string::npos;
++                const bool lanes2 = code == 0x2Eu ? out2.find("ctx->vu0_acc, 0xEu, 0x1111u") != std::string::npos
++                                                  : out2.find("ctx->vu0_acc, 0xAu, 0x0u") != std::string::npos;
++                if (mac2 != want1 || (want1 && !lanes2))
++                {
++                    ++wrong;
++                    std::fprintf(stderr, "[MAC] special2 code 0x%02X mac=%d want=%d\n", code, mac2, want1);
++                }
++            }
++            t.Equals(wrong, static_cast<size_t>(0u), "MAC updates exactly on the FMAC opcodes, with the right lanes");
++        });
++
+         tc.Run("VU0 S2 vector ops use rd as source and rt as destination", [](TestCase &t) {
+             Instruction inst{};
+             inst.opcode = OPCODE_COP2;
+diff --git a/ps2xTest/src/ps2_vu_tests.cpp b/ps2xTest/src/ps2_vu_tests.cpp
+index b96befe6566f5187c30246e4b431c14b07433634..ee7f4de1b6f61bdd77be8312c0c2a367b3fa80a5 100644
+--- a/ps2xTest/src/ps2_vu_tests.cpp
++++ b/ps2xTest/src/ps2_vu_tests.cpp
+@@ -3,6 +3,7 @@
+ #include "ps2_runtime_macros.h"
+ #include "runtime/ps2_memory.h"
+ #include "Kernel/Stubs/VU.h"
++#include "ps2_vu0_mac.h"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -77,6 +78,60 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Literal port of PCSX2 VUflags.cpp VU_MAC_UPDATE / VU_MACx_CLEAR and VUops.cpp applyBinaryMACOp,
++    // _vuOPMULA/_vuOPMSUB (flags only), used as the oracle for ps2_vu0_mac.h.
++    void pcsx2MacUpdate(uint32_t &macflag, int shift, uint32_t v)
++    {
++        float f;
++        std::memcpy(&f, &v, sizeof(f));
++        const int exp = (v >> 23) & 0xff;
++        const uint32_t s = v & 0x80000000u;
++        if (s)
++            macflag |= 0x0010u << shift;
++        else
++            macflag &= ~(0x0010u << shift);
++        if (f == 0)
++        {
++            macflag = (macflag & ~(0x1100u << shift)) | (0x0001u << shift);
++            return;
++        }
++        switch (exp)
++        {
++        case 0:
++            macflag = (macflag & ~(0x1000u << shift)) | (0x0101u << shift);
++            return;
++        case 255:
++            macflag = (macflag & ~(0x0101u << shift)) | (0x1000u << shift);
++            return;
++        default:
++            macflag = (macflag & ~(0x1101u << shift));
++            return;
++        }
++    }
++    uint32_t pcsx2ApplyMac(uint32_t macflag, const uint32_t v[4], uint32_t lanes, bool outerProduct)
++    {
++        for (int i = 0; i < 4; ++i)
++        {
++            const int shift = 3 - i;
++            const bool written = outerProduct ? (i < 3) : ((lanes & (0x8u >> i)) != 0u);
++            if (written)
++                pcsx2MacUpdate(macflag, shift, v[i]);
++            else if (!outerProduct) // _vuOPMULA/_vuOPMSUB never touch the w bits
++                macflag &= ~(0x1111u << shift);
++        }
++        return macflag & 0xFFFFu;
++    }
++    __m128 bitsToVec(const uint32_t v[4])
++    {
++        __m128 r;
++        std::memcpy(&r, v, sizeof(r));
++        return r;
++    }
++}
++
++
+ void register_ps2_vu_tests()
+ {
+     MiniTest::Case("PS2VU0Math", [](TestCase &tc)
+@@ -1042,4 +1097,89 @@ void register_ps2_vu_tests()
+             t.IsTrue(nearlyEqual(out[0], 0.0f), "DropShadowMatrix point mode should subtract d before scaling by k");
+         });
+     });
++    MiniTest::Case("PS2VU0MacFlags", [](TestCase &tc)
++    {
++        tc.Run("MAC update matches the PCSX2 interpreter for every lane mask and special value", [](TestCase &t)
++        {
++            // GAMEPLAY_003: COP2 FMAC instructions must set the MAC flags read by CFC2 $vi17 (atari_check_4).
++            const uint32_t values[] = {0x00000000u, 0x80000000u, 0x3F800000u, 0xBF800000u, 0x3F000000u, 0xC0200000u,
++                                       0x7F7FFFFFu, 0xFF7FFFFFu, 0x00800000u, 0x80800000u, 0x00000001u, 0x807FFFFFu,
++                                       0x7F800000u, 0xFF800000u, 0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0x48742400u};
++            const uint32_t olds[] = {0x0000u, 0xFFFFu, 0x1234u, 0xA5A5u, 0x0080u, 0x1111u};
++            const size_t n = sizeof(values) / sizeof(values[0]);
++            uint64_t rng = 0x9E3779B97F4A7C15ull;
++            size_t checked = 0, mismatches = 0;
++            for (uint32_t lanes = 0; lanes < 16u; ++lanes)
++                for (uint32_t old : olds)
++                    for (int k = 0; k < 64; ++k)
++                    {
++                        uint32_t v[4];
++                        for (uint32_t &x : v)
++                        {
++                            rng ^= rng << 13;
++                            rng ^= rng >> 7;
++                            rng ^= rng << 17;
++                            x = values[rng % n];
++                        }
++                        ++checked;
++                        if (ps2Vu0MacUpdate(old, bitsToVec(v), lanes, 0u) != pcsx2ApplyMac(old, v, lanes, false))
++                            ++mismatches;
++                        ++checked;
++                        if (ps2Vu0MacUpdate(old, bitsToVec(v), 0xEu, 0x1111u) != pcsx2ApplyMac(old, v, 0xEu, true))
++                            ++mismatches;
++                    }
++            t.Equals(checked, static_cast<size_t>(16u * 6u * 64u * 2u), "corpus size");
++            t.Equals(mismatches, static_cast<size_t>(0u), "every MAC value must match the PCSX2 oracle");
++        });
++
++        tc.Run("MAC field bits: sign, zero, underflow and overflow per component", [](TestCase &t)
++        {
++            t.Equals(ps2Vu0MacFieldBits(0x3F800000u), 0x0000u, "positive normal: no flags");
++            t.Equals(ps2Vu0MacFieldBits(0xBF800000u), 0x0010u, "negative normal: S");
++            t.Equals(ps2Vu0MacFieldBits(0x00000000u), 0x0001u, "+0: Z");
++            t.Equals(ps2Vu0MacFieldBits(0x80000000u), 0x0011u, "-0: Z and S");
++            t.Equals(ps2Vu0MacFieldBits(0x00000001u), 0x0101u, "denormal: Z and U");
++            t.Equals(ps2Vu0MacFieldBits(0x807FFFFFu), 0x0111u, "negative denormal: Z, U and S");
++            t.Equals(ps2Vu0MacFieldBits(0x7F800000u), 0x1000u, "+Inf: O");
++            t.Equals(ps2Vu0MacFieldBits(0xFFC00000u), 0x1010u, "negative NaN: O and S");
++            const uint32_t v[4] = {0xBF800000u, 0x00000000u, 0x00000001u, 0x7F800000u}; // x<0, y=0, z denormal, w Inf
++            t.Equals(ps2Vu0MacUpdate(0u, bitsToVec(v), 0xFu, 0u), 0x1286u,
++                     "x S (0x80), y Z (0x04), z Z|U (0x202), w O (0x1000)");
++            t.Equals(ps2Vu0MacUpdate(0xFFFFu, bitsToVec(v), 0x2u, 0u), 0x0202u, "unwritten fields are cleared");
++            t.Equals(ps2Vu0MacUpdate(0xFFFFu, bitsToVec(v), 0xEu, 0x1111u), 0x1286u & 0xEEEEu | 0x1111u,
++                     "OPMULA/OPMSUB keep the w bits");
++        });
++
++        tc.Run("atari_check_4 floor ray: vmul.x, vsubq.x and vsubx.w produce the flags its branches test", [](TestCase &t)
++        {
++            // Get_height_pl floor ray on triangle 0x010A17E0 (GAMEPLAY_003 section 7): d_start = 500, d_end = -500,
++            // dot(dir, n) = -1000. Statements as the translator emits them: operation, blend, MAC update.
++            const __m128 vf17 = _mm_set_ps(0.0f, 0.0f, 0.0f, 500.0f);
++            const __m128 vf18 = _mm_set_ps(0.0f, 0.0f, 0.0f, -500.0f);
++            __m128 vf8 = _mm_setzero_ps();
++            uint32_t mac = 0u;
++            vf8 = PS2_VBLEND(vf8, PS2_VMUL(vf17, vf18), _mm_castsi128_ps(_mm_set_epi32(0, 0, 0, -1)));
++            mac = ps2Vu0MacUpdate(mac, vf8, 0x8u, 0u); // vmul.x vf8, vf17, vf18 (0x15DDB4)
++            t.Equals(mac, 0x0080u, "d_start * d_end < 0 -> MAC 0x0080 (Sx)");
++            t.IsTrue((mac & 0x88u) != 0u, "gate 1 (andi 0x88) passes");
++            const float q = 500.0f / -1000.0f; // vdiv: Q (no MAC update emitted for vdiv/vnop)
++            __m128 vf9 = _mm_setzero_ps();
++            vf9 = PS2_VBLEND(vf9, PS2_VSUB(_mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f), _mm_set1_ps(q)),
++                             _mm_castsi128_ps(_mm_set_epi32(0, 0, 0, -1)));
++            const uint32_t t0 = mac = ps2Vu0MacUpdate(mac, vf9, 0x8u, 0u); // vsubq.x vf9, vf0, Q (0x15DE0C): t = 0.5
++            t.Equals(t0, 0x0000u, "t = 0.5 > 0: no x flags, y/z/w cleared");
++            const __m128 vf0 = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++            const __m128 res = PS2_VSUB(vf0, _mm_shuffle_ps(vf9, vf9, _MM_SHUFFLE(0, 0, 0, 0)));
++            const __m128 written = PS2_VBLEND(vf0, res, _mm_castsi128_ps(_mm_set_epi32(-1, 0, 0, 0)));
++            const uint32_t t1 = mac = ps2Vu0MacUpdate(mac, written, 0x1u, 0u); // vsubx.w vf0, vf0, vf9x (0x15DE28)
++            t.Equals(t1, 0x0000u, "w = 1 - t = 0.5: no flags, x bits cleared");
++            t.IsTrue(((t0 | t1) & 0x80u) == 0u, "final gate ((t0|t1) & 0x80) passes for t in (0, 1)");
++            t.Equals(ps2Vu0MacUpdate(0u, _mm_set_ps(0, 0, 0, 500.0f * 2500.0f), 0x8u, 0u), 0x0000u,
++                     "both endpoints on the same side: gate 1 rejects");
++            t.Equals(ps2Vu0MacUpdate(0u, _mm_set_ps(0, 0, 0, 0.0f), 0x8u, 0u), 0x0008u,
++                     "an endpoint on the plane: Zx, gate 1 passes");
++            t.IsTrue((ps2Vu0MacUpdate(0u, _mm_set_ps(0, 0, 0, -0.25f), 0x8u, 0u) & 0x80u) != 0u,
++                     "t < 0: Sx, the final gate rejects");
++        });
++    });
+ }
+diff --git a/ps2xRuntime/include/ps2_vu0_mac.h b/ps2xRuntime/include/ps2_vu0_mac.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0797fb5726a924b06755b3dfa06a887f02e074b4
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_vu0_mac.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++// VU0 MAC flag register for COP2 macro-mode FMAC instructions (included by generated code that uses it).
++//
++// Layout (PCSX2 VUflags.cpp, VU_MAC_UPDATE; shift x=3, y=2, z=1, w=0):
++//   Z (zero)      0x0001 << shift     S (sign)     0x0010 << shift
++//   U (underflow) 0x0100 << shift     O (overflow) 0x1000 << shift
++// Per written field: S = sign bit of the result; result == +/-0 -> Z; exponent 0 with a non-zero mantissa -> Z|U;
++// exponent 255 (Inf/NaN on the host) -> O; otherwise only S. Fields the instruction does not write are cleared
++// (applyBinaryMACOp/applyTernaryMACOp: VU_MACx_CLEAR...), except OPMULA/OPMSUB, which write x/y/z and leave the w
++// bits untouched. Only the flags are modelled here; result values are not altered.
++
++#include <cstdint>
++#include <cstring>
++#include <xmmintrin.h>
++
++inline uint32_t ps2Vu0MacFieldBits(uint32_t bits)
++{
++    const uint32_t exponent = bits & 0x7F800000u;
++    uint32_t flags = (bits & 0x80000000u) ? 0x0010u : 0u;
++    if ((bits & 0x7FFFFFFFu) == 0u)
++        flags |= 0x0001u;
++    else if (exponent == 0u)
++        flags |= 0x0101u;
++    else if (exponent == 0x7F800000u)
++        flags |= 0x1000u;
++    return flags;
++}
++
++// lanes: VU field mask (x = 0x8, y = 0x4, z = 0x2, w = 0x1) of the fields written by the instruction.
++// keep:  MAC bits carried over from the previous value (0 for every FMAC except OPMULA/OPMSUB: 0x1111, the w bits).
++inline uint32_t ps2Vu0MacUpdate(uint32_t oldMac, __m128 result, uint32_t lanes, uint32_t keep)
++{
++    uint32_t v[4];
++    std::memcpy(v, &result, sizeof(v));
++    uint32_t mac = oldMac & keep;
++    for (uint32_t i = 0; i < 4u; ++i)
++    {
++        if (lanes & (0x8u >> i))
++            mac |= ps2Vu0MacFieldBits(v[i]) << (3u - i);
++    }
++    return mac & 0xFFFFu;
++}

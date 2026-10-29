@@ -1,0 +1,332 @@
+diff --git a/ps2xIOP/src/modules/cdmodule.cpp b/ps2xIOP/src/modules/cdmodule.cpp
+index 4c58a4b58021bc9ae2d69c70a13cbee5c55f28f5..9a1f507a223f922483344a58a1e0af55f29c9d5e 100644
+--- a/ps2xIOP/src/modules/cdmodule.cpp
++++ b/ps2xIOP/src/modules/cdmodule.cpp
+@@ -78,11 +78,15 @@ namespace ps2x::iop::detail
+             }
+ 
+             // DEVSTATE_003C checkpoint codec. MovieStreamState is a plain
+-            // POD; Main Menu v1 requires it inactive (no open movie resource
+-            // across the checkpoint boundary -- see DEVSTATE_002 §3.9/§12).
++            // POD and is serialized whole (active/resourceId/lba/totalSize/
++            // bytesConsumed); no host handle outlives an RPC. The safe point
++            // requires the stream to be drained (alive=0, the same predicate
++            // fno=0xD reports), as designed in DEVSTATE_002 §3. The game does
++            // not send fno=0xC after a movie ends naturally, so a drained
++            // session stays active=1 until the next fno=9; it is restored as is.
+             [[nodiscard]] bool validateCheckpointSafe(std::string &reason) const override
+             {
+-                if (m_movie.active)
++                if (m_movie.active && m_movie.bytesConsumed < m_movie.totalSize)
+                 {
+                     reason = "movie stream active";
+                     return false;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 026beb426f7481621d7515697f1370dfd7ff0223..f9508f8958bbe0bb3b9bce71a6dec15157c50bab 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <limits>
+@@ -930,9 +931,76 @@ EeScheduler::CheckpointRequestStatus EeScheduler::checkpointRequestStatus() cons
+     return m_checkpointRequestStatus;
+ }
+ 
++namespace
++{
++    // GAMEPLAY_002: PS2X_CHECKPOINT_DEFER_VSYNCS=<N> keeps a save request
++    // pending while the safe-point validation refuses it, and retries it at
++    // every later boundary for up to N VSync ticks. The validation only reads
++    // state, so a pending request does not change what the guest executes.
++    // Unset or 0: the original single attempt. Executor thread only.
++    // Logging only: the first refusal is printed, then at most one line every
++    // kCheckpointDeferLogVsyncs ticks with the number of refusals not printed.
++    constexpr uint64_t kCheckpointDeferLogVsyncs = 60u;
++    struct CheckpointDeferState
++    {
++        bool waiting = false;
++        uint64_t firstTick = 0u;
++        uint64_t attempts = 0u;
++        uint64_t lastLogTick = 0u;
++        uint64_t skippedLogs = 0u;
++    };
++    CheckpointDeferState g_checkpointDefer;
++
++    uint64_t checkpointDeferVsyncs()
++    {
++        static const uint64_t value = []() -> uint64_t {
++            const char *env = std::getenv("PS2X_CHECKPOINT_DEFER_VSYNCS");
++            return (env && *env) ? std::strtoull(env, nullptr, 0) : 0u;
++        }();
++        return value;
++    }
++}
++
+ void EeScheduler::handleCheckpointRequestAtBoundary()
+ {
+     assertExecutor();
++    if (const uint64_t deferVsyncs = checkpointDeferVsyncs(); deferVsyncs != 0u)
++    {
++        CheckpointDeferState &d = g_checkpointDefer;
++        if (!d.waiting)
++        {
++            d = CheckpointDeferState{};
++            d.waiting = true;
++            d.firstTick = m_vsyncTick;
++        }
++        ++d.attempts;
++        const ps2x::checkpoint::CheckpointSafetyResult safety =
++            ps2x::checkpoint::CheckpointManager::validateSafePoint(m_runtime);
++        if (!safety.ok && m_vsyncTick - d.firstTick < deferVsyncs)
++        {
++            if (d.attempts == 1u || m_vsyncTick - d.lastLogTick >= kCheckpointDeferLogVsyncs)
++            {
++                std::fprintf(stderr, "[CKPT:DEFER] waiting tick=%llu attempts=%llu skipped=%llu reason=%s\n",
++                             static_cast<unsigned long long>(m_vsyncTick),
++                             static_cast<unsigned long long>(d.attempts),
++                             static_cast<unsigned long long>(d.skippedLogs), safety.reason.c_str());
++                d.lastLogTick = m_vsyncTick;
++                d.skippedLogs = 0u;
++            }
++            else
++            {
++                ++d.skippedLogs;
++            }
++            return;
++        }
++        std::fprintf(stderr, "[CKPT:DEFER] %s tick=%llu requestedTick=%llu attempts=%llu skipped=%llu\n",
++                     safety.ok ? "safe" : "expired", static_cast<unsigned long long>(m_vsyncTick),
++                     static_cast<unsigned long long>(d.firstTick),
++                     static_cast<unsigned long long>(d.attempts),
++                     static_cast<unsigned long long>(d.skippedLogs));
++        d.waiting = false;
++    }
++
+     std::filesystem::path path;
+     ps2x::checkpoint::CheckpointIdentity identity;
+     {
+@@ -1002,6 +1070,27 @@ void EeScheduler::run()
+         // MAIN_MENU_V1 boundary (after processPendingEvents(), before guest
+         // selection/dispatch); the request may come from any host thread but
+         // validation+serialization run exclusively here on the executor.
++        // GAMEPLAY_002: PS2X_CHECKPOINT_AT_VSYNC=<tick> + PS2X_CHECKPOINT_AT_VSYNC_PATH=<file> queue one
++        // save request from the executor once the VSync tick reaches <tick>, so two runs can be saved
++        // at the same emulated tick and compared. An existing file is never overwritten.
++        {
++            static const char *atTickEnv = std::getenv("PS2X_CHECKPOINT_AT_VSYNC");
++            static const char *atPathEnv = std::getenv("PS2X_CHECKPOINT_AT_VSYNC_PATH");
++            static bool atTickDone = !(atTickEnv && *atTickEnv && atPathEnv && *atPathEnv);
++            if (!atTickDone && m_vsyncTick >= std::strtoull(atTickEnv, nullptr, 0))
++            {
++                atTickDone = true;
++                std::error_code ec;
++                if (std::filesystem::exists(atPathEnv, ec))
++                    std::fprintf(stderr, "[CKPT:REQUEST] at-vsync refused: %s exists\n", atPathEnv);
++                else if (!ps2x::checkpoint::hasProcessIdentity() ||
++                         !requestCheckpoint(atPathEnv, ps2x::checkpoint::processIdentity()))
++                    std::fprintf(stderr, "[CKPT:REQUEST] at-vsync request not queued\n");
++                else
++                    std::fprintf(stderr, "[CKPT:REQUEST] at-vsync queued tick=%llu path=%s\n",
++                                 static_cast<unsigned long long>(m_vsyncTick), atPathEnv);
++            }
++        }
+         if (m_checkpointRequestPending.load(std::memory_order_acquire))
+         {
+             handleCheckpointRequestAtBoundary();
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index a4ed4521aca4611956a06e82f86b2e37e44e0811..314ff0626d2340178008f1f13ec158d578068441 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -237,9 +237,14 @@ namespace
+ bool GS::checkpointIdle(std::string &reason) const
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-    if (m_vtxCount != 0)
+-    {
+-        reason = "GS vertex queue holds a half-submitted primitive";
++    // The vertex queue (m_vtxCount, m_vtxIndex, all kMaxVerts vertices) is
++    // serialized field by field and restored as is, so queued vertices are
++    // not a reason to refuse: after a TRISTRIP/TRIFAN/LINESTRIP kick the GS
++    // keeps 1-2 vertices until the next PRIM write. Only an out-of-range
++    // count (which the reader would reject) is refused.
++    if (m_vtxCount < 0 || m_vtxCount > kMaxVerts)
++    {
++        reason = "GS vertex queue count out of range";
+         return false;
+     }
+     if (m_backend)
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 06b0c7a09997c278c4bc8d34abf9ca660989cbcb..1c02ff41d03c8f39b73f8c48f28fab6b413f17a0 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -3975,6 +3975,88 @@ void register_ps2_gs_tests()
+             t.Equals(mismatches, static_cast<size_t>(0u), "every bilinear corpus frame must match the reference hash");
+         });
+ 
++        tc.Run("GS checkpoint restores a partially filled vertex queue exactly", [](TestCase &t)
++        {
++            // GAMEPLAY_002: queued vertices are part of the serialized GS state, so a checkpoint taken with
++            // vertices pending (a strip/fan tail, or a primitive whose remaining vertices arrive later) must
++            // continue on restore exactly as the original GS does.
++            struct Case
++            {
++                const char *name;
++                uint8_t prim;
++                int before; // vertices sent before the checkpoint
++                int after;  // vertices sent after it
++            };
++            const Case cases[] = {
++                {"tristrip tail", GS_PRIM_TRISTRIP, 4, 2},
++                {"trifan tail", GS_PRIM_TRIFAN, 3, 2},
++                {"triangle with one vertex queued", GS_PRIM_TRIANGLE, 1, 2},
++                {"triangle with two vertices queued", GS_PRIM_TRIANGLE, 2, 1},
++                {"linestrip tail", GS_PRIM_LINESTRIP, 2, 2},
++            };
++            const uint16_t xs[] = {4, 40, 8, 56, 20, 60};
++            const uint16_t ys[] = {2, 4, 28, 20, 30, 2};
++            auto sendVertex = [&](GS &gs, int i)
++            {
++                gs.writeRegister(GS_REG_RGBAQ, static_cast<uint64_t>(0x20u + 37u * i) |
++                                                   (static_cast<uint64_t>(0xF0u - 29u * i) << 8) |
++                                                   (static_cast<uint64_t>(0x40u + 51u * i) << 16) |
++                                                   (0x80ull << 24) | (0x3F800000ull << 32));
++                gs.writeRegister(GS_REG_XYZ2, (static_cast<uint64_t>(xs[i]) << 4) |
++                                                  (static_cast<uint64_t>(ys[i]) << 4 << 16));
++            };
++            auto setup = [](GS &gs, uint8_t prim)
++            {
++                gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
++                gs.writeRegister(GS_REG_ZBUF_1, (1ull << 32));
++                gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (31ull << 48));
++                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
++                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
++                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(prim) | (1ull << 3));
++            };
++            for (const Case &c : cases)
++            {
++                std::vector<uint8_t> vramA(PS2_GS_VRAM_SIZE, 0u);
++                GS a;
++                a.init(vramA.data(), static_cast<uint32_t>(vramA.size()), nullptr);
++                setup(a, c.prim);
++                for (int i = 0; i < c.before; ++i)
++                    sendVertex(a, i);
++
++                std::string reason;
++                t.IsTrue(a.checkpointIdle(reason), std::string(c.name) + ": queued vertices must not refuse the save");
++                ps2x::checkpoint::ByteWriter w;
++                std::string error;
++                t.IsTrue(a.serializeCheckpointState(w, error), std::string(c.name) + ": GS state should serialize");
++
++                std::vector<uint8_t> vramB = vramA;
++                GS b;
++                b.init(vramB.data(), static_cast<uint32_t>(vramB.size()), nullptr);
++                ps2x::checkpoint::ByteReader r(w.buffer().data(), w.buffer().size());
++                t.IsTrue(b.deserializeCheckpointState(r, error), std::string(c.name) + ": GS state should restore");
++
++                // Control: the same registers without the restored queue.
++                std::vector<uint8_t> vramC = vramA;
++                GS control;
++                control.init(vramC.data(), static_cast<uint32_t>(vramC.size()), nullptr);
++                setup(control, c.prim);
++
++                const std::vector<uint8_t> beforeFrame(vramA.begin(), vramA.begin() + 8192);
++                for (int i = c.before; i < c.before + c.after; ++i)
++                {
++                    sendVertex(a, i);
++                    sendVertex(b, i);
++                    sendVertex(control, i);
++                }
++                t.IsTrue(std::equal(vramA.begin(), vramA.begin() + 8192, vramB.begin()),
++                         std::string(c.name) + ": restored GS must draw exactly what the original draws");
++                t.IsFalse(std::equal(beforeFrame.begin(), beforeFrame.end(), vramA.begin()),
++                          std::string(c.name) + ": the vertices after the checkpoint must draw something");
++                t.IsFalse(std::equal(vramA.begin(), vramA.begin() + 8192, vramC.begin()),
++                          std::string(c.name) + ": without the restored queue the frame must differ");
++            }
++        });
++
+         tc.Run("GS bilinear sampling at texel centres equals point sampling", [](TestCase &t)
+         {
+             // A 16x16 sprite whose UV span is 16 texels samples every pixel at a texel centre: both bilinear
+diff --git a/ps2xTest/src/ps2_iop_tests.cpp b/ps2xTest/src/ps2_iop_tests.cpp
+index 1ef38443ab88cd6884f1488242f1e0887e28515c..5eae8e3c0f99b6d8d879e3e26f3a7d59fbb91049 100644
+--- a/ps2xTest/src/ps2_iop_tests.cpp
++++ b/ps2xTest/src/ps2_iop_tests.cpp
+@@ -787,6 +787,72 @@ void register_ps2_iop_tests()
+             t.Equals(query(2u, 0u), -1, "reset returns every channel to idle");
+         });
+ 
++        tc.Run("DMC CDMODULE allows a checkpoint once the movie stream is drained", [](TestCase &t)
++        {
++            // GAMEPLAY_002: after a movie ends naturally DMC never sends fno=0xC, so the session stays
++            // active with every byte consumed (fno=0xD answers alive=0). That state is serialized whole and
++            // must not refuse a checkpoint; a stream with bytes left still must.
++            FakeIopHost host;
++            std::vector<uint8_t> disc(2048u + 0x30u);
++            for (size_t i = 0; i < disc.size(); ++i)
++                disc[i] = static_cast<uint8_t>(i * 7u + 3u);
++            host.hostFileContents["fake/disc.iso"] = disc;
++            ps2x::iop::IopSubsystem subsystem(host);
++            std::string error;
++            t.IsTrue(subsystem.configure({"SLES_503.58", 0x00100008u, 0x77654AD2u}, &error),
++                     "DMC profile should configure");
++
++            constexpr uint32_t kSend = 0x1000u;
++            constexpr uint32_t kRecv = 0x2000u;
++            constexpr uint32_t kDest = 0x3000u;
++            const auto call = [&](uint32_t function, uint32_t word8)
++            {
++                const uint32_t words[8] = {0x231u, 1u, word8, kDest, 0u, 1u, 0u, 0u};
++                host.writeGuest(kSend, words, sizeof(words));
++                ps2x::iop::RpcRequest request{};
++                request.sid = 0x12345678u;
++                request.function = function;
++                request.send = {kSend, sizeof(words)};
++                request.receive = {kRecv, 16u};
++                const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
++                uint32_t value = 0u;
++                host.readGuest(kRecv, &value, sizeof(value));
++                return result.handled ? value : 0xFFFFFFFFu;
++            };
++            std::string reason;
++            t.IsTrue(subsystem.validateCheckpointSafe(reason), "no movie: safe");
++
++            t.Equals(call(9u, 0x30u), 0x30u, "fno=9 starts the movie session");
++            t.IsFalse(subsystem.validateCheckpointSafe(reason), "a started stream with bytes left refuses");
++            t.Equals(call(0xAu, 0x20u), 0x20u, "fno=0xA copies the first chunk");
++            t.IsFalse(subsystem.validateCheckpointSafe(reason), "a partly consumed stream refuses");
++            t.Equals(reason, std::string("CDMODULE: movie stream active"), "refusal names the movie stream");
++            std::vector<uint8_t> partial;
++            t.IsFalse(subsystem.serializeCheckpointState(partial, error), "serialization also refuses it");
++
++            t.Equals(call(0xAu, 0x20u), 0x20u, "fno=0xA echoes the requested size at the end of the file");
++            t.Equals(call(0xDu, 0u), 0u, "fno=0xD reports alive=0 once every byte was consumed");
++            t.IsTrue(subsystem.validateCheckpointSafe(reason), "a drained stream left open is safe");
++
++            std::vector<uint8_t> saved;
++            t.IsTrue(subsystem.serializeCheckpointState(saved, error), "the drained session serializes");
++            t.Equals(call(9u, 0x30u), 0x30u, "a new movie changes the session after the snapshot");
++            t.IsTrue(subsystem.deserializeCheckpointState(saved, error), "the drained session restores");
++            t.IsTrue(subsystem.validateCheckpointSafe(reason), "the restored session is still safe");
++            t.Equals(call(0xDu, 0u), 0u, "the restored session still answers alive=0");
++
++            std::vector<uint8_t> fill(0x20u, 0xA5u);
++            host.writeGuest(kDest, fill.data(), fill.size());
++            t.Equals(call(0xAu, 0x20u), 0x20u, "a transfer after restore still echoes the request");
++            std::vector<uint8_t> after(0x20u);
++            host.readGuest(kDest, after.data(), after.size());
++            t.IsTrue(after == fill, "the restored session copies nothing more (still drained)");
++
++            std::vector<uint8_t> again;
++            t.IsTrue(subsystem.serializeCheckpointState(again, error), "save after restore");
++            t.IsTrue(again == saved, "save -> restore -> save is byte-identical");
++        });
++
+ #if defined(PS2X_TEST_IOP_PLUGIN_DIR)
+         tc.Run("plugin module remains loaded through instances and unloads after subsystem destruction", [](TestCase &t)
+         {

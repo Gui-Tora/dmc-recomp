@@ -627,3 +627,65 @@ arriba). Los diecinueve patches actualmente activos:
     - Validación: 460 tests, los mismos 24 fallos preexistentes.
     - Oficina de DMC (VSync 16500–17000, `native`, sin sondas): 6,42 → 6,76 VSync/s (−7,9 ms por VSync).
       Documentación: `analysis/notes/PERF_001_BASELINE.md`, sección 10.
+
+29. `GAMEPLAY_002_checkpoint_gameplay_safe_point.patch` (convención B). Checkpoints durante el gameplay sin
+    relajar la fidelidad: dos condiciones del punto seguro rechazaban estados que ya se serializan enteros.
+    - `cdmodule.cpp`: el gate exige el stream de película agotado (`alive = 0`, el mismo predicado que
+      `fno=0xD`), como fija el diseño de DEVSTATE_002, en lugar de `active = 0`. DMC no envía `fno=0xC` al
+      terminar una película, así que la sesión agotada sigue `active` hasta el siguiente `fno=9`; sus cinco
+      campos se serializan y no hay handles del host entre RPC.
+    - `gs_frontend.cpp`: `checkpointIdle` ya no rechaza vértices en cola. `m_vtxCount`, `m_vtxIndex` y los 6
+      vértices se serializan campo a campo; tras un kick de TRISTRIP/TRIFAN/LINESTRIP el GS retiene 1–2
+      vértices hasta el siguiente `PRIM`. Solo se rechaza un recuento fuera de rango.
+    - `EeScheduler.cpp`, opt-in: `PS2X_CHECKPOINT_DEFER_VSYNCS=N` mantiene la petición pendiente mientras la
+      validación (de solo lectura) la rechace y la reintenta en cada frontera durante N VSync;
+      `PS2X_CHECKPOINT_AT_VSYNC=T` + `PS2X_CHECKPOINT_AT_VSYNC_PATH` piden un guardado al llegar al tick T, sin
+      sobrescribir. Sin las variables, el comportamiento es el anterior.
+    - Registro de `[CKPT:DEFER]` (solo log): el primer rechazo y después como máximo una línea cada 60 VSync,
+      con `skipped=` (rechazos no impresos desde la línea anterior). La lógica y los tiempos de guardado no cambian.
+    - Formato y ABI sin cambios: mismo `checkpointCompatId`; los checkpoints existentes siguen cargando.
+    - Tests: 2 nuevos (el GS restaurado con 1–2 vértices en cola dibuja exactamente lo mismo que el original
+      y distinto de un GS sin la cola; CDMODULE rechaza un stream con bytes pendientes, acepta el agotado y
+      guardar → restaurar → guardar es idéntico byte a byte). 462 tests, los mismos 24 fallos preexistentes.
+    - Validación en DMC: guardado en la oficina (tick 16387, `vtxCount = 2`, película 0x232 agotada) que antes
+      se rechazaba; dos restauraciones en procesos nuevos guardadas en el tick 16700 son idénticas entre sí y
+      a la ejecución original en 11 de 12 secciones (MEM, MMIO, GS, SCHED, IOP…); en CORE solo difiere el
+      contador de contabilidad `VU1State.cycles`.
+      Documentación: `analysis/notes/GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md`, sección 12.
+
+30. `GAMEPLAY_003_vu0_macro_mac_flags.patch` (convención B). Las instrucciones FMAC de COP2 en modo macro
+    actualizan `vu0_mac_flags`, que antes ninguna instrucción traducida escribía. `CFC2 $vi17` leía siempre 0, así
+    que `atari_check_4`/`atari_check_4R` (test rayo-triángulo de DMC) rechazaban todos los triángulos y Dante
+    atravesaba el suelo al saltar.
+    - `ps2xRuntime/include/ps2_vu0_mac.h` (nuevo): semántica de `VU_MAC_UPDATE` de PCSX2, solo flags.
+      - Por componente escrito: S = signo; ±0 → Z; subnormal → Z|U; exponente 255 → O.
+      - Los componentes no escritos se borran; OPMULA/OPMSUB conservan los bits de w.
+      - No altera los valores de los resultados.
+    - `code_generator.cpp` (`translateVUInstruction`): tras ADD/SUB/MUL/MADD/MSUB (bc/q/i y acumulador A) y
+      OPMULA/OPMSUB, añade `ctx->vu0_mac_flags = ps2Vu0MacUpdate(...)` sobre el destino ya escrito (`vf[fd]` o
+      `ACC`, con su máscara).
+      - Va antes del descarte de la escritura en `vf0` (parche `GAMEPLAY_001J_vu0_vf0_hardwired`).
+      - MAX/MINI, ABS, MOVE/MR32, FTOI/ITOF, CLIP, DIV/SQRT/RSQRT, NOP y las operaciones enteras no lo tocan.
+    - `function_emitter.cpp` / `ps2_recompiler.cpp`: el `#include "ps2_vu0_mac.h"` se emite solo en los ficheros
+      que lo usan; el resto del código generado queda idéntico.
+    - Tests: 5 nuevos.
+      - Oráculo copiado de `VU_MAC_UPDATE` y `applyBinaryMACOp`: 12 288 casos, valores especiales y las 16
+        máscaras.
+      - Bits por componente.
+      - El escenario de `atari_check_4`.
+      - Emisión con palabras reales (`vmul.x`, `vsubq.x`, `vsubx.w $vf0`, `vopmula`, `vopmsub`, y sin emisión
+        en `vdiv`/`vnop`/`vclip`/`vitof`/`vftoi`/`cfc2`).
+      - Cobertura exacta de los códigos de ambas tablas.
+      - Una mutación (orden de componentes) hace fallar los tests.
+      - 467 tests, los mismos 24 fallos preexistentes.
+    - Regeneración controlada en carpetas temporales con el traductor sin y con el cambio.
+      - Cambian exactamente 43 ficheros, todos con FMAC de COP2, y el cambio es solo aditivo: 395 sentencias MAC y
+        el `#include`.
+      - Solo esos 43 se integraron; la compilación incremental recompiló 43 TU.
+    - Validación en DMC (`g002_castle_entry.dmck`):
+      - el rayo de suelo de `Get_height_pl` impacta el triángulo `0x010A17E0` con t = 0,5, como PCSX2 s09;
+      - el bloque de suelo queda en h = −3527, nodo `0x1001`, normal (0, 1, 0);
+      - Dante salta (TRIÁNGULO) y aterriza en y = −3527.
+      - Prueba manual del usuario desde el mismo checkpoint: Dante camina, corre, salta y aterriza sobre el suelo;
+        el fallo de atravesarlo no se reproduce. No valida todo el sistema de colisiones.
+      Documentación: `analysis/notes/GAMEPLAY_003_JUMP_COLLISION_DIAGNOSIS.md`, sección 8.
