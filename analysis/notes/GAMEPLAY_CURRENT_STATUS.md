@@ -1,15 +1,46 @@
 # Estado actual del proyecto — punto de entrada para nuevos agentes
 
-Última actualización: 2026-10-19, cierre de GAMEPLAY_001L (parches 20–25: IPU, RPC, DMA, VU0, VIF V4-5, build sin FFmpeg; personajes de la oficina recuperados) — [GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md](GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md).
+Última actualización: 2026-10-29, tras integrar GAMEPLAY_002/003 (PR #10) e iniciar PERF_002. Estado vigente: sección 0.
+Actualización anterior: 2026-10-19, cierre de GAMEPLAY_001L (parches 20–25: IPU, RPC, DMA, VU0, VIF V4-5, build sin FFmpeg; personajes de la oficina recuperados) — [GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md](GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md).
 Índice histórico completo: [RESEARCH_INDEX.md](RESEARCH_INDEX.md).
 Reglas del proyecto: [AGENTS.md](../../AGENTS.md) (obligatorias) y [README.md](../../README.md).
 
-> **Aviso:** `master` (`b6f7934`, PR #4) contiene el trabajo hasta 001K (19 parches). El trabajo de 001L
+> **Aviso histórico (2026-10-19, superado; ver sección 0):** `master` (`b6f7934`, PR #4) contiene el trabajo hasta 001K (19 parches). El trabajo de 001L
 > (parches 20–25, notas) está en la rama `gameplay-001l`, publicada como Draft PR #5 y pendiente de revisión. Lee la
 > sección «Estado remoto frente a estado local».
 > **El juego no es jugable. DMC-Recomp es experimental.** `FIRST_PLAYABLE_FRAME` **no** está demostrado.
 
 Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
+
+## 0. Estado al 2026-10-29
+
+- **`master` = `314aaa70177e760f29b025cce1448e2f8ae05774`** (merge de la PR #10). Lock: **30 parches**,
+  `patched_commit` `ce2d053db5772642e756eacce4205ac38594894d`; el replay limpio reproduce el árbol del vendor
+  (`fa1b4d7a…`).
+- **Rama local `perf-002-castle` (2026-10-29, sin commit):** parche 31 `PERF_002_vu1_exactflags_signbit.patch`
+  integrado localmente (C1: `exactFlags` sin `_ldsign`, +5 % de VSync/s atribuible); lock de 31 parches,
+  `patched_commit` `dfa856e76663479a38de583cd2b3e3e5ad1a1be9`; ver [PERF_002_CASTLE_BASELINE.md](PERF_002_CASTLE_BASELINE.md) §13.
+- Integrado desde el estado de las secciones 1–11: VISUAL_001 (PR #6, parches 26–27), PERF_001 P1-A (PR #7, 11
+  entradas VU1 compiladas y `/d2OptimizeHugeFunctions`), PERF_001 P3 (PR #8, parche 28) y GAMEPLAY_002/003 (PR #10,
+  parches 29–30).
+- **HECHO: `FIRST_PLAYABLE_FRAME` conseguido** (definición limitada): Dante visible y controlable en el castillo.
+  El usuario confirmó a mano que camina, corre, salta y aterriza
+  ([GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md](GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md) §14,
+  [GAMEPLAY_003_JUMP_COLLISION_DIAGNOSIS.md](GAMEPLAY_003_JUMP_COLLISION_DIAGNOSIS.md) §9).
+- **Salto y aterrizaje corregidos** (parche 30): las FMAC de VU0 en modo macro actualizan los flags MAC; antes
+  `CFC2 $vi17` leía siempre 0 y `atari_check_4` rechazaba todos los triángulos.
+- **Checkpoint reutilizable del castillo:** `analysis/local/gameplay_002/ckpt/g002_castle_entry.dmck` (local, no
+  versionado; tick 26640, guardado con el parche 29). Restaura en un proceso nuevo y llega al control en el
+  tick ~28010, unos 4,5–5 min de pared después de cargar.
+- **Limitación del guardado con control:** desde que Dante es controlable, la validación del punto seguro rechaza
+  siempre (`GS local->host buffer not fully consumed`, `activeInv != 0`, `completedDmacCauses not empty`). Causa
+  UNKNOWN. No hay checkpoint con el control ya disponible.
+- **Rendimiento todavía muy bajo:** ~4–5 VSync/s en el castillo frente a 50 PAL (oficina: 6,76 VSync/s tras
+  PERF_001). En curso: PERF_002 ([PERF_002_CASTLE_BASELINE.md](PERF_002_CASTLE_BASELINE.md)).
+- **Pendiente:** errores gráficos; colisiones distintas del suelo (paredes, bordes, pendientes, enemigos y cámara,
+  `atari_check_4R`) sin validar; 15 `ret0`; audio SE/BGM/PSS mudo.
+- **Para jugar a mano:** lanzar sin `DMC_P311_PAD_FILE` (o vacía). Mientras el canal P311 está activo, sustituye
+  el mando y el teclado reales.
 
 ## 1. Identidad y arquitectura
 
@@ -124,6 +155,8 @@ generales del runtime van en `patches/`.
 - 20 funciones VU0 sustituidas por `ret0` durante el bring-up.
 - Estado detallado, grupos A/B/C y prioridades en
   [GAMEPLAY_001_RET0_RESTORATION_STATUS.md](GAMEPLAY_001_RET0_RESTORATION_STATUS.md).
+- **Parche 30 (GAMEPLAY_003):** las FMAC en modo macro actualizan los flags MAC (solo flags; la saturación de
+  `VADD`/`VMUL` del punto siguiente sigue pendiente).
 - Defectos del traductor:
   - **corregidos en el parche 23 (001L):** `VCLIPw` (orden de bits y `|w|`), `VDIV` (x/0 → ±max) y `VFTOI`
     (saturación), con la semántica del intérprete de PCSX2;
@@ -168,6 +201,17 @@ generales del runtime van en `patches/`.
 
 ## 8. Próximos bloqueadores (orden por evidencia)
 
+**Actualización 2026-10-29:** la franja (VISUAL_001), PERF_001 y la escena posterior a `0x231` (personaje visible
+y controlable, GAMEPLAY_002/003) están resueltos. Orden actual:
+
+1. **Rendimiento en gameplay** (PERF_002): ~4–5 VSync/s en el castillo.
+2. Errores gráficos del castillo y de la oficina, pendientes de comparar con PCSX2.
+3. Colisiones distintas del suelo sin validar.
+4. Checkpoint con control (punto seguro siempre rechazado en el castillo).
+5. 15 `ret0` y los casos `InterpNode 0/0`; audio.
+
+Orden de 001L (histórico):
+
 **Actualización 001L:** los puntos 1 (`sceDmaRecvI`) y 6 (CLIP/DIV/FTOI) están resueltos o encauzados.
 
 Orden actual:
@@ -201,6 +245,10 @@ Lista histórica de 001J:
 
 ## 9. Próxima fase (propuesta, no iniciada)
 
+**2026-10-29:** PERF_002, diagnóstico y línea base del rendimiento en el castillo (rama local `perf-002-castle`).
+
+Histórico:
+
 **Tras el cierre de VISUAL_001:** PERF_001. La lista
 siguiente es la propuesta histórica de 001J/001K, ya cumplida.
 
@@ -212,6 +260,11 @@ GAMEPLAY_001J está documentada en
 [GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md](GAMEPLAY_001J_VISUAL_TRANSITION_DIAGNOSIS.md).
 
 ## 10. Estado remoto frente a estado local
+
+**Verificado 2026-10-29:** `origin/master = 314aaa70` (PR #10). Fusionadas las PR #5–#8 y #10. Rama local
+`perf-002-castle` desde `master`, sin commits. Ninguna rama borrada.
+
+Histórico:
 
 **Verificado 2026-10-19, cierre de 001L:**
 
