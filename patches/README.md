@@ -652,3 +652,40 @@ arriba). Los diecinueve patches actualmente activos:
       a la ejecución original en 11 de 12 secciones (MEM, MMIO, GS, SCHED, IOP…); en CORE solo difiere el
       contador de contabilidad `VU1State.cycles`.
       Documentación: `analysis/notes/GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md`, sección 12.
+
+30. `GAMEPLAY_003_vu0_macro_mac_flags.patch` (convención B). Las instrucciones FMAC de COP2 en modo macro
+    actualizan `vu0_mac_flags`, que antes ninguna instrucción traducida escribía. `CFC2 $vi17` leía siempre 0, así
+    que `atari_check_4`/`atari_check_4R` (test rayo-triángulo de DMC) rechazaban todos los triángulos y Dante
+    atravesaba el suelo al saltar.
+    - `ps2xRuntime/include/ps2_vu0_mac.h` (nuevo): semántica de `VU_MAC_UPDATE` de PCSX2, solo flags.
+      - Por componente escrito: S = signo; ±0 → Z; subnormal → Z|U; exponente 255 → O.
+      - Los componentes no escritos se borran; OPMULA/OPMSUB conservan los bits de w.
+      - No altera los valores de los resultados.
+    - `code_generator.cpp` (`translateVUInstruction`): tras ADD/SUB/MUL/MADD/MSUB (bc/q/i y acumulador A) y
+      OPMULA/OPMSUB, añade `ctx->vu0_mac_flags = ps2Vu0MacUpdate(...)` sobre el destino ya escrito (`vf[fd]` o
+      `ACC`, con su máscara).
+      - Va antes del descarte de la escritura en `vf0` (parche `GAMEPLAY_001J_vu0_vf0_hardwired`).
+      - MAX/MINI, ABS, MOVE/MR32, FTOI/ITOF, CLIP, DIV/SQRT/RSQRT, NOP y las operaciones enteras no lo tocan.
+    - `function_emitter.cpp` / `ps2_recompiler.cpp`: el `#include "ps2_vu0_mac.h"` se emite solo en los ficheros
+      que lo usan; el resto del código generado queda idéntico.
+    - Tests: 5 nuevos.
+      - Oráculo copiado de `VU_MAC_UPDATE` y `applyBinaryMACOp`: 12 288 casos, valores especiales y las 16
+        máscaras.
+      - Bits por componente.
+      - El escenario de `atari_check_4`.
+      - Emisión con palabras reales (`vmul.x`, `vsubq.x`, `vsubx.w $vf0`, `vopmula`, `vopmsub`, y sin emisión
+        en `vdiv`/`vnop`/`vclip`/`vitof`/`vftoi`/`cfc2`).
+      - Cobertura exacta de los códigos de ambas tablas.
+      - Una mutación (orden de componentes) hace fallar los tests.
+      - 467 tests, los mismos 24 fallos preexistentes.
+    - Regeneración controlada en carpetas temporales con el traductor sin y con el cambio.
+      - Cambian exactamente 43 ficheros, todos con FMAC de COP2, y el cambio es solo aditivo: 395 sentencias MAC y
+        el `#include`.
+      - Solo esos 43 se integraron; la compilación incremental recompiló 43 TU.
+    - Validación en DMC (`g002_castle_entry.dmck`):
+      - el rayo de suelo de `Get_height_pl` impacta el triángulo `0x010A17E0` con t = 0,5, como PCSX2 s09;
+      - el bloque de suelo queda en h = −3527, nodo `0x1001`, normal (0, 1, 0);
+      - Dante salta (TRIÁNGULO) y aterriza en y = −3527.
+      - Prueba manual del usuario desde el mismo checkpoint: Dante camina, corre, salta y aterriza sobre el suelo;
+        el fallo de atravesarlo no se reproduce. No valida todo el sistema de colisiones.
+      Documentación: `analysis/notes/GAMEPLAY_003_JUMP_COLLISION_DIAGNOSIS.md`, sección 8.

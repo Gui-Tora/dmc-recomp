@@ -119,6 +119,10 @@
     {
       "path": "patches/GAMEPLAY_002_checkpoint_gameplay_safe_point.patch",
       "sha256": "d5f4eaeb8527261bdc5bdd50ae2aafab5d8e73fab20d76095dde254487ff0abb"
+    },
+    {
+      "path": "patches/GAMEPLAY_003_vu0_macro_mac_flags.patch",
+      "sha256": "6d079a51ba482f03e46411684cb1753f4482f7fdcc26111d059763cb0d1dbd7f"
     }
   ],
   "patch_identity": {
@@ -127,5 +131,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "6be089cd6056ee7a48a67c656fba731064795627"
+  "patched_commit": "ce2d053db5772642e756eacce4205ac38594894d"
 }
