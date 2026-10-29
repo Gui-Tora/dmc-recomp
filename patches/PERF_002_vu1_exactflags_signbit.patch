@@ -1,0 +1,178 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_native.h b/ps2xRuntime/src/lib/vu/ps2_vu1_native.h
+index 381e194611f7286b4a9616a5ff6e793207536d9d..640a632a69932cf62eb6f0d823c6248c6ff56944 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_native.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_native.h
+@@ -13,6 +13,7 @@
+ #include "runtime/ps2_vu1.h"
+ 
+ #include <algorithm>
++#include <bit>
+ #include <cfenv>
+ #include <cmath>
+ #include <cstdint>
+@@ -119,10 +120,28 @@ namespace vu1c
+         return bitsToFloat(bits);
+     }
+ 
++    // Sign bit of an IEEE-754 binary64 value read from its representation. On MSVC, std::signbit(long double)
++    // is an out-of-line UCRT call (_ldsign); where long double is binary64 (MSVC x64) bit 63 is the same sign
++    // for every class (+-0, subnormal, normal, Inf, NaN with any payload). Other models keep std::signbit.
++    template <typename T>
++    inline bool signBit(T value)
++    {
++        if constexpr (sizeof(T) == sizeof(uint64_t) && std::numeric_limits<T>::is_iec559 &&
++                      std::numeric_limits<T>::digits == 53)
++            return (std::bit_cast<uint64_t>(value) >> 63) != 0u;
++        else
++            return std::signbit(value);
++    }
++#if defined(_MSC_VER) && defined(_M_X64)
++    static_assert(sizeof(long double) == sizeof(uint64_t) && std::numeric_limits<long double>::is_iec559 &&
++                      std::numeric_limits<long double>::digits == 53,
++                  "MSVC x64: long double is expected to be IEEE-754 binary64");
++#endif
++
+     // VU1Interpreter::normalizeFmacExactResult: returns Z=1 S=2 U=4 O=8 and fixes the value.
+     inline uint32_t exactFlags(float &value, long double exact)
+     {
+-        const bool negative = std::signbit(exact);
++        const bool negative = signBit(exact);
+         const long double magnitude = std::fabs(exact);
+         uint32_t flags = negative ? 0x2u : 0u;
+         const uint32_t bits = negative ? 0x80000000u : 0u;
+diff --git a/ps2xTest/src/ps2_vu_tests.cpp b/ps2xTest/src/ps2_vu_tests.cpp
+index ee7f4de1b6f61bdd77be8312c0c2a367b3fa80a5..f705c9def80f52a261cd9194f0d31fd835e67bec 100644
+--- a/ps2xTest/src/ps2_vu_tests.cpp
++++ b/ps2xTest/src/ps2_vu_tests.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "Kernel/Stubs/VU.h"
+ #include "ps2_vu0_mac.h"
++#include "vu/ps2_vu1_native.h"
+ 
+ #include <cmath>
+ #include <cstdint>
+@@ -1182,4 +1183,123 @@ void register_ps2_vu_tests()
+                      "t < 0: Sx, the final gate rejects");
+         });
+     });
++
++    MiniTest::Case("PS2VU1NativeExactFlags", [](TestCase &tc)
++    {
++        // vu1c::exactFlags reads the sign from the binary64 representation instead of calling
++        // std::signbit(long double). Oracle: the previous implementation, verbatim.
++        static const auto reference = [](float &value, long double exact) -> uint32_t
++        {
++            const bool negative = std::signbit(exact);
++            const long double magnitude = std::fabs(exact);
++            uint32_t flags = negative ? 0x2u : 0u;
++            const uint32_t bits = negative ? 0x80000000u : 0u;
++            if (magnitude == 0.0L)
++            {
++                flags |= 0x1u;
++                std::memcpy(&value, &bits, 4);
++            }
++            else if (magnitude > static_cast<long double>(std::numeric_limits<float>::max()))
++            {
++                flags |= 0x8u;
++                const uint32_t b = bits | 0x7F7FFFFFu;
++                std::memcpy(&value, &b, 4);
++            }
++            else if (magnitude < static_cast<long double>(std::numeric_limits<float>::min()))
++            {
++                flags |= 0x5u;
++                std::memcpy(&value, &bits, 4);
++            }
++            return flags;
++        };
++        static const auto fromBits = [](uint64_t b)
++        {
++            double d;
++            std::memcpy(&d, &b, sizeof d);
++            return static_cast<long double>(d);
++        };
++        static const auto floatBits = [](float f)
++        {
++            uint32_t b;
++            std::memcpy(&b, &f, 4);
++            return b;
++        };
++        // Same flags, same resulting float bits and the same sign as std::signbit, for one exact value.
++        static const auto agrees = [](long double exact, float seed)
++        {
++            float a = seed, b = seed;
++            const uint32_t fa = reference(a, exact);
++            const uint32_t fb = vu1c::exactFlags(b, exact);
++            return fa == fb && floatBits(a) == floatBits(b) && vu1c::signBit(exact) == std::signbit(exact);
++        };
++        static const auto splitmix = [](uint64_t &s)
++        {
++            uint64_t z = (s += 0x9E3779B97F4A7C15ull);
++            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
++            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
++            return z ^ (z >> 31);
++        };
++
++        tc.Run("directed_classes_both_signs", [](TestCase &t)
++        {
++            const uint64_t positive[] = {
++                0x0000000000000000ull, 0x0000000000000001ull, 0x000FFFFFFFFFFFFFull, 0x0010000000000000ull, // 0, subnormals, DBL_MIN
++                0x36A0000000000000ull, 0x380FFFFFFFFFFFFFull, 0x3810000000000000ull, 0x3810000000000001ull, // FLT_TRUE_MIN, around FLT_MIN
++                0x3FF0000000000000ull, 0x47EFFFFFDFFFFFFFull, 0x47EFFFFFE0000000ull, 0x47EFFFFFE0000001ull, // 1, around FLT_MAX
++                0x7FEFFFFFFFFFFFFFull, 0x7FF0000000000000ull,                                               // DBL_MAX, Inf
++                0x7FF8000000000000ull, 0x7FF0000000000001ull, 0x7FF4000000000000ull, 0x7FFFFFFFFFFFFFFFull, // NaN payloads
++                0x7FF800000000ABCDull};
++            const float seeds[] = {0.0f, 1.0f, -3.0f};
++            uint32_t mismatches = 0u, signs = 0u;
++            for (const uint64_t p : positive)
++                for (const uint64_t s : {0ull, 0x8000000000000000ull})
++                {
++                    const long double v = fromBits(p | s);
++                    signs += vu1c::signBit(v) == (s != 0u) ? 0u : 1u;
++                    for (const float seed : seeds)
++                        mismatches += agrees(v, seed) ? 0u : 1u;
++                }
++            t.Equals(signs, 0u, "signBit is the representation's sign bit (+-0, subnormal, normal, Inf, NaN)");
++            t.Equals(mismatches, 0u, "directed cases: same flags and value as std::signbit");
++        });
++
++        tc.Run("exponent_sweep", [](TestCase &t)
++        {
++            const uint64_t mantissas[] = {0ull, 1ull, 0x5555555555555ull, 0x8000000000000ull, 0xFFFFFFFFFFFFFull};
++            uint32_t mismatches = 0u, cases = 0u;
++            for (uint64_t sign = 0; sign < 2; ++sign)
++                for (uint64_t exponent = 0; exponent < 2048; ++exponent)
++                    for (const uint64_t m : mantissas)
++                    {
++                        mismatches += agrees(fromBits((sign << 63) | (exponent << 52) | m), 1.0f) ? 0u : 1u;
++                        ++cases;
++                    }
++            t.Equals(cases, 20480u, "every exponent, both signs, 5 mantissas");
++            t.Equals(mismatches, 0u, "exponent sweep: same flags and value");
++        });
++
++        tc.Run("random_patterns_and_products", [](TestCase &t)
++        {
++            uint64_t state = 0xC1C1C1C1u;
++            uint32_t mismatches = 0u;
++            for (uint32_t i = 0; i < 4000000u; ++i)
++                mismatches += agrees(fromBits(splitmix(state)), 0.5f) ? 0u : 1u;
++            t.Equals(mismatches, 0u, "4M random binary64 patterns: same flags and value");
++
++            uint32_t productMismatches = 0u;
++            for (uint32_t i = 0; i < 2000000u; ++i)
++            {
++                const uint64_t r = splitmix(state);
++                float left, right;
++                const uint32_t lb = static_cast<uint32_t>(r), rb = static_cast<uint32_t>(r >> 32);
++                std::memcpy(&left, &lb, 4);
++                std::memcpy(&right, &rb, 4);
++                float product = left * right;
++                const uint32_t expected =
++                    reference(product, static_cast<long double>(left) * static_cast<long double>(right)) & 0xFu;
++                productMismatches += vu1c::productSticky(left, right) == expected ? 0u : 1u;
++            }
++            t.Equals(productMismatches, 0u, "2M random float products: productSticky unchanged");
++        });
++    });
+ }
