@@ -627,3 +627,28 @@ arriba). Los diecinueve patches actualmente activos:
     - Validación: 460 tests, los mismos 24 fallos preexistentes.
     - Oficina de DMC (VSync 16500–17000, `native`, sin sondas): 6,42 → 6,76 VSync/s (−7,9 ms por VSync).
       Documentación: `analysis/notes/PERF_001_BASELINE.md`, sección 10.
+
+29. `GAMEPLAY_002_checkpoint_gameplay_safe_point.patch` (convención B). Checkpoints durante el gameplay sin
+    relajar la fidelidad: dos condiciones del punto seguro rechazaban estados que ya se serializan enteros.
+    - `cdmodule.cpp`: el gate exige el stream de película agotado (`alive = 0`, el mismo predicado que
+      `fno=0xD`), como fija el diseño de DEVSTATE_002, en lugar de `active = 0`. DMC no envía `fno=0xC` al
+      terminar una película, así que la sesión agotada sigue `active` hasta el siguiente `fno=9`; sus cinco
+      campos se serializan y no hay handles del host entre RPC.
+    - `gs_frontend.cpp`: `checkpointIdle` ya no rechaza vértices en cola. `m_vtxCount`, `m_vtxIndex` y los 6
+      vértices se serializan campo a campo; tras un kick de TRISTRIP/TRIFAN/LINESTRIP el GS retiene 1–2
+      vértices hasta el siguiente `PRIM`. Solo se rechaza un recuento fuera de rango.
+    - `EeScheduler.cpp`, opt-in: `PS2X_CHECKPOINT_DEFER_VSYNCS=N` mantiene la petición pendiente mientras la
+      validación (de solo lectura) la rechace y la reintenta en cada frontera durante N VSync;
+      `PS2X_CHECKPOINT_AT_VSYNC=T` + `PS2X_CHECKPOINT_AT_VSYNC_PATH` piden un guardado al llegar al tick T, sin
+      sobrescribir. Sin las variables, el comportamiento es el anterior.
+    - Registro de `[CKPT:DEFER]` (solo log): el primer rechazo y después como máximo una línea cada 60 VSync,
+      con `skipped=` (rechazos no impresos desde la línea anterior). La lógica y los tiempos de guardado no cambian.
+    - Formato y ABI sin cambios: mismo `checkpointCompatId`; los checkpoints existentes siguen cargando.
+    - Tests: 2 nuevos (el GS restaurado con 1–2 vértices en cola dibuja exactamente lo mismo que el original
+      y distinto de un GS sin la cola; CDMODULE rechaza un stream con bytes pendientes, acepta el agotado y
+      guardar → restaurar → guardar es idéntico byte a byte). 462 tests, los mismos 24 fallos preexistentes.
+    - Validación en DMC: guardado en la oficina (tick 16387, `vtxCount = 2`, película 0x232 agotada) que antes
+      se rechazaba; dos restauraciones en procesos nuevos guardadas en el tick 16700 son idénticas entre sí y
+      a la ejecución original en 11 de 12 secciones (MEM, MMIO, GS, SCHED, IOP…); en CORE solo difiere el
+      contador de contabilidad `VU1State.cycles`.
+      Documentación: `analysis/notes/GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md`, sección 12.

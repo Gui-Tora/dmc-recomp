@@ -115,6 +115,10 @@
     {
       "path": "patches/PERF_001_gs_bilinear_zero_fraction.patch",
       "sha256": "6bbc8a12f93b9f8fe9352b701fac627e945ca614f1651fd4ad8617b5be1a41c3"
+    },
+    {
+      "path": "patches/GAMEPLAY_002_checkpoint_gameplay_safe_point.patch",
+      "sha256": "d5f4eaeb8527261bdc5bdd50ae2aafab5d8e73fab20d76095dde254487ff0abb"
     }
   ],
   "patch_identity": {
@@ -123,5 +127,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "e3d4250d793372be74a2bcd65363810d577aa00d"
+  "patched_commit": "6be089cd6056ee7a48a67c656fba731064795627"
 }
