@@ -147,3 +147,9 @@ P4.0–P4.2.4 y Q6–Q10.1:
 Ninguna fase se considera documentalmente cerrada si sus hallazgos solo existen en `analysis/local/`. El
 procedimiento completo está en [GAMEPLAY_CURRENT_STATUS.md](GAMEPLAY_CURRENT_STATUS.md) §12. Plantilla de
 bloqueo: [BLOCKER_TEMPLATE.md](BLOCKER_TEMPLATE.md).
+
+## 7. Verificación de identidad de la ISO adjunta (2026-10-29)
+
+| ID | Problema | Descubrimiento principal | Estado | Documento |
+|---|---|---|---|---|
+| ISO_IDENTITY_001 | ¿Qué versión/región representa la imagen adjunta? | `SYSTEM.CNF` declara `SLES_503.58`, v1.02, PAL; SHA-256, CRC32 y entry del ELF coinciden con la identidad canónica registrada | **verificada estáticamente**; no implica viabilidad del juego | [ISO_IDENTITY_001_ATTACHED_IMAGE.md](ISO_IDENTITY_001_ATTACHED_IMAGE.md) |

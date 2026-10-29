@@ -1,6 +1,6 @@
 # Estado actual del proyecto — punto de entrada para nuevos agentes
 
-Última actualización: 2026-10-19, cierre de GAMEPLAY_001L (parches 20–25: IPU, RPC, DMA, VU0, VIF V4-5, build sin FFmpeg; personajes de la oficina recuperados) — [GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md](GAMEPLAY_001L_SCEDMARECVI_MOVIE_TEXTURE.md).
+Última actualización: 2026-10-29, identidad de la ISO adjunta — [ISO_IDENTITY_001_ATTACHED_IMAGE.md](ISO_IDENTITY_001_ATTACHED_IMAGE.md).
 Índice histórico completo: [RESEARCH_INDEX.md](RESEARCH_INDEX.md).
 Reglas del proyecto: [AGENTS.md](../../AGENTS.md) (obligatorias) y [README.md](../../README.md).
 
@@ -17,6 +17,7 @@ Categorías: HECHO, INFERENCIA, HIPÓTESIS, UNKNOWN, RETRACTADO.
 |---|---|
 | Juego | Devil May Cry (2001), PS2, **PAL Europa**, v1.02 (`SYSTEM.CNF`: `VER = 1.02`, `VMODE = PAL`) |
 | ELF | `SLES_503.58`; SHA-256 `d0753a6b3b2f00802a50758a872d8cf051725aa31c839aa8894eee30ce58bab4`; CRC32 `0x77654AD2`; entry `0x00100008` |
+| ISO verificada | Imagen adjunta; 4,698,767,360 bytes; SHA-256 `20a1b6a2b43d5e72ed4a334740e54c48bf5a91753160334a28af2719276807c8`; volumen `DEVIL MAY CRY` ([evidencia](ISO_IDENTITY_001_ATTACHED_IMAGE.md)) |
 | `CDMODULE.IRX` | SHA-256 `9d51f16d1ed861e508daa1389e6aaf4fe597687b3f0cd5feb920e62a479b34fa` |
 | `TSNDDRVM.IRX` | SHA-256 `c00b17f07aa0dfed089a517498074eec251c7b571f58a7649414ef88be7f31fd` |
 | Recompilador | `ran-j/PS2Recomp`, baseline `14b1e5cb39b4af7e6fc12f9a29fdc751efde49d7` + parches de `upstream.lock.json`. `master` (tras integrar 001L): 25 parches (`patched_commit` `e86516d5c335a443d53b40b79eabc210bbaf043a`). Rama `visual-001-letterbox`, en revisión: **27 parches** (`patched_commit` `e58f58b93897d28a8fa5f47f9f8c2e73601f5b23`), vendor idéntico byte a byte al replay limpio |
