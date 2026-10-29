@@ -689,3 +689,26 @@ arriba). Los diecinueve patches actualmente activos:
       - Prueba manual del usuario desde el mismo checkpoint: Dante camina, corre, salta y aterriza sobre el suelo;
         el fallo de atravesarlo no se reproduce. No valida todo el sistema de colisiones.
       Documentación: `analysis/notes/GAMEPLAY_003_JUMP_COLLISION_DIAGNOSIS.md`, sección 8.
+
+31. `PERF_002_vu1_exactflags_signbit.patch` (convención B). Rendimiento, sin cambio de semántica: `vu1c::exactFlags`
+    (y `productSticky`, que la usa) obtiene el signo de `long double` sin `std::signbit`. Con MSVC/UCRT,
+    `std::signbit(long double)` es una llamada no inlineable a `_ldsign` de `ucrtbase`, que costaba el 4,1 % del hilo
+    del juego en la cinemática del castillo.
+    - `ps2xRuntime/src/lib/vu/ps2_vu1_native.h`: plantilla `vu1c::signBit`. Si el tipo es IEEE-754 binary64
+      (`sizeof == 8`, `is_iec559`, `digits == 53`, como `long double` en MSVC x64), devuelve el bit 63 mediante
+      `std::bit_cast<uint64_t>`; en otros modelos usa `std::signbit`. Un `static_assert` fija la premisa en MSVC x64.
+      El signo es el mismo en todas las clases (±0, subnormal, normal, Inf, NaN con cualquier carga útil).
+    - El intérprete VU1 (`normalizeFmacExactResult`) no cambia: es la referencia del modo verify.
+    - Solo la incluyen `ps2_runtime.cpp` y la unidad VU1 compilada; ningún fichero EE generado.
+    - Tests: 3 nuevos (`PS2VU1NativeExactFlags`) contra la implementación anterior copiada como oráculo.
+      - Casos dirigidos por clase y signo, los 2 048 exponentes y 4 M de patrones aleatorios más 2 M de productos
+        `float × float`, con 0 diferencias en flags y valor.
+      - Una mutación (bit 62) los hace fallar.
+      - 470 tests, los mismos 24 fallos preexistentes.
+    - Ensamblador: `exactFlags`/`productSticky` pasan de `call [__imp__ldsign]` a `movq` + `shr 63`, sin llamadas.
+    - Validación en DMC (`g002_castle_entry.dmck`):
+      - `PS2X_VU1_NATIVE=verify` en los VSync 26640–27176: 362 767 llamadas comparadas, 0 diferencias, con las 15
+        entradas compiladas ejecutadas;
+      - serie A/B/B/A en los VSync 27000–27500, con la misma carga: VU1 de 95,4 a 83,1 ms por VSync; relación
+        VU1/(PATH1+resto) de 0,813 a 0,725; +5,2 % de VSync/s frente a la A con los mismos controles.
+      Documentación: `analysis/notes/PERF_002_CASTLE_BASELINE.md`, sección 13.
