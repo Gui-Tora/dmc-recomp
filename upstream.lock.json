@@ -131,6 +131,10 @@
     {
       "path": "patches/PERF_003_gs_zte_depth_test_enable.patch",
       "sha256": "4f79c093edf6fe9d92ab195e319ec10f7f3e0a1047ae9063ddde3c3732f4944b"
+    },
+    {
+      "path": "patches/PERF_003_gs_vram_dispatch_function_pointers.patch",
+      "sha256": "429f1eb778ed78aac653c8ea8def48e4586e760f53def9fb2845fb350ba08121"
     }
   ],
   "patch_identity": {
@@ -139,5 +143,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "b7840ea9dcff04fbac1293e2812ff2e8ba970d4c"
+  "patched_commit": "614c0eee0b3b52b8e55dca7dc0b35999a2ecbd62"
 }

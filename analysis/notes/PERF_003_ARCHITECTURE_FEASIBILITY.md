@@ -1295,3 +1295,183 @@ color ANSI):
     `cap2`.
 - **Aviso conocido:** C4244 en `main.cpp:733` (perfilador; nombre de DLL de `wchar_t` a `char`). Es inocuo y no se ha
   cambiado.
+
+## 16. C2a-1: perfilado del rasterizador CPU y viabilidad (2026-10-30, sin cambios funcionales)
+
+Base: HEAD `6054354`, vendor `b7840ea9` (32 parches), captura `cap2` (2 VSync del castillo). Banco local en
+`analysis/local/perf003/c2a1/` (no versionado): `gs_replay` enlazado contra una copia generada de `gs_cpu_backend.cpp`
+(`make_probe.py`), con sondas tras macros. Sin cambios en el vendor ni en el runtime.
+
+### 16.1 Método
+
+- **Fidelidad de las sondas (HECHO):** referencia intermedia de 32 parches = registro de los 1 681 hashes de VRAM y los
+  2 `Present` que calcula la reproducción con el `GSCpuBackend` de `ps2_runtime.lib` (SHA-256 del registro
+  `d3f437c8…`, idéntico en dos ejecuciones). Las 12 variantes de sonda producen exactamente ese registro y la VRAM
+  final `50d7bb62…`; `--force-zte` sigue dando `IDENTICAL` frente a `cap2`.
+- **Coste marginal por duplicación:** cada variante `DUP_*` repite una operación sin efecto observable (lectura a un
+  sumidero `volatile`, escritura idempotente del mismo valor, muestreo repetido) y mide la diferencia. Es un coste
+  **marginal y optimista** (la repetición encuentra la caché caliente), no un coste aislado.
+- **Tiempos:** un núcleo (afinidad 0x10), prioridad alta, sin verificación en el proceso cronometrado, orden rotatorio,
+  15 rondas × 3 reproducciones; diferencia emparejada por ronda frente a `base` (copia sin sondas). Una primera tanda
+  sin fijar afinidad dio una dispersión de ±20 % entre procesos y solo se usa como contraste.
+- **Perfil:** muestreo de hoja (20 reproducciones, 8 773 muestras) de la variante `lib`.
+
+### 16.2 Carga (HECHO, contadores de una reproducción)
+
+| | Lotes | Iteraciones de caja | Píxeles (`WritePixel`) | Escrituras FB | Lecturas Z | Muestreos | Texels leídos | CLUT |
+|---|---|---|---|---|---|---|---|---|
+| Triángulos (tristrip) | 26 815 | 7 852 457 | 973 264 (12,4 %) | 653 022 | 971 919 | 973 264 (todos bilineales de 4 taps) | 3 893 056 | 3 893 056 |
+| Sprites | 40 | — | 2 562 626 | 2 562 626 | 268 866 | 686 658 (227 906 centrados de 1 tap) | 2 062 914 | 0 |
+| Líneas, puntos | 0 | | | | | | | |
+
+- Rechazo por scissor dentro de `WritePixel`: **0** (triángulo y sprite ya recortan al scissor).
+- Mezcla: 1 813 438 píxeles; lecturas de FB: 1 884 788; escrituras de Z: 652 868; niebla: 514 220.
+- **20 estados distintos** en toda la captura; 10 suman el 96 % del tiempo y el 92 % de los píxeles.
+
+### 16.3 Tiempo (HECHO salvo donde se indica)
+
+- Por tipo (TIMEKEY, 4 reproducciones): triángulos 130 ms (59 %), sprites 92 ms (41 %) por reproducción.
+- `base` 228–243 ms de mediana según la tanda (fijado a un núcleo); `lib` − `base` = +0,5 a −1,9 ms (sin efecto de
+  enlazado ni de disposición del código).
+
+| Variante (marginal) | Δ emparejado | Rondas | Operaciones | ns por operación (ESTIMACIÓN) |
+|---|---|---|---|---|
+| `DUP_SAMPLE` | **+111,3 ms** (IQR +97..+118) | 15/15 | 1 659 922 muestreos | ~67 |
+| `DUP_FBWRITE` | +22,1 ms | 14/15 | 3 215 648 | ~7 |
+| `DUP_ZWRITE` | +12,4 ms | 14/15 | 652 868 | ~19 |
+| `DUP_EDGE` (función de borde) | +9,9 ms | 10/10 | 7 852 457 iteraciones | ~1,3 |
+| `DUP_BLEND` | +8,0 ms | 12/15 | 1 813 438 | ~4 |
+| `DUP_FBREAD` | +7,9 ms (IQR −5,5..+13,9) | 10/15 | 1 884 788 | ~4 |
+| `DUP_ZREAD` | +6,3 ms (IQR −8,9..+12,0) | 9/15 | 1 240 785 | ~5 |
+| `DISPATCH_PTR` (punteros en lugar de `std::function`; exacto) | **−35,6 ms (−15 %)** (IQR −39,9..−32,6) | 15/15 más rápido | ~15 M accesos | ~2,4 ahorrados |
+
+Perfil de hoja (`lib`): `WritePixel` 17,5 %; despacho de VRAM 24,1 % (`ReadVramUnlocked` 12,3, `_Do_call` de lectura
+5,7, `WriteVramUnlocked` 3,5, `_Do_call` de escritura 2,6); `SampleTexture` 8,3 más su lambda 6,3; `DrawTriangle`
+7,4; `combineTexture` 7,2; `lerpChannel` 5,4 más CRT 5,2 (`lround`); `LookupCLUT` 3,8; lectores y escritores con
+*swizzle* 6,6; `DrawSprite` 2,4; `bitsPerPixel` 1,0.
+
+- **INFERENCIA:** la ruta de textura (muestreo bilineal de 4 taps sobre T8/T4 con CLUT leída de VRAM en cada tap)
+  es el cuello de botella: ~45–50 % del GS. El despacho por `std::function` es el mayor coste puramente accidental.
+- **INFERENCIA:** el código caliente ocupa ~8 KB (tamaños del `.map`), cabe en la caché L1 de instrucciones; no hay
+  indicios de presión de caché de instrucciones. No se han medido fallos de predicción (sin contadores PMU).
+- **HECHO (código):** un píxel de la ruta T8 bilineal hace ~45 llamadas no inlineables: 4 × (lambda, despacho,
+  `_Do_call`, `ReadP8`, `LookupCLUT`, `ReadCT32`, `lerpChannel`, `lround`) más `combineTexture`, `WritePixel` y
+  2–4 accesos de FB/Z con despacho. Los lectores están en `ps2_gs_memory.cpp`, otra unidad sin `/GL`.
+
+### 16.4 Decisiones por píxel trasladables al lote (HECHO, código; exactas por construcción)
+
+Decodificación de `TEST`, `ALPHA`, `FRAME`, `ZBUF`, `TEX0`, `CLAMP` y `TEXCLUT`; `framePageBaseToBlock`;
+`bitsPerPixel` (llamada fuera de línea, dos veces por píxel); test de scissor de `WritePixel` (0 rechazos medidos);
+selección de lector y escritor por PSM; `resolveClutIndex` (CSM/CSA); `switch` de TFX en `combineTexture`; modo de
+envoltura; `iip`/`tme`/`fst` en el bucle del triángulo.
+
+### 16.5 Estrategias
+
+| | Potencial (ESTIMACIÓN salvo B1) | Complejidad | Riesgo de fidelidad |
+|---|---|---|---|
+| A. Mantener | 0 | 0 | 0 |
+| B. Punteros a función por lote | **B1 medido: −15 %**; con selección por lote de lector FB/Z/texel, −15 a −20 % | Baja: 1 cabecera privada (2 unidades del runtime, ninguna del código generado) | Nulo: mismas funciones, mismos argumentos |
+| C. Plantillas y variantes precompiladas | −35 a −50 % (ESTIMACIÓN; elimina la mayoría de llamadas si los lectores se exponen inline) | Alta: combinatoria de 20 estados, ruta genérica de respaldo, tamaño de código | Medio: misma aritmética, pero muchas rutas que validar |
+| D. Estado invariante precalculado | −5 a −10 % (ESTIMACIÓN; parte del 17,5 % de `WritePixel` y de la decodificación de textura) | Media | Bajo, si la ruta general queda como oráculo |
+
+Técnicas de PCSX2 (§14.3) relevantes: clave de selector por draw (C/D), tablas de direcciones por fila y columna, CLUT
+expandida por draw, relleno rápido de sprites. Su bilineal entero no es reutilizable si se exige igualdad de bits.
+
+Otras oportunidades medidas o acotadas, para fases posteriores:
+- caché de CLUT por lote (3,9 M lecturas de CLUT; requiere invalidación si el lote escribe sobre la CLUT);
+- `lround` inline en `lerpChannel` (CRT 5,2 %; exige prueba exhaustiva de equivalencia en [0, 256));
+- recorrido por intervalos en lugar de caja (~9 ms medidos, ~4 %).
+
+### 16.6 Observación fuera de alcance
+
+El runtime lee la CLUT de VRAM en cada muestreo. El GS real la carga en su búfer de CLUT según `TEX0.CLD`. Si un
+juego reescribe la zona de CLUT en VRAM sin recargarla, los resultados pueden diferir del hardware. No investigado;
+no afecta a la equivalencia con la línea base.
+
+## 17. C2a-2: prototipo de despacho de VRAM con punteros a función (2026-10-30, experimento local, sin integrar)
+
+Base A: vendor `b7840ea9` (32 parches). Prototipo B: el mismo vendor con un único cambio en
+`gs_cpu_backend.h` (cabecera privada del backend): los alias `ReadVramFunc`/`WriteVramFunc` pasan de `std::function`
+a punteros a función con las mismas firmas. El constructor, `ReadVramUnlocked`, `WriteVramUnlocked` y los lectores
+no cambian. Evidencia local en `analysis/local/perf003/c2a2/` (ejecutables A y B congelados, registros y propuesta).
+
+### 17.1 Revisión del cambio (HECHO)
+
+- Las tablas solo se rellenan en el constructor con funciones libres de `GSMem` (sin capturas) y solo se llaman en
+  `ReadVramUnlocked`/`WriteVramUnlocked`. Las 64 entradas se rellenan siempre (por defecto `ReadNull`/`WriteNull`), así
+  que la diferencia de un `std::function` vacío (`bad_function_call`) frente a un puntero nulo no puede darse.
+- Compilación incremental: solo `gs_cpu_backend.cpp` y `gs_frontend.cpp` (más `gs_replay` y el driver local, que
+  incluyen la cabecera); ninguna unidad de `recomp/generated`; sin avisos nuevos.
+- En el `.map` de B ya no hay instancias de `_Func_impl_no_alloc` en `gs_cpu_backend.obj` (13 en A).
+
+### 17.2 Fidelidad (HECHO)
+
+- Registro intermedio de la reproducción de `cap2` (1 681 hashes de VRAM y 2 `Present`): `d3f437c8…`, idéntico en A
+  y en dos ejecuciones de B; VRAM final `50d7bb62…`; `--force-zte` `IDENTICAL` con el driver local y con
+  `gs_replay`.
+- `ps2x_tests`: 481 pruebas y los mismos 24 fallos (identidad y mensajes); las 11 de ZTE superadas; `ctest` 1/1.
+- Con el parche diagnóstico de GS-1/GS-2 aplicado temporalmente: 483 pruebas y 26 fallos, idénticos a la referencia
+  de E3-A (mismos mensajes de las dos sondas).
+
+### 17.3 Rendimiento (HECHO; banco de GS Replay, no tiempo del juego)
+
+Un núcleo (afinidad 0x10), prioridad alta, sin verificación, 4 reproducciones por proceso con la primera descartada
+como calentamiento, orden A/B alterno por ronda.
+
+| Medida | A | B | Diferencia emparejada |
+|---|---|---|---|
+| Backend por reproducción de `cap2` (2 VSync), 21 rondas | 235,8 ms (IQR 227,9–244,9) | 203,5 ms (IQR 196,5–216,2) | **−30,9 ms**; por ronda **−13,6 %** (cuartiles −15,6 / −9,1; mín. −19,1, máx. −3,2); B más rápido en 21/21; ≥ 10 % en 15/21 |
+| Variante con tiempo por lote, 11 rondas | 247,5 ms | 215,8 ms | −31,5 ms (IQR −32,4..−30,8), −12,7 % |
+| Triángulos (por reproducción) | 129,5 ms | 114,8 ms | −14,7 ms (−11 %) |
+| Sprites (por reproducción) | 90,7 ms | 76,0 ms | −14,7 ms (−16 %) |
+
+- El prototipo da algo menos que la sonda de C2a-1 (−35,6 ms, −15 %), dentro de la variación entre tandas.
+- **No extrapolable directamente al juego:** el ahorro es del rasterizador aislado en una ventana del castillo.
+
+### 17.4 Propuesta local de parche 33
+
+`analysis/local/perf003/c2a2/PERF_003_gs_vram_dispatch_function_pointers.patch.proposal` (SHA-256 `429f1eb7…`,
+LF). Aplicada con el procedimiento del pipeline sobre los 32 parches da el árbol `0b6a5eb7…` y el commit sintético
+`614c0eee…`. No está en `patches/` ni en el lock. El vendor se ha devuelto a `b7840ea9` y el árbol de compilación se
+ha recompilado de forma incremental a A.
+
+## 18. C2a-2: integración local del parche 33 (2026-10-30, sin commit)
+
+Se integra el prototipo de §17 como parche 33, `patches/PERF_003_gs_vram_dispatch_function_pointers.patch`
+(SHA-256 `429f1eb778ed78aac653c8ea8def48e4586e760f53def9fb2845fb350ba08121`), idéntico a la propuesta. Se añade
+al lock y a `patches/README.md`; los parches 1–32 no cambian. Evidencia local en `analysis/local/perf003/c2a2/int33/`.
+
+### 18.1 Reconstrucción (HECHO)
+
+- Copia limpia de upstream `14b1e5cb` con los 33 parches del lock: árbol `0b6a5eb7…`, `patched_commit`
+  `614c0eee0b3b52b8e55dca7dc0b35999a2ecbd62`, los previstos en §17.4. El vendor está en ese commit, limpio, y
+  `pipeline.upstream()` y la verificación de hashes de los 33 parches pasan.
+- Compilación incremental: `gs_cpu_backend.cpp` y `gs_frontend.cpp` (más `gs_replay` y el banco local); ninguna
+  unidad de `recomp/generated`; sin avisos nuevos. En el `.map` no queda ninguna instancia de `std::function` en
+  `gs_cpu_backend.obj` (13 con 32 parches).
+
+### 18.2 Fidelidad (HECHO)
+
+- `ps2x_tests`: 481 pruebas, los mismos 24 fallos con los mismos mensajes (14 `Error`, 10 `Failed`); las 11 de
+  `PS2GSDepthTestEnable` superadas; `ctest` de GS Replay 1/1.
+- Reproducción de `cap2` (dos veces): registro de 1 681 hashes y 2 `Present` `d3f437c8…`, idéntico byte a byte a la
+  referencia de 32 parches; VRAM final `50d7bb62…` con el driver local y con `gs_replay`; `--force-zte` `IDENTICAL`
+  (0 divergencias) con ambos.
+- Sondas GS-1/GS-2 aplicadas temporalmente: 483 pruebas, 26 fallos, idénticos a la referencia de E3-A; las dos sondas
+  siguen fallando con los mismos mensajes. Retiradas después.
+
+### 18.3 Rendimiento (HECHO; banco de GS Replay, no tiempo del juego)
+
+A: ejecutables congelados de §17 (vendor reconstruido con 32 parches). B: vendor reconstruido con 33 parches. Mismo
+procedimiento que §17.3.
+
+| Medida | A | B | Diferencia emparejada |
+|---|---|---|---|
+| Backend por reproducción de `cap2` (2 VSync), 21 rondas | 233,9 ms (IQR 231,2–237,4) | 202,0 ms (IQR 199,8–206,5) | **−31,0 ms** (IQR −32,7..−28,6); por ronda **−13,3 %** (cuartiles −14,4 / −12,2); B más rápido en 20/21; ≥ 10 % en 20/21 |
+| Variante con tiempo por lote, 11 rondas | 224,4 ms | 194,2 ms | −28,1 ms (IQR −32,0..−26,9), −13,4 %; 11/11 |
+| Triángulos (por reproducción) | 132,2 ms | 117,2 ms | −15,0 ms (−11,3 %) |
+| Sprites (por reproducción) | 92,2 ms | 77,9 ms | −14,3 ms (−15,5 %) |
+
+- Una ronda (+9,5 %) es un atípico de B (máximo 256,6 ms frente a una mediana de 202,0); el resto está entre −10,7 y
+  −19,2 %. Se reproduce la ganancia de §17.3 (−13,6 %).
+- **No extrapolable directamente al juego.**

@@ -1,0 +1,17 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 71e80324fb483dbea75df8bda9d1ccb682ca62e9..7e4cf06f5b82e53125cf3735eaa09ab5dff31083 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -58,8 +58,10 @@ private:
+                              uint32_t sourceOriginX,
+                              uint32_t sourceOriginY) const;
+ 
+-    using WriteVramFunc = std::function<void(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)>;
+-    using ReadVramFunc = std::function<uint32_t(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t)>;
++    // Plain function pointers: every slot holds a free GSMem accessor (see the constructor), and a std::function
++    // wrapper added a second indirect call to each VRAM access.
++    using WriteVramFunc = void (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
++    using ReadVramFunc = uint32_t (*)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t);
+ 
+     static constexpr size_t kPsmHandlerCount = 1u << 6u;
+     mutable std::mutex m_mutex;
