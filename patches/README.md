@@ -712,3 +712,26 @@ arriba). Los diecinueve patches actualmente activos:
       - serie A/B/B/A en los VSync 27000–27500, con la misma carga: VU1 de 95,4 a 83,1 ms por VSync; relación
         VU1/(PATH1+resto) de 0,813 a 0,725; +5,2 % de VSync/s frente a la A con los mismos controles.
       Documentación: `analysis/notes/PERF_002_CASTLE_BASELINE.md`, sección 13.
+
+32. `PERF_003_gs_zte_depth_test_enable.patch` (convención B). Fidelidad del GS: el rasterizador CPU ignoraba
+    `TEST.ZTE`. Con `ZTE=0`, el test de profundidad está desactivado: todos los píxeles pasan, contenga lo que contenga
+    ZTST, y no se escribe el Z-buffer (manual del GS; en PCSX2, `GSState::FlushPrim` y `GSRendererSW` fuerzan ZTST
+    ALWAYS y enmascaran la Z).
+    - Antes, ZTST=NEVER descartaba el dibujo aunque ZTE fuera 0, y con otros ZTST se escribía la Z.
+    - `ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp`, `WritePixel`: con `ZTE=0`, el método es ALWAYS y no se escribe
+      la Z. No hay casos especiales para DMC ni cambios en VU, GIF, DMA, texturas, lectores de VRAM ni temporización.
+    - Tests: 11 en `PS2GSDepthTestEnable`, con expectativas del manual y de PCSX2:
+      - ZTE=0 con los cuatro ZTST; ZTE=1 con NEVER, ALWAYS, GEQUAL y GREATER;
+      - ZMSK, FBMSK, AFAIL y DATE;
+      - conservación de la Z en sprite, triángulo y línea;
+      - formatos Z32, Z24, Z16 y Z16S, y bits no escribibles de CT24.
+      - Sin la corrección fallan 3. Suite: 481 tests, los mismos 24 fallos preexistentes.
+    - Validación con GS Replay (captura del castillo `cap2`, VSync 27100–27101):
+      - con ZTE forzado a 1, coincide con la captura;
+      - la primera divergencia es el primer lote con ZTE=0 (sprite, `TEST=0x1003`);
+      - la imagen presentada es idéntica; la VRAM final difiere en 392 bytes, todos de alfa, y nunca en la profundidad;
+      - es determinista.
+      - En DMC son 16 lotes por cada 2 VSync que componen un oscurecimiento sustractivo (en esta ventana vale 0).
+    - Coste: +8–10 % del tiempo del GS en esa captura, concentrado en esos 16 lotes.
+    - No corrige el recorte de Z al máximo del formato ni el DATE con framebuffer CT24, que se registran aparte.
+      Documentación: `analysis/notes/PERF_003_ARCHITECTURE_FEASIBILITY.md`, sección 15.
