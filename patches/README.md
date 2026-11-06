@@ -712,3 +712,60 @@ arriba). Los diecinueve patches actualmente activos:
       - serie A/B/B/A en los VSync 27000–27500, con la misma carga: VU1 de 95,4 a 83,1 ms por VSync; relación
         VU1/(PATH1+resto) de 0,813 a 0,725; +5,2 % de VSync/s frente a la A con los mismos controles.
       Documentación: `analysis/notes/PERF_002_CASTLE_BASELINE.md`, sección 13.
+
+32. `PERF_003_gs_zte_depth_test_enable.patch` (convención B). Fidelidad del GS: el rasterizador CPU ignoraba
+    `TEST.ZTE`. Con `ZTE=0`, el test de profundidad está desactivado: todos los píxeles pasan, contenga lo que contenga
+    ZTST, y no se escribe el Z-buffer (manual del GS; en PCSX2, `GSState::FlushPrim` y `GSRendererSW` fuerzan ZTST
+    ALWAYS y enmascaran la Z).
+    - Antes, ZTST=NEVER descartaba el dibujo aunque ZTE fuera 0, y con otros ZTST se escribía la Z.
+    - `ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp`, `WritePixel`: con `ZTE=0`, el método es ALWAYS y no se escribe
+      la Z. No hay casos especiales para DMC ni cambios en VU, GIF, DMA, texturas, lectores de VRAM ni temporización.
+    - Tests: 11 en `PS2GSDepthTestEnable`, con expectativas del manual y de PCSX2:
+      - ZTE=0 con los cuatro ZTST; ZTE=1 con NEVER, ALWAYS, GEQUAL y GREATER;
+      - ZMSK, FBMSK, AFAIL y DATE;
+      - conservación de la Z en sprite, triángulo y línea;
+      - formatos Z32, Z24, Z16 y Z16S, y bits no escribibles de CT24.
+      - Sin la corrección fallan 3. Suite: 481 tests, los mismos 24 fallos preexistentes.
+    - Validación con GS Replay (captura del castillo `cap2`, VSync 27100–27101):
+      - con ZTE forzado a 1, coincide con la captura;
+      - la primera divergencia es el primer lote con ZTE=0 (sprite, `TEST=0x1003`);
+      - la imagen presentada es idéntica; la VRAM final difiere en 392 bytes, todos de alfa, y nunca en la profundidad;
+      - es determinista.
+      - En DMC son 16 lotes por cada 2 VSync que componen un oscurecimiento sustractivo (en esta ventana vale 0).
+    - Coste: +8–10 % del tiempo del GS en esa captura, concentrado en esos 16 lotes.
+    - No corrige el recorte de Z al máximo del formato ni el DATE con framebuffer CT24, que se registran aparte.
+      Documentación: `analysis/notes/PERF_003_ARCHITECTURE_FEASIBILITY.md`, sección 15.
+
+33. `PERF_003_gs_vram_dispatch_function_pointers.patch` (convención B). Rendimiento del GS, sin cambio de
+    comportamiento: las tablas de acceso a VRAM por PSM del rasterizador CPU (`m_readVramFuncs`/`m_writeVramFuncs`)
+    pasan de `std::function` a punteros a función con las mismas firmas.
+    - `ps2xRuntime/include/runtime/gs/gs_cpu_backend.h`: solo cambian los alias `ReadVramFunc`/`WriteVramFunc`. El
+      constructor las sigue rellenando con las mismas funciones libres de `GSMem` (las 64 entradas, con
+      `ReadNull`/`WriteNull` por defecto), y `ReadVramUnlocked`/`WriteVramUnlocked`, los lectores, el *swizzle*, el
+      muestreo, la CLUT, la mezcla y `WritePixel` no cambian. Se elimina la segunda llamada indirecta de
+      `std::function` en cada acceso.
+    - La cabecera solo la incluyen `gs_cpu_backend.cpp`, `gs_frontend.cpp` y `tools/gs_replay`; ninguna unidad de
+      `recomp/generated`.
+    - Validación: suite de 481 tests con los mismos 24 fallos; las 11 de ZTE superadas; GS Replay de `cap2` con los
+      1 681 hashes intermedios, los 2 `Present` y la VRAM final idénticos a los 32 parches; `--force-zte` sigue dando
+      `IDENTICAL`.
+    - Coste: unos −31 ms (−13 %) del tiempo del rasterizador por reproducción de `cap2` (2 VSync), medido en el banco
+      de GS Replay; no es tiempo del juego.
+      Documentación: `analysis/notes/PERF_003_ARCHITECTURE_FEASIBILITY.md`, secciones 16 a 18.
+34. `GS4_prot3w_lwu_r5900_semantics.patch` (convención B). Semántica del generador, cambio general:
+    - `ps2xRecomp/src/lib/mmi_translation_helpers.cpp` y `ps2xRuntime/include/ps2_runtime_macros.h`: `PROT3W` rotaba
+      las cuatro palabras (`_MM_SHUFFLE(0,3,2,1)`); el R5900 rota las tres inferiores y conserva la palabra 3
+      (`{w1, w2, w0, w3}`, `_MM_SHUFFLE(3,0,2,1)`, como PCSX2). La macro no tiene usos en el código generado; se corrige
+      igualmente.
+    - `ps2xRecomp/src/lib/instruction_translator.cpp`: `LWU` se emitía con `SET_GPR_U32` (extensión de signo); ahora
+      extiende con ceros los 64 bits bajos y deja intactos los 64 altos, como PCSX2 y con el mismo efecto que el
+      arreglo upstream #244.
+    - Pruebas nuevas en `ps2xTest` (`code_generator_tests.cpp`, `ps2_runtime_expansion_tests.cpp`): cadena emitida y
+      semántica de ambas instrucciones, incluida la secuencia `lwu`/`or`/`prot3w` de `Morph_sub_h`.
+    - Efecto en DMC: el búfer facial que monta `Morph_sub_h` dejaba vértices desplazados o NaN (cuñas naranjas de
+      GS-4 y huecos en la cara). En el código EE cambian 270 ficheros: 1 224 líneas `LWU` y 7 `PROT3W`.
+    - Validación: suite de 483 tests con los mismos 24 fallos y las 2 nuevas superadas; auditoría de flujo de datos de
+      las 1 224 `LWU` y arnés diferencial; corridas del castillo sin las cuñas; moteado de 27240 idéntico con y sin el
+      parche.
+    - Coste: cambia `ps2_runtime_macros.h`, así que recompila todo el código generado (~10 000 objetos).
+      Documentación: `analysis/notes/PERF_003_ARCHITECTURE_FEASIBILITY.md`, secciones 24 a 27.

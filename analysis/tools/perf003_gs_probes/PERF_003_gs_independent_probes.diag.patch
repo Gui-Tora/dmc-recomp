@@ -1,0 +1,45 @@
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 92207544a2575ed1da01901b1f26f0e112354bcf..90084a8ae7a4bb855c666cedf9887fe2686012fd 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -5558,4 +5558,40 @@ void register_ps2_gs_tests()
+                      "CT16, ZTE=0: 16-bit colour written, neighbours and depth kept");
+         });
+     });
++
++    // Probes for depth/destination-alpha behaviour that is independent of TEST.ZTE. Expectations come from PCSX2
++    // (GSRendererSW: zclamp against the Z format maximum; DATE on a 24-bit frame skips the draw, verified on PS2
++    // according to the PCSX2 comment). Kept separate so a failure here is not read as a ZTE regression.
++    MiniTest::Case("PS2GSDepthIndependentProbes", [](TestCase &tc)
++    {
++        constexpr uint64_t kZte = 1ull << 16;
++        auto ztst = [](uint64_t v) { return v << 17; };
++
++        tc.Run("depth_is_clamped_to_the_z_format_maximum", [&](TestCase &t)
++        {
++            RawSetup z16;
++            z16.zpsmField = 2u;
++            z16.presetZ = 0x0000u;
++            const RawResult w16 = drawRaw(z16, {{kZte | ztst(1), 0x12345u}});
++            t.Equals(w16.z, 0xFFFFu, "Z16: depth 0x12345 is stored as 0xFFFF");
++            z16.presetZ = 0xFFFFu;
++            const RawResult ge16 = drawRaw(z16, {{kZte | ztst(2), 0x10000u}});
++            t.Equals(ge16.z, 0xFFFFu, "Z16 GEQUAL: 0x10000 clamps to 0xFFFF, passes, stores 0xFFFF");
++            RawSetup z24;
++            z24.zpsmField = 1u;
++            z24.presetZ = 0xAB000000u;
++            const RawResult w24 = drawRaw(z24, {{kZte | ztst(1), 0x01234567u}});
++            t.Equals(w24.z, 0xABFFFFFFu, "Z24: depth 0x01234567 is stored as 0xFFFFFF");
++        });
++
++        tc.Run("date_on_a_24bit_frame_skips_the_draw", [&](TestCase &t)
++        {
++            RawSetup ct24;
++            ct24.fpsm = GS_PSM_CT24;
++            ct24.presetFrame = 0xAB223344u;
++            ct24.presetZ = 0x50u;
++            const RawResult r = drawRaw(ct24, {{kZte | ztst(1) | (1ull << 14)}});
++            t.IsTrue(r.frame == 0xAB223344u && r.z == 0x50u, "CT24 + DATE: neither colour nor depth is written");
++        });
++    });
+ }

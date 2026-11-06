@@ -127,6 +127,18 @@
     {
       "path": "patches/PERF_002_vu1_exactflags_signbit.patch",
       "sha256": "170b67176df8f333434e5da73e4fc27cef42113d7f704cbf78b5b7d8105679d7"
+    },
+    {
+      "path": "patches/PERF_003_gs_zte_depth_test_enable.patch",
+      "sha256": "4f79c093edf6fe9d92ab195e319ec10f7f3e0a1047ae9063ddde3c3732f4944b"
+    },
+    {
+      "path": "patches/PERF_003_gs_vram_dispatch_function_pointers.patch",
+      "sha256": "429f1eb778ed78aac653c8ea8def48e4586e760f53def9fb2845fb350ba08121"
+    },
+    {
+      "path": "patches/GS4_prot3w_lwu_r5900_semantics.patch",
+      "sha256": "4b1769b1006045573c50cc72715bcba6437aaa1b41f79bad1fbafe38d703dd9f"
     }
   ],
   "patch_identity": {
@@ -135,5 +147,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "dfa856e76663479a38de583cd2b3e3e5ad1a1be9"
+  "patched_commit": "ea54616dd3a3d0e5ab099d9150335fbdc27e1db7"
 }

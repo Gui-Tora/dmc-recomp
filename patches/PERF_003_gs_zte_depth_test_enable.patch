@@ -1,0 +1,369 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index d88dd6f925b22c5b0eed3eaad2d22a8412678917..cde253611e6fe4d1d2b55b47c90f42e3fa81710d 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -801,7 +801,10 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         return;
+     }
+ 
+-    const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
++    // TEST.ZTE = 0 turns the depth test off: every pixel passes whatever ZTST holds and the depth buffer is not
++    // written (GS manual; PCSX2 forces ZTST to ALWAYS and masks Z writes when ZTE = 0).
++    const bool depthTestEnabled = ((ctx.test >> 16) & 1u) != 0u;
++    const uint32_t ztestMethod = depthTestEnabled ? static_cast<uint32_t>((ctx.test >> 17) & 3u) : 1u;
+     const bool alphaBlendEnabled = state.prim.abe;
+     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
+     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
+@@ -930,7 +933,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
+     }
+ 
+-    if (writeMask.writeDepth && !ctx.zbuf.zmask)
++    if (writeMask.writeDepth && !ctx.zbuf.zmask && depthTestEnabled)
+     {
+         WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
+     }
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 1c02ff41d03c8f39b73f8c48f28fab6b413f17a0..92207544a2575ed1da01901b1f26f0e112354bcf 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -460,6 +460,90 @@ namespace
+             gs.ReadVram(GS_PSM_Z32, kDepthBlock, 1u, 0u, 0u),
+         };
+     }
++
++    // Depth-test helpers: frame at block 0, depth at block 512, both 64 pixels wide. Words are preset and read back
++    // raw through the storage layout of the format (CT32 for 32/24-bit frames, Z32 for Z32/Z24 depth) so that bits
++    // a format cannot write are observable. (9, 9) lies inside every primitive drawn, (20, 20) outside all of them.
++    struct RawSetup
++    {
++        uint32_t fpsm = GS_PSM_CT32;
++        uint32_t presetFrame = 0x11223344u;
++        uint32_t fbmsk = 0u;
++        uint32_t zpsmField = 0u;
++        bool zmsk = false;
++        uint32_t presetZ = 0xFFFFu;
++    };
++
++    struct RawDraw
++    {
++        uint64_t test = 0u;
++        uint32_t z = 0x100u;
++        uint32_t prim = GS_PRIM_SPRITE;
++        uint32_t red = 0xAAu;
++    };
++
++    struct RawResult
++    {
++        uint32_t frame;
++        uint32_t z;
++        uint32_t frameOutside;
++        uint32_t zOutside;
++    };
++
++    uint32_t to5551(uint32_t rgba)
++    {
++        return ((rgba >> 3) & 0x1Fu) | (((rgba >> 11) & 0x1Fu) << 5) | (((rgba >> 19) & 0x1Fu) << 10) |
++               ((rgba & 0x80000000u) ? 0x8000u : 0u);
++    }
++
++    RawResult drawRaw(const RawSetup &s, const std::vector<RawDraw> &draws)
++    {
++        constexpr uint32_t kZbp = 16u;
++        std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++        GS gs;
++        gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++        const uint32_t frameStorage = (s.fpsm == GS_PSM_CT24) ? static_cast<uint32_t>(GS_PSM_CT32) : s.fpsm;
++        const uint32_t zpsm = s.zpsmField | 0x30u;
++        const uint32_t zStorage = (zpsm == GS_PSM_Z24) ? static_cast<uint32_t>(GS_PSM_Z32) : zpsm;
++        for (uint32_t c : {9u, 20u})
++        {
++            gs.WriteVram(frameStorage, 0u, 1u, c, c, s.presetFrame);
++            gs.WriteVram(zStorage, kZbp << 5u, 1u, c, c, s.presetZ);
++        }
++        gs.writeRegister(GS_REG_FRAME_1, (1ull << 16) | (static_cast<uint64_t>(s.fpsm) << 24) |
++                                             (static_cast<uint64_t>(s.fbmsk) << 32));
++        gs.writeRegister(GS_REG_ZBUF_1, kZbp | (static_cast<uint64_t>(s.zpsmField) << 24) | ((s.zmsk ? 1ull : 0ull) << 32));
++        gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
++        gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
++        for (const RawDraw &d : draws)
++        {
++            gs.writeRegister(GS_REG_TEST_1, d.test);
++            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(d.prim));
++            gs.writeRegister(GS_REG_RGBAQ, d.red | (0xBBull << 8) | (0xCCull << 16) | (0x80ull << 24) | (0x3F800000ull << 32));
++            const auto xyz = [&](uint64_t x, uint64_t y)
++            {
++                gs.writeRegister(GS_REG_XYZ2, (x * 16) | ((y * 16) << 16) | (static_cast<uint64_t>(d.z) << 32));
++            };
++            if (d.prim == GS_PRIM_TRIANGLE)
++            {
++                xyz(8, 8);
++                xyz(16, 8);
++                xyz(8, 16);
++            }
++            else if (d.prim == GS_PRIM_LINE)
++            {
++                xyz(8, 9);
++                xyz(14, 9);
++            }
++            else
++            {
++                xyz(8, 8);
++                xyz(12, 12);
++            }
++        }
++        return {gs.ReadVram(frameStorage, 0u, 1u, 9u, 9u), gs.ReadVram(zStorage, kZbp << 5u, 1u, 9u, 9u),
++                gs.ReadVram(frameStorage, 0u, 1u, 20u, 20u), gs.ReadVram(zStorage, kZbp << 5u, 1u, 20u, 20u)};
++    }
+ }
+ 
+ void register_ps2_gs_tests()
+@@ -5230,4 +5314,248 @@ void register_ps2_gs_tests()
+                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+         });
+     });
++
++    MiniTest::Case("PS2GSDepthTestEnable", [](TestCase &tc)
++    {
++        // Expected behaviour from the GS manual and PCSX2 (GSState::FlushPrim, GSRendererSW): TEST.ZTE = 0 means
++        // the depth test is off (every pixel passes, whatever ZTST holds) and the depth buffer is not written; a
++        // draw is discarded by depth only with ZTE = 1 and ZTST = NEVER. One 4x4 sprite over pixel (9, 9) of a
++        // 64-wide CT32 frame; colour and depth are read back at (9, 9).
++        struct Result
++        {
++            uint32_t color;
++            uint32_t z;
++        };
++        static const auto draw = [](uint64_t test, uint32_t zpsmField, bool zmsk, uint32_t presetZ, uint32_t drawZ,
++                                    uint32_t fbmsk = 0u) -> Result
++        {
++            constexpr uint32_t kFbp = 0u, kZbp = 16u, kSentinel = 0x11223344u;
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            const uint32_t zpsm = zpsmField | 0x30u;
++            writeReferenceFramePSMCT32Pixel(vram, kFbp, 1u, 9u, 9u, kSentinel);
++            gs.WriteVram(zpsm, kZbp << 5u, 1u, 9u, 9u, presetZ);
++            gs.writeRegister(GS_REG_FRAME_1, kFbp | (1ull << 16) | (static_cast<uint64_t>(fbmsk) << 32));
++            gs.writeRegister(GS_REG_ZBUF_1, kZbp | (static_cast<uint64_t>(zpsmField) << 24) | ((zmsk ? 1ull : 0ull) << 32));
++            gs.writeRegister(GS_REG_SCISSOR_1, (0ull << 0) | (63ull << 16) | (0ull << 32) | (63ull << 48));
++            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
++            gs.writeRegister(GS_REG_TEST_1, test);
++            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
++            gs.writeRegister(GS_REG_RGBAQ, 0xAAull | (0xBBull << 8) | (0xCCull << 16) | (0x80ull << 24) | (0x3F800000ull << 32));
++            gs.writeRegister(GS_REG_XYZ2, (8ull * 16) | ((8ull * 16) << 16) | (static_cast<uint64_t>(drawZ) << 32));
++            gs.writeRegister(GS_REG_XYZ2, (12ull * 16) | ((12ull * 16) << 16) | (static_cast<uint64_t>(drawZ) << 32));
++            return {readReferenceFramePSMCT32Pixel(vram, kFbp, 1u, 9u, 9u), gs.ReadVram(zpsm, kZbp << 5u, 1u, 9u, 9u)};
++        };
++        constexpr uint32_t kDrawn = 0x80CCBBAAu, kSentinel = 0x11223344u;
++        constexpr uint64_t kZte = 1ull << 16;
++        auto ztst = [](uint64_t v) { return v << 17; };
++
++        tc.Run("zte0_draws_colour_and_keeps_depth_for_every_ztst", [&](TestCase &t)
++        {
++            for (uint64_t method = 0; method < 4; ++method)
++            {
++                // Stored depth above the drawn one: GEQUAL/GREATER would reject the pixel if they were applied.
++                const Result r = draw(ztst(method), 0u, false, 0xFFFFu, 0x100u);
++                t.Equals(r.color, kDrawn, "ZTE=0: the colour is written whatever ZTST holds (ZTST=" + std::to_string(method) + ")");
++                t.Equals(r.z, 0xFFFFu, "ZTE=0: the depth buffer is not written (ZTST=" + std::to_string(method) + ")");
++            }
++        });
++
++        tc.Run("zte1_never_writes_nothing", [&](TestCase &t)
++        {
++            const Result r = draw(kZte | ztst(0), 0u, false, 0x50u, 0x100u);
++            t.Equals(r.color, kSentinel, "ZTE=1, NEVER: no colour write");
++            t.Equals(r.z, 0x50u, "ZTE=1, NEVER: no depth write");
++        });
++
++        tc.Run("zte1_always_writes_colour_and_depth_unless_zmsk", [&](TestCase &t)
++        {
++            const Result r = draw(kZte | ztst(1), 0u, false, 0x50u, 0x100u);
++            t.Equals(r.color, kDrawn, "ZTE=1, ALWAYS: colour written");
++            t.Equals(r.z, 0x100u, "ZTE=1, ALWAYS: depth written");
++            const Result m = draw(kZte | ztst(1), 0u, true, 0x50u, 0x100u);
++            t.Equals(m.color, kDrawn, "ZTE=1, ALWAYS, ZMSK: colour written");
++            t.Equals(m.z, 0x50u, "ZTE=1, ALWAYS, ZMSK: depth kept");
++        });
++
++        tc.Run("zte1_gequal_and_greater_limits", [&](TestCase &t)
++        {
++            const Result ge = draw(kZte | ztst(2), 0u, false, 0x100u, 0x100u);
++            t.IsTrue(ge.color == kDrawn && ge.z == 0x100u, "GEQUAL: equal depth passes");
++            const Result geFail = draw(kZte | ztst(2), 0u, false, 0x100u, 0xFFu);
++            t.IsTrue(geFail.color == kSentinel && geFail.z == 0x100u, "GEQUAL: smaller depth fails, nothing written");
++            const Result gt = draw(kZte | ztst(3), 0u, false, 0x100u, 0x100u);
++            t.IsTrue(gt.color == kSentinel && gt.z == 0x100u, "GREATER: equal depth fails");
++            const Result gtPass = draw(kZte | ztst(3), 0u, false, 0x100u, 0x101u);
++            t.IsTrue(gtPass.color == kDrawn && gtPass.z == 0x101u, "GREATER: larger depth passes and is written");
++        });
++
++        tc.Run("zte_interactions_with_alpha_test_and_masks", [&](TestCase &t)
++        {
++            // ATE=1, ATST=NEVER, AFAIL=FB_ONLY with ZTE=0 (TEST=0x1001): the alpha test fails, the frame is written.
++            const Result fbOnly = draw(0x1001ull, 0u, false, 0xFFFFu, 0x100u);
++            t.Equals(fbOnly.color, kDrawn, "ZTE=0 + AFAIL=FB_ONLY: colour written");
++            t.Equals(fbOnly.z, 0xFFFFu, "ZTE=0 + AFAIL=FB_ONLY: depth not written");
++            // AFAIL=ZB_ONLY with ZTE=1/ALWAYS: only depth; with ZTE=0: nothing (depth writes are off).
++            const Result zbOnly = draw(kZte | ztst(1) | 0x2001ull, 0u, false, 0x50u, 0x100u);
++            t.IsTrue(zbOnly.color == kSentinel && zbOnly.z == 0x100u, "ZTE=1 + AFAIL=ZB_ONLY: depth only");
++            const Result zbOnlyOff = draw(0x2001ull, 0u, false, 0x50u, 0x100u);
++            t.IsTrue(zbOnlyOff.color == kSentinel && zbOnlyOff.z == 0x50u, "ZTE=0 + AFAIL=ZB_ONLY: nothing written");
++            // FBMSK still applies with ZTE=0.
++            const Result masked = draw(ztst(0), 0u, false, 0xFFFFu, 0x100u, 0xFF000000u);
++            t.Equals(masked.color, (kDrawn & 0x00FFFFFFu) | (kSentinel & 0xFF000000u), "ZTE=0 + FBMSK: masked bits kept");
++        });
++
++        tc.Run("zte_depth_formats", [&](TestCase &t)
++        {
++            struct Format
++            {
++                uint32_t field;
++                const char *name;
++            } formats[] = {{0u, "Z32"}, {1u, "Z24"}, {2u, "Z16"}, {0xAu, "Z16S"}};
++            for (const Format &f : formats)
++            {
++                const Result on = draw(kZte | ztst(2), f.field, false, 0x1200u, 0x1234u);
++                t.IsTrue(on.color == kDrawn && on.z == 0x1234u, std::string(f.name) + ": ZTE=1 GEQUAL passes and writes depth");
++                const Result fail = draw(kZte | ztst(2), f.field, false, 0x1234u, 0x1200u);
++                t.IsTrue(fail.color == kSentinel && fail.z == 0x1234u, std::string(f.name) + ": ZTE=1 GEQUAL rejects a smaller depth");
++                const Result off = draw(ztst(2), f.field, false, 0x1234u, 0x1200u);
++                t.IsTrue(off.color == kDrawn && off.z == 0x1234u, std::string(f.name) + ": ZTE=0 draws and keeps depth");
++            }
++        });
++
++        // Raw-word variant: frame and depth words are preset and read back through their storage layout (CT32 for
++        // 32/24-bit frames, Z32 for Z32/Z24 buffers) so bits a format cannot write stay visible. Pixel (20, 20) is
++        // never covered and checks that nothing leaks outside the primitive.
++        tc.Run("zte0_destination_alpha_test", [&](TestCase &t)
++        {
++            constexpr uint64_t kDate = 1ull << 14, kDatm = 1ull << 15;
++            const RawResult pass = drawRaw({}, {{kDate}});
++            t.IsTrue(pass.frame == kDrawn && pass.z == 0xFFFFu, "ZTE=0 + DATE, DATM=0, dest alpha 0: drawn, depth kept");
++            const RawResult fail = drawRaw({}, {{kDate | kDatm}});
++            t.IsTrue(fail.frame == kSentinel && fail.z == 0xFFFFu, "ZTE=0 + DATE, DATM=1, dest alpha 0: rejected");
++            RawSetup alphaSet;
++            alphaSet.presetFrame = 0x91223344u;
++            const RawResult passSet = drawRaw(alphaSet, {{kDate | kDatm}});
++            t.IsTrue(passSet.frame == kDrawn && passSet.z == 0xFFFFu, "ZTE=0 + DATE, DATM=1, dest alpha 1: drawn, depth kept");
++            RawSetup zOn;
++            zOn.presetZ = 0x50u;
++            const RawResult zFail = drawRaw(zOn, {{kZte | ztst(1) | kDate | kDatm}});
++            t.IsTrue(zFail.frame == kSentinel && zFail.z == 0x50u, "ZTE=1 ALWAYS + failing DATE: neither colour nor depth");
++            const RawResult zPass = drawRaw(zOn, {{kZte | ztst(1) | kDate}});
++            t.IsTrue(zPass.frame == kDrawn && zPass.z == 0x100u, "ZTE=1 ALWAYS + passing DATE: colour and depth");
++            RawSetup ct16;
++            ct16.fpsm = GS_PSM_CT16;
++            ct16.presetFrame = 0x0001u;
++            const RawResult f16 = drawRaw(ct16, {{kDate | kDatm}});
++            t.IsTrue(f16.frame == 0x0001u && f16.z == 0xFFFFu, "CT16, ZTE=0 + DATE, DATM=1, dest alpha 0: rejected");
++            ct16.presetFrame = 0x8001u;
++            const RawResult p16 = drawRaw(ct16, {{kDate | kDatm}});
++            t.IsTrue(p16.frame == to5551(kDrawn) && p16.z == 0xFFFFu, "CT16, ZTE=0 + DATE, DATM=1, dest alpha 1: drawn");
++        });
++
++        tc.Run("zte0_alpha_test_afail_modes", [&](TestCase &t)
++        {
++            // ATE=1, ATST=NEVER: the alpha test always fails, AFAIL decides what is written.
++            const auto afail = [](uint64_t mode) { return 1ull | (mode << 12); };
++            const RawResult keep = drawRaw({}, {{afail(0)}});
++            t.IsTrue(keep.frame == kSentinel && keep.z == 0xFFFFu, "ZTE=0 + AFAIL=KEEP: nothing");
++            const RawResult fb = drawRaw({}, {{afail(1)}});
++            t.IsTrue(fb.frame == kDrawn && fb.z == 0xFFFFu, "ZTE=0 + AFAIL=FB_ONLY: colour only");
++            const RawResult zb = drawRaw({}, {{afail(2)}});
++            t.IsTrue(zb.frame == kSentinel && zb.z == 0xFFFFu, "ZTE=0 + AFAIL=ZB_ONLY: nothing");
++            const RawResult rgb = drawRaw({}, {{afail(3)}});
++            t.IsTrue(rgb.frame == ((kDrawn & 0x00FFFFFFu) | (kSentinel & 0xFF000000u)) && rgb.z == 0xFFFFu,
++                     "ZTE=0 + AFAIL=RGB_ONLY: RGB only, destination alpha and depth kept");
++            const RawResult atPass = drawRaw({}, {{1ull | (1ull << 1)}});
++            t.IsTrue(atPass.frame == kDrawn && atPass.z == 0xFFFFu, "ZTE=0 + ATST=ALWAYS: colour, depth kept");
++            RawSetup zOn;
++            zOn.presetZ = 0x50u;
++            const RawResult rgbZ = drawRaw(zOn, {{kZte | ztst(1) | afail(3)}});
++            t.IsTrue(rgbZ.frame == ((kDrawn & 0x00FFFFFFu) | (kSentinel & 0xFF000000u)) && rgbZ.z == 0x50u,
++                     "ZTE=1 ALWAYS + AFAIL=RGB_ONLY: RGB only, no depth");
++            const RawResult fbZ = drawRaw(zOn, {{kZte | ztst(1) | afail(1)}});
++            t.IsTrue(fbZ.frame == kDrawn && fbZ.z == 0x50u, "ZTE=1 ALWAYS + AFAIL=FB_ONLY: colour only");
++        });
++
++        tc.Run("zte0_preserves_depth_buffer_with_zmsk0", [&](TestCase &t)
++        {
++            const uint32_t prims[] = {GS_PRIM_SPRITE, GS_PRIM_TRIANGLE, GS_PRIM_LINE};
++            for (uint32_t prim : prims)
++            {
++                for (uint64_t method = 0; method < 4; ++method)
++                {
++                    RawSetup s;
++                    s.presetZ = 0x200u;
++                    const RawResult r = drawRaw(s, {{ztst(method), 0x100u, prim}});
++                    t.IsTrue(r.frame == kDrawn && r.z == 0x200u && r.zOutside == 0x200u && r.frameOutside == kSentinel,
++                             "ZTE=0, ZMSK=0: colour drawn, depth untouched (prim " + std::to_string(prim) + ", ZTST=" +
++                                 std::to_string(method) + ")");
++                }
++            }
++            // The kept depth still governs a later depth-tested draw.
++            RawSetup s;
++            s.presetZ = 0x200u;
++            const RawResult later = drawRaw(s, {{ztst(2), 0x300u}, {kZte | ztst(2), 0x250u, GS_PRIM_SPRITE, 0x10u}});
++            t.IsTrue(later.frame == ((kDrawn & 0xFFFFFF00u) | 0x10u) && later.z == 0x250u,
++                     "ZTE=1 GEQUAL after a ZTE=0 draw compares against the preserved depth (0x250 >= 0x200)");
++            const RawResult laterFail = drawRaw(s, {{ztst(2), 0x100u}, {kZte | ztst(2), 0x1F0u, GS_PRIM_SPRITE, 0x10u}});
++            t.IsTrue(laterFail.frame == kDrawn && laterFail.z == 0x200u,
++                     "ZTE=1 GEQUAL after a ZTE=0 draw rejects 0x1F0 against the preserved 0x200");
++        });
++
++        tc.Run("zte_depth_representation_per_format", [&](TestCase &t)
++        {
++            RawSetup z32;
++            z32.presetZ = 0x00001200u;
++            const RawResult w32 = drawRaw(z32, {{kZte | ztst(1), 0xFEDCBA98u}});
++            t.Equals(w32.z, 0xFEDCBA98u, "Z32: full 32-bit depth written");
++            RawSetup z24;
++            z24.zpsmField = 1u;
++            z24.presetZ = 0xAB001200u;
++            const RawResult w24 = drawRaw(z24, {{kZte | ztst(1), 0x123456u}});
++            t.Equals(w24.z, 0xAB123456u, "Z24: 24-bit depth written, top byte of the word kept");
++            const RawResult off24 = drawRaw(z24, {{ztst(1), 0x123456u}});
++            t.Equals(off24.z, 0xAB001200u, "Z24, ZTE=0: word untouched");
++            const RawResult ge24 = drawRaw(z24, {{kZte | ztst(2), 0x1300u}});
++            t.Equals(ge24.z, 0xAB001300u, "Z24 GEQUAL compares 24 bits only (top byte ignored)");
++            for (uint32_t field : {2u, 0xAu})
++            {
++                RawSetup z16;
++                z16.zpsmField = field;
++                z16.presetZ = 0x1200u;
++                const RawResult w16 = drawRaw(z16, {{kZte | ztst(1), 0x1234u}});
++                t.IsTrue(w16.z == 0x1234u && w16.zOutside == 0x1200u,
++                         std::string(field == 2u ? "Z16" : "Z16S") + ": 16-bit depth written, neighbours kept");
++                const RawResult off16 = drawRaw(z16, {{ztst(1), 0x1234u}});
++                t.IsTrue(off16.z == 0x1200u && off16.zOutside == 0x1200u,
++                         std::string(field == 2u ? "Z16" : "Z16S") + ", ZTE=0: depth untouched");
++            }
++        });
++
++        tc.Run("zte0_frame_unwritable_bits_and_masks", [&](TestCase &t)
++        {
++            RawSetup ct24;
++            ct24.fpsm = GS_PSM_CT24;
++            ct24.presetFrame = 0xAB223344u;
++            const RawResult f24 = drawRaw(ct24, {{0ull}});
++            t.IsTrue(f24.frame == ((kDrawn & 0x00FFFFFFu) | 0xAB000000u) && f24.z == 0xFFFFu,
++                     "CT24, ZTE=0: RGB written, top byte of the word kept, depth kept");
++            RawSetup masked;
++            masked.fbmsk = 0x00FF00FFu;
++            const RawResult m = drawRaw(masked, {{0ull}});
++            t.IsTrue(m.frame == ((kDrawn & 0xFF00FF00u) | (kSentinel & 0x00FF00FFu)) && m.z == 0xFFFFu,
++                     "CT32, ZTE=0 + FBMSK=0x00FF00FF: masked bits kept");
++            masked.fbmsk = 0xFFFFFFFFu;
++            const RawResult all = drawRaw(masked, {{0ull}});
++            t.IsTrue(all.frame == kSentinel && all.z == 0xFFFFu, "CT32, ZTE=0 + FBMSK=all: nothing changes");
++            RawSetup ct16;
++            ct16.fpsm = GS_PSM_CT16;
++            ct16.presetFrame = 0x0001u;
++            const RawResult f16 = drawRaw(ct16, {{0ull}});
++            t.IsTrue(f16.frame == to5551(kDrawn) && f16.frameOutside == 0x0001u && f16.z == 0xFFFFu,
++                     "CT16, ZTE=0: 16-bit colour written, neighbours and depth kept");
++        });
++    });
+ }
