@@ -752,3 +752,20 @@ arriba). Los diecinueve patches actualmente activos:
     - Coste: unos −31 ms (−13 %) del tiempo del rasterizador por reproducción de `cap2` (2 VSync), medido en el banco
       de GS Replay; no es tiempo del juego.
       Documentación: `analysis/notes/PERF_003_ARCHITECTURE_FEASIBILITY.md`, secciones 16 a 18.
+34. `GS4_prot3w_lwu_r5900_semantics.patch` (convención B). Semántica del generador, cambio general:
+    - `ps2xRecomp/src/lib/mmi_translation_helpers.cpp` y `ps2xRuntime/include/ps2_runtime_macros.h`: `PROT3W` rotaba
+      las cuatro palabras (`_MM_SHUFFLE(0,3,2,1)`); el R5900 rota las tres inferiores y conserva la palabra 3
+      (`{w1, w2, w0, w3}`, `_MM_SHUFFLE(3,0,2,1)`, como PCSX2). La macro no tiene usos en el código generado; se corrige
+      igualmente.
+    - `ps2xRecomp/src/lib/instruction_translator.cpp`: `LWU` se emitía con `SET_GPR_U32` (extensión de signo); ahora
+      extiende con ceros los 64 bits bajos y deja intactos los 64 altos, como PCSX2 y con el mismo efecto que el
+      arreglo upstream #244.
+    - Pruebas nuevas en `ps2xTest` (`code_generator_tests.cpp`, `ps2_runtime_expansion_tests.cpp`): cadena emitida y
+      semántica de ambas instrucciones, incluida la secuencia `lwu`/`or`/`prot3w` de `Morph_sub_h`.
+    - Efecto en DMC: el búfer facial que monta `Morph_sub_h` dejaba vértices desplazados o NaN (cuñas naranjas de
+      GS-4 y huecos en la cara). En el código EE cambian 270 ficheros: 1 224 líneas `LWU` y 7 `PROT3W`.
+    - Validación: suite de 483 tests con los mismos 24 fallos y las 2 nuevas superadas; auditoría de flujo de datos de
+      las 1 224 `LWU` y arnés diferencial; corridas del castillo sin las cuñas; moteado de 27240 idéntico con y sin el
+      parche.
+    - Coste: cambia `ps2_runtime_macros.h`, así que recompila todo el código generado (~10 000 objetos).
+      Documentación: `analysis/notes/PERF_003_ARCHITECTURE_FEASIBILITY.md`, secciones 24 a 27.

@@ -135,6 +135,10 @@
     {
       "path": "patches/PERF_003_gs_vram_dispatch_function_pointers.patch",
       "sha256": "429f1eb778ed78aac653c8ea8def48e4586e760f53def9fb2845fb350ba08121"
+    },
+    {
+      "path": "patches/GS4_prot3w_lwu_r5900_semantics.patch",
+      "sha256": "4b1769b1006045573c50cc72715bcba6437aaa1b41f79bad1fbafe38d703dd9f"
     }
   ],
   "patch_identity": {
@@ -143,5 +147,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "614c0eee0b3b52b8e55dca7dc0b35999a2ecbd62"
+  "patched_commit": "ea54616dd3a3d0e5ab099d9150335fbdc27e1db7"
 }

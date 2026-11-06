@@ -1475,3 +1475,726 @@ procedimiento que §17.3.
 - Una ronda (+9,5 %) es un atípico de B (máximo 256,6 ms frente a una mediana de 202,0); el resto está entre −10,7 y
   −19,2 %. Se reproduce la ganancia de §17.3 (−13,6 %).
 - **No extrapolable directamente al juego.**
+
+## 19. C2a-3: acceso a VRAM sin envoltorio en las rutas de dibujo (2026-10-31, experimento local, descartado)
+
+Base: HEAD `c36743e`, vendor `614c0eee` (33 parches). Evidencia local en `analysis/local/perf003/c2a3/`.
+
+### 19.1 Auditoría (HECHO salvo donde se indica)
+
+- **Formatos en `cap2`:** lectura de texel T8, T4 y CT32 (más Z16S); framebuffer CT32; Z en Z16S. La CLUT ya se lee
+  directamente con `GSMem::ReadCT32` y no pasa por las tablas.
+- **Selección:** con el parche 33 la «selección» es una carga indexada (`m_*VramFuncs[psm & 0x3F]`) dentro de
+  `ReadVramUnlocked`/`WriteVramUnlocked`, una vez por acceso (unos 13 M por reproducción: ~6 M texels, 1,9 M lecturas
+  de FB, 1,2 M de Z, 3,2 M escrituras de FB y 0,65 M de Z).
+- **Invariantes:** `FRAME.PSM`, `ZBUF.PSM` y `TEX0.PSM` vienen de `GSDrawState`, constante durante todo el lote; las
+  rutas de dibujo solo se alcanzan desde `Submit`, que retorna si `m_vram` es nulo y mantiene el mutex, así que la
+  comprobación de nulo por acceso es redundante en ellas (`LookupCLUT` ya lo asume). Las transferencias,
+  `ClearFramebuffer` y la presentación no son rutas por píxel y quedan fuera.
+- **Perfil de hoja con 33 parches (6 990 muestras):** `ReadVramUnlocked` 3,2 %, `WriteVramUnlocked` 2,1 % propios;
+  ninguno se inlinea (el desensamblado muestra prólogo, reordenación de 5–6 argumentos y llamada indirecta).
+- **INFERENCIA de diseño:** seleccionar por lote (B/C) no ahorra más que llamar a la tabla directamente (D): en ambos
+  casos queda una carga desde `this` y una llamada indirecta a un lector de otra unidad (`ps2_gs_memory.cpp`), que no
+  se puede inlinear sin plantillas o exponer los lectores. B/C añadirían además estado o cambios de firma en la
+  cabecera. Se elige D.
+
+### 19.2 Prototipo D (HECHO)
+
+Solo `gs_cpu_backend.cpp`: en `WritePixel` (lecturas y escrituras de FB y Z) y en el muestreo de texels se llama al
+puntero de la tabla directamente con `m_vram`, sin pasar por los envoltorios. El resto de usos no cambia.
+Compilación: solo `gs_cpu_backend.cpp`.
+
+- Fidelidad: 481/24 sin diferencias; ZTE 11/11; `ctest` 1/1; registro `d3f437c8…` idéntico (dos ejecuciones y la
+  variante TIMEKEY); VRAM final `50d7bb62…`; `--force-zte` `IDENTICAL` con ambos ejecutables; sondas GS-1/GS-2 483/26
+  idénticas a E3-A.
+
+### 19.3 Rendimiento (HECHO; banco de GS Replay)
+
+| Medida | 33 parches | D | Diferencia emparejada |
+|---|---|---|---|
+| Backend por reproducción de `cap2`, 21 rondas | 200,3 ms | 196,7 ms | −1,5 ms (IQR −5,1..+3,5); por ronda −0,7 % (cuartiles −2,8 / +1,8); D más lento en 7/21 |
+| Tiempo por lote, 11 rondas | 195,1 ms | 190,3 ms | −4,3 ms (IQR −7,1..−1,7), −2,5 %; 10/11 |
+| Triángulos / sprites | 117,8 / 77,5 ms | 115,7 / 74,3 ms | −1,8 % / −4,1 % |
+
+- El perfil de D ya no muestra los envoltorios, pero su coste reaparece en `WritePixel`, `DrawTriangle` y los
+  lectores. **Hipótesis refutada:** que el 5,3 % propio de los envoltorios fuera ahorrable; casi todo era el coste de
+  la llamada en sí, que permanece.
+- **Decisión:** ganancia < 3 % → descartado. Vendor revertido a `614c0eee` y compilación restaurada (481/24,
+  `d3f437c8…`, `50d7bb62…`, `IDENTICAL`).
+- Lo que queda en el despacho solo se reduce eliminando la llamada a los lectores (inlinearlos o especializar por
+  formato), lo que cae en la estrategia C de §16.5.
+
+## 20. C2b-1: auditoría de costes de texturizado (2026-10-31, sin cambios funcionales)
+
+Cierre de C2a-3: descartado por beneficio insuficiente (§19); no hay parche 34 y el prototipo D queda fuera del
+pipeline. Base: HEAD `c36743e`, vendor `614c0eee` limpio. Evidencia local en `analysis/local/perf003/c2a3/`
+(perfil `prof33.txt`, `hot.py`) y `analysis/local/perf003/c2b1/` (prueba exhaustiva de redondeo).
+
+### 20.1 Perfil por instrucción (HECHO; 6 990 muestras de hoja, 20 reproducciones de `cap2`, 33 parches)
+
+| Función | Propio | Dónde se concentra |
+|---|---|---|
+| `WritePixel` | 24,0 %* | repartido (decodificación de registros, prueba de Z, mezcla); sin un punto dominante |
+| `SampleTexture` | 10,4 %* | construcción del cierre de la lambda y preparación de `floorf`; repartido |
+| `combineTexture` | 9,9 %* | **446 muestras en una sola instrucción**, justo después de `mov eax,[rsp+30h]` que relee como `dword` los 4 bytes del resultado escritos uno a uno: fallo de reenvío almacén→carga (*store forwarding*). 61 más en la otra salida. ≈ 8 % del total de módulo |
+| lambda `samplePoint` | 9,1 %* | prólogo, llamada indirecta al lector, salto a `LookupCLUT` |
+| `DrawTriangle` | 8,6 %* | funciones de borde e interpolación |
+| `ucrtbase.dll` | 7,6 % | cuerpos de `lroundf` (4 por píxel bilineal, uno por canal) y `floorf` (2 por píxel bilineal) |
+| `lerpChannel` | 6,8 %* | aritmética `float` y la llamada a `lroundf` por la IAT |
+| `ReadCT32` / `ReadP8` / otros lectores | 6,0 / 2,2 / ~1 % | |
+| `LookupCLUT` | 4,0 %* | prólogo y `resolveClutIndex` |
+
+\* porcentaje sobre las 6 278 muestras dentro del ejecutable. Los estados más caros de `cap2` son tristrip T8
+bilineal con `TFX=0 TCC=1` (MODULATE con alfa), justamente la salida de `combineTexture` que acumula las 446 muestras.
+
+### 20.2 Fidelidad numérica
+
+- **Bilineal (HECHO, código):** aritmética `float` escalar SSE2, `/fp:precise`, sin FMA (no se compila con AVX2);
+  `top`, `bottom` y la mezcla final en ese orden exacto. Cualquier reordenación o paso a enteros cambia bits; no se
+  propone tocarla.
+- **Redondeo (HECHO, prueba exhaustiva):** `clampU8(static_cast<int>(std::lround(v)))` es `lroundf` del CRT. Una
+  versión sin llamada (`!(v >= 0.5f) → 0`, `v >= 2^31 → 0`, `v >= 255 → 255`, si no `i + (v − i >= 0.5f)`) coincide en
+  los 2^32 patrones de `float` (0 discrepancias). La primera versión, sin el caso `v >= 2^31`, discrepaba en
+  813 694 977 patrones (todos los `float` ≥ 2^31 y `+inf`): `lroundf` de MSVC devuelve `LONG_MIN` y `clampU8` lo
+  convierte en 0. **INFERENCIA:** el resultado actual para coordenadas desbordadas depende de la implementación
+  (`long` de 32 bits en Windows, de 64 en Linux); una sustitución exacta debe replicar el de MSVC.
+- **Combinación (HECHO, código):** enteros; `(t·v) >> 7` ≤ 508 y `clampU8`; el empaquetado del resultado no cambia
+  ningún valor.
+- **Conversiones (HECHO, código; fuera de alcance):** colores e índices de textura se truncan con `static_cast` desde
+  `float` (`uint16_t` desde un `float` negativo es comportamiento indefinido en C++; MSVC trunca).
+
+### 20.3 Alternativas
+
+| | Ahorro esperado (ESTIMACIÓN) | Riesgo de fidelidad | Tamaño |
+|---|---|---|---|
+| A. Mantener | 0 | 0 | 0 |
+| B1. `combineTexture` devuelve los 4 canales empaquetados en un `uint32_t` (misma aritmética) | hasta ~7 % (el bloqueo de reenvío) | nulo por construcción | ~20 líneas, 1 archivo |
+| B2. Redondeo sin llamada en `lerpChannel` | ~5–7 % (`lroundf` + llamada) | nulo en MSVC (prueba exhaustiva); depende de replicar el caso desbordado | ~10 líneas |
+| C. Especializar por estado del lote (TFX/TCC, filtro) | desconocido; solapa con B1 | bajo | medio |
+| D. Variantes precompiladas por formato (T8/T4/CT32) | 15–30 % (plantillas) | medio | grande |
+| E. PCSX2 (bilineal entero, CLUT expandida) | — | no reutilizable con igualdad de bits | — |
+
+### 20.4 Experimento propuesto (pendiente de autorización)
+
+B1 únicamente. Archivo: `gs_cpu_backend.cpp` (`combineTexture` y sus dos llamadores en `DrawSprite` y
+`DrawTriangle`). Hipótesis: el 7–8 % de muestras en la salida de `combineTexture` es el bloqueo de reenvío y
+desaparece si el resultado se construye en registro. Aceptación: equivalencia exacta (481/24, ZTE 11/11, `ctest`,
+`d3f437c8…`, 2 `Present`, `50d7bb62…`, `IDENTICAL` con `--force-zte`, GS-1/GS-2 483/26) y ≥ 5 % en el A/B frente
+al parche 33; 3–5 % se evalúa; < 3 % se descarta.
+
+## 21. C2b-2: empaquetado directo de `combineTexture` (2026-10-31, experimento local, descartado)
+
+Base: HEAD `c36743e`, vendor `614c0eee` (33 parches). Experimento B1 de §20.4. Evidencia local en
+`analysis/local/perf003/c2b2/`.
+
+### 21.1 Código generado antes del cambio (HECHO)
+
+- En la salida MODULATE con `TCC=1`, `combineTexture` escribe r, g, b y a byte a byte en `[rsp+30h..33h]` (las
+  ranuras de sus propios argumentos en pila) y los relee con `mov eax,dword ptr [rsp+30h]`; la instrucción siguiente
+  acumula 446–486 muestras según el perfil. Los llamadores ya usan `eax` en registro.
+- No se asumió que todas esas muestras fueran del bloqueo: el *skid* del muestreo puede cargar ahí otras latencias.
+
+### 21.2 Cambio y equivalencia (HECHO)
+
+- Solo `gs_cpu_backend.cpp`: `combineTexture` calcula los cuatro canales en variables locales con las mismas
+  expresiones y devuelve `pack32(r, g, b, a)`; `DrawSprite` y `DrawTriangle` desempaquetan con desplazamientos.
+- Prueba local de equivalencia del empaquetado (`pack_equivalence.cpp`, mismas opciones de compilación): versión
+  original frente a la nueva en TFX 0..5 × TCC 0..1 × 256³ (cada canal recorre todo su dominio): 201 326 592
+  llamadas, 0 discrepancias.
+- Ensamblador: desaparecen las escrituras parciales y la relectura de 32 bits (4 → 0 accesos `dword [rsp+30h]`); el
+  resultado se forma en registros con 3 `shl` y 3 `or` en la salida común; 512 → 480 bytes.
+- Fidelidad: 481/24 sin diferencias; ZTE 11/11; `ctest` 1/1; `d3f437c8…` (dos ejecuciones y TIMEKEY); 2 `Present`;
+  `50d7bb62…`; `IDENTICAL` con `--force-zte` (ambos ejecutables); GS-1/GS-2 483/26 idénticas.
+
+### 21.3 Rendimiento (HECHO; banco de GS Replay)
+
+- Primera tanda descartada por carga externa: la mediana de A subió de ~201 a 217 ms con picos de 345 ms (±40 % por
+  ronda). Se repitió con registro de carga.
+- Segunda tanda: 21 rondas, −0,1 % por ronda (cuartiles −7,1 / +3,2; todavía ruidosa, máx. 432 ms); tiempo por
+  lote, 11 rondas (A 196,4 ms, coherente con la línea base): **+0,1 %** (IQR −1,3..+3,7 ms); triángulos +1,0 %,
+  sprites −0,6 %.
+- Perfil A/B (≈ 8 700 muestras cada uno): `combineTexture` baja de 7,95 % a 1,90 % y el pico de 486 muestras
+  desaparece, pero el total de muestras apenas cambia (8 746 → 8 675) y el tiempo reaparece en `WritePixel` (+2,8
+  puntos), `DrawTriangle` (+1,0) y `DrawSprite` (+0,9).
+- **Hipótesis refutada:** que la concentración de muestras en la salida de `combineTexture` fuera tiempo ahorrable.
+  **INFERENCIA:** el bloqueo de reenvío existía, pero el procesador lo solapaba con el trabajo independiente del
+  llamador; la acumulación de muestras no medía coste en el camino crítico.
+- **Decisión:** < 3 % → descartado. Vendor revertido a `614c0eee` y compilación restaurada (481/24, `d3f437c8…`,
+  `50d7bb62…`, `IDENTICAL`). **Lección de método:** antes de proponer un experimento por una concentración de muestras,
+  confirmarlo con una sonda de duplicación (como en §16) que mida el coste marginal.
+
+## 22. C2b-3: coste marginal de redondeo e interpolación (2026-10-31, solo instrumentación)
+
+Cierre de C2b-2: resultado nulo (§21); sin parche 34. Vendor `614c0eee` limpio durante toda la fase. Sondas
+desechables fuera del vendor, en una copia generada del backend (`analysis/local/perf003/c2b3/`,
+`add_round_probes.py` sobre `c2a3/make_probe_tk.py`), todas con variante TIMEKEY.
+
+### 22.1 Método y fidelidad de las sondas (HECHO)
+
+- Cada sonda repite la operación sobre una entrada sumada a un `volatile float` igual a cero y acumula el resultado en
+  un sumidero `volatile`. El desensamblado confirma que sobreviven: una segunda llamada a `lroundf` en `lerpChannel`,
+  dos `floorf` más en `SampleTexture`, la aritmética duplicada (6 `mulss` en lugar de 3) y la candidata sin llamada
+  (`cvttss2si` y comparaciones).
+- Las 7 variantes reproducen el registro `d3f437c8…` y la VRAM `50d7bb62…`.
+- **Limitación:** en `DUP_LERP` el compilador inlinea la llamada duplicada; esa sonda mide aritmética más `lroundf`,
+  sin el coste de la llamada a `lerpChannel`.
+
+### 22.2 Frecuencia (HECHO, una reproducción de `cap2`)
+
+| | `lerpChannel` = `lroundf` | `floorf` | Muestreos bilineales | Centrados (1 tap) |
+|---|---|---|---|---|
+| Triángulos | 3 893 056 | 1 946 528 | 973 264 | 0 |
+| Sprites | 1 835 008 | 1 373 316 | 686 658 | 227 906 |
+
+### 22.3 Coste marginal (HECHO; 15 rondas rotatorias, base TIMEKEY 222–224 ms por reproducción)
+
+| Sonda | Δ emparejado total | Triángulos | Sprites | ns por llamada (ESTIMACIÓN) |
+|---|---|---|---|---|
+| `DUP_LROUND` | **+16,1 ms** (IQR +13,3..+20,1); 15/15 | +13,2 | +2,9 | ~2,8 |
+| `DUP_FLOOR` | +6,1 ms (IQR +3,1..+8,6); 14/15 | +1,5 | +2,7 | ~1,8 |
+| `DUP_LERPARITH` | +8,8 ms (IQR +5,0..+12,1); 14/15 | +6,1 | +1,3 | ~1,5 |
+| `DUP_LERP` (inlineada) | +25,4 ms (IQR +21,8..+28,2); 15/15 | +18,2 | +7,5 | — |
+| `DUP_CANDROUND` (segunda tanda) | +10,4 ms (IQR +8,3..+14,6); 14/15 | +10,5 | +0,8 | ~1,8 |
+
+- Segunda tanda (`TK`, `TK_LROUND`, `TK_CANDROUND`): `DUP_LROUND` +16,2 ms, reproducible. Diferencia por ronda
+  `lroundf` − candidata: **+6,0 ms** (IQR +0,4..+8,0), positiva en 12/15.
+- **INFERENCIA:** el ahorro efectivo de sustituir `lroundf` es del orden de 6 ms por reproducción (~3 % de los
+  ~200 ms del backend sin sondas), no los 16 ms del coste marginal: la candidata exacta cuesta ~10 ms (comparaciones
+  y conversión dependientes del valor). Para `floorf`, con +6 ms de coste marginal total, el ahorro neto de una
+  alternativa sería previsiblemente < 3 ms (< 1,5 %).
+- La aritmética de `lerpChannel` (+8,8 ms) no es eliminable sin cambiar resultados.
+
+### 22.4 Equivalencia numérica
+
+- **`lroundf` (HECHO, MSVC x64, prueba de §20.2):** redondeo de empates alejándose de cero (0,5 → 1; 2,5 → 3);
+  negativos y −0 → 0 tras `clampU8`; NaN y −inf → 0; ≥ 2^31 y +inf → `LONG_MIN` → 0. La candidata reproduce los
+  2^32 casos.
+- **Linux (INFERENCIA, no verificado en esta fase):** `long` es de 64 bits; `lroundf(5e9)` cabe y `static_cast<int>`
+  lo reduce módulo 2^32 (705 032 704 → 255 tras `clampU8`), mientras MSVC da 0. El código actual ya no es portable en
+  ese caso; una sustitución exacta para MSVC no lo sería para Linux sin otra prueba.
+- **`floorf` (HECHO, prueba exhaustiva `c2b3/floor_exhaustive.cpp`):** referencia independiente
+  `static_cast<int>(std::floor(x))`; candidata `i = (int)x; if (i != INT_MIN && x < (float)i) --i;`: 0 discrepancias en
+  los 2^32 patrones. La referencia da `INT_MIN` en 1 644 167 168 patrones (|x| ≥ 2^31 y NaN): conversión indefinida
+  en C++ que MSVC/SSE2 resuelve como `0x80000000`; la candidata depende de lo mismo.
+
+### 22.5 Conclusión
+
+Ninguna alternativa supera el umbral con margen: `lroundf` ≈ 3 % neto con dependencia de plataforma; `floorf`
+< 1,5 %; la aritmética no es reducible. **Recomendación:** abandonar la línea de redondeo e interpolación y volver a
+la especialización por formato o a propuestas externas (PS2Recomp, PCSX2), con medición marginal previa.
+
+## 23. E4: validación integral en el castillo con 33 parches (2026-10-31, una corrida)
+
+Cierre de la línea de microoptimización del GS: C2a-3 (§19), C2b-2 (§21) y C2b-3 (§22) se descartaron por beneficio
+insuficiente; no hay parche 34. Evidencia local en `analysis/local/perf003/e4/`.
+
+### 23.1 Preparación (HECHO)
+
+- HEAD `c36743e`, vendor `614c0eee` limpio, 33 parches; `ps2x_tests` 481/24, GS Replay `d3f437c8…`/`50d7bb62…`,
+  `IDENTICAL` con `--force-zte` (§22, sin cambios después).
+- El ejecutable de trabajo (`c85183a0…`) era el de la corrida de E3-A (31 parches más el experimento de ZTE).
+  Compilación incremental del juego: solo `gs_cpu_backend.cpp`, `gs_frontend.cpp` y `dmc_overrides.cpp` (gancho
+  temporal del perfilador de PERF_001, copiado a `e4/` con los contadores del vendor sustituidos por ceros) y el
+  enlace con `-MAP`: `12dd0c5a…`. Sin código EE recompilado. Parche 33 presente (0 instancias de `std::function` en
+  `gs_cpu_backend.obj`, 26 en `c85183a0`).
+- Checkpoint `g002_castle_entry.dmck` `4c841943…`: «executable build differs, checkpoint ABI compatible».
+- **Capturas blancas de E3-A (comprobación previa sin el juego):** `PrintWindow(PW_CLIENTONLY |
+  PW_RENDERFULLCONTENT)` funciona con la sesión activa, también sobre una ventana OpenGL ajena (7 162 colores). La
+  causa más probable sigue siendo de entorno (sesión bloqueada o pantalla apagada). `e4/shot_e4.py` añade una captura
+  de pantalla del rectángulo cliente y avisa si la imagen es de un solo color.
+- **Incidente de método:** el primer lanzamiento usó una copia del ejecutable sin las DLL de FFmpeg y terminó en 1,6 s
+  con `0xC0000135` antes de ejecutar nada del juego (`e4/run0_dll_missing/`). Se lanzó el mismo binario desde su
+  directorio de compilación. Un bucle huérfano del primer conductor añadió dos líneas espurias a `marks.txt`
+  (`loaded`/`done` en t=51).
+
+### 23.2 Corrida (HECHO)
+
+`g002_castle_entry.dmck`, sin entrada, VU1 `native`, estadísticas cada 2 s, perfilador de 1 ms en VSync 27000–27600
+(la misma ventana que `runP` de PERF_002). 301,5 s (límite), VSync 26641–28080, 0 FATAL, sin mensajes nuevos en el
+log respecto a E3-A.
+
+| Tramo | E4 (33 parches, perfilador en la ventana) | `runP` PERF_002 (30, perfilador) | `runB_c1` (31, sin perfilador) | E3-A (31 + ZTE, sin perfilador) |
+|---|---|---|---|---|
+| 27000–27600 | **3,876 VSync/s**, 258 ms/VSync (mediana 226, p95 336) | 4,034 | 4,558 | 4,120 |
+| 27600–28080 | **4,913 VSync/s**, 204 ms/VSync (mediana 200, p95 287) | 4,846 | 4,921 | 4,437 (hasta 27962) |
+
+- Evolución: 6,0–6,5 VSync/s hasta ~26980; baja a 3,0 VSync/s en 27340–27600 (máximo 402 ms por VSync, PATH1 hasta
+  188 ms) y vuelve a 5–6 VSync/s desde 27730. Ninguna ventana de estadísticas supera 2,04 s: no hay bloqueos.
+- **INFERENCIA:** dentro de la dispersión entre corridas (~6 %, §PERF_002) no se aprecia cambio integral atribuible a
+  los parches 32 y 33; fuera de la ventana perfilada, E4 coincide con C1 (4,91 frente a 4,92). Sin una A/B del juego no
+  se puede atribuir una ganancia de FPS al parche 33.
+
+### 23.3 Perfil del hilo del juego (HECHO, 70 591 muestras, 98,5 % de un núcleo; ms = % × 258,5)
+
+| Subsistema (exclusivo) | E4 | `runP` | ms/VSync E4 (ESTIMACIÓN) |
+|---|---|---|---|
+| Rasterizador GS | 56,0 % | 55,0 % | ~145 |
+| VU1 compilado | 26,1 % | 28,7 % | ~67 |
+| VU1 intérprete | 10,2 % | 9,0 % | ~26 |
+| VIF | 2,5 % | 2,3 % | ~6,5 |
+| DMA / memoria EE | 2,4 % | 2,4 % | ~6,2 |
+| Código EE recompilado | 1,0 % | 0,9 % | ~2,6 |
+| GIF / frontal GS | 0,6 % | 0,7 % | ~1,6 |
+| Audio / MPEG / IPU | 0,6 % | 0,5 % | |
+| Planificador EE, IOP/SIF/CD, esperas | 0,3 % | 0,3 % | |
+
+- Solapamiento: el 74,2 % del hilo está dentro de `PS2Runtime_vu1DispatchCall`; de ese tiempo, 37,0 puntos son
+  rasterizador (PATH1 por XGKICK) y 36,3 VU1. El 19 % restante del rasterizador está fuera del despacho (sprites y
+  PATH2/3).
+- Funciones: `vu1c` 11,6 %, lectores de `ps2_gs_memory` 9,2 %, `DrawTriangle` 9,1 %, `WritePixel` 7,5 %,
+  `exactFlags` 5,8 %, `SampleTexture` 5,7 %, lambda 3,9 %, `lerpChannel` 3,9 %, `commitReadyPipelines` 3,8 %,
+  `lroundf` 3,3 %.
+- Presentación (hilo de ventana, 7,6 % de un núcleo): 89,8 % en espera; `PresentFromLocalMemory` 0,3 % y
+  `CopyFrameToHostRgba` 0,07 % de ese hilo. **Coste de presentación despreciable.**
+
+### 23.4 Observaciones visuales (HECHO, 4 capturas; `PrintWindow` y pantalla coinciden salvo 54 píxeles)
+
+- Las capturas ya no son blancas.
+- **GS-4 persiste:** triángulo o cuña naranja plana delante de Dante en VSync 27060, 27360 y 27780.
+- VSync 27600: escena oscura con una banda vertical oscura sobre Dante y puntos brillantes dispersos; sin referencia
+  PCSX2 no se puede clasificar.
+- El mar de VSync 27360 no muestra bloques evidentes a esta resolución; GS-5 sigue sin confirmar ni descartar.
+
+### 23.5 Restauración (HECHO)
+
+`runtime/dmc_overrides.cpp` restaurado (SHA-256 igual al original); recompilación incremental de esa unidad y enlace:
+ejecutable de trabajo `9e07ee8b…` (33 parches, sin perfilador).
+
+## 24. GS-4: diagnóstico del triángulo naranja con GS Replay (2026-10-31, sin ejecutar el juego)
+
+Cierre de E4: el parche 33 reduce el tiempo del rasterizador en GS Replay (−13,3 %, §18), pero **su efecto en el
+juego completo no está demostrado**: no hay una A/B del juego, y la corrida E4 queda dentro de la dispersión entre
+corridas (§23.2). Evidencia local de esta sección en `analysis/local/gs4/` (driver local `gsr_gs4` con trazador de
+píxeles, volcado de framebuffer y volcado de lotes; ningún cambio en el vendor).
+
+### 24.1 Localización (HECHO)
+
+- `cap2` contiene el defecto. Los dos `Present` (registros 8 y 14320) muestran el circuito 1 con `DISPFB1.FBP=504`
+  (8 páginas por fila); la lectura desborda los 4 MB de VRAM y continúa en `FBP=0`, así que se presenta el búfer 0
+  desplazado 32 líneas. La imagen de `Present` 1 es el búfer 0 tras el registro 14319 (`fb0_at14319.png`).
+- Trazador sobre 5 píxeles naranjas del búfer 0 (`trace_fb0.txt`): el último lote que les da el color naranja es el
+  **registro 10382** (los posteriores, 14276–14288, son sprites de pantalla completa que solo cambian el alfa o
+  mezclan encima).
+- Registro 10382: triángulo de una tira (`PRIM` 4, IIP, TME, FGE, `ctxt=1`), textura T8 `TBP0=10752 TBW=4`
+  bilineal, `TFX=0 TCC=1`, `TEST=0x5010D` (ZTST GEQUAL), `FRAME` 0 CT32, `ZBUF` 112 Z16S. Vértices en pantalla
+  (21,5; 256,8) z 3252, (309,1; 60,8) z 1334, (305,0; 485,3) z 1759; `s/q`, `t/q` ≈ (0,56; 0,43) en los tres: casi un
+  solo texel sobre ~60 000 píxeles², de ahí el naranja plano.
+
+### 24.2 La malla (HECHO, `all_batches.txt`)
+
+- Malla de la cabeza de Dante: textura `TBP0=10752`, registros 9591–14271 del búfer 0 (y la misma en el búfer 56),
+  1 641 triángulos con área mediana de 1,1 píxeles²; solo 2 superan 2 000 píxeles² (10181 y 10382, ~60 000 cada uno).
+- 935 posiciones distintas (x, y, z); contando también color y STQ, 1 007 vértices en tres grupos:
+
+| Grupo | Vértices | Pantalla | q (= 1/w) | `s/q`, `t/q` |
+|---|---|---|---|---|
+| Cabeza | 952 | x 279–340, y 47–100, z 1302–1346 | 0,000508–0,000525 | 0,00–1,00 / 0,05–0,99 |
+| Racimo C | 52 | **x 20,6–24,6, y 236–264** (bajo el scissor), z 3223–3263 | **0,00124–0,00126** | 0,34–0,79 / 0,39–0,96 |
+| Grupo L | 3 | (305; 485) | 0,000682 | ≈ 0,53 / 0,44 |
+
+- Composición de triángulos: 1 546 solo cabeza; 36 solo racimo C (diminutos y fuera del scissor); **51 mezclan C con
+  la cabeza** (27 CHH, 24 CCH) y 8 incluyen L. Las cuñas visibles son esos triángulos mixtos.
+- **INFERENCIA:** los vértices C cubren una zona amplia de la textura y comparten tiras con la cabeza, así que son
+  vértices reales de la superficie de la cabeza. Llegan con una `w` distinta (~800 frente a ~1 950) y colapsados en un
+  área de 4×28 píxeles: firma de un grupo de vértices transformado con una matriz degenerada (escala casi nula y otra
+  traslación). El grupo L (3 vértices casi idénticos) muestra lo mismo con otra traslación.
+
+### 24.3 Qué queda descartado (HECHO salvo donde se indica)
+
+- **Rasterizador:** dibuja exactamente los triángulos recibidos; el color es el muestreo correcto de coordenadas de
+  textura casi constantes. Profundidad, scissor y composición no explican vértices desplazados 300 píxeles.
+- **Frontal GIF/GS:** XYZ2/XYZF2 empaquetados leen ADC del bit 111 (`vertexKick(!adk)`) y XYZ3/XYZF3 no dibujan. Las
+  tiras se reinician correctamente (el registro 10380 empieza con dos vértices nuevos). **INFERENCIA:** un error de
+  ADC/VCLIPw solo explicaría triángulos que debieron descartarse, no vértices en posiciones erróneas.
+- **`ret0` de geometría en la ventana:** en la corrida E4 (VSync 26641–28080) el único `ret0` llamado es
+  `katVu0Setmat4_shw` (sombras). `capCopyMatrix`, `InterpNode`, `Calc_md` y las funciones de recorte no se llaman. El
+  checkpoint (tick 26640) se grabó con el RECOMP, así que su estado puede arrastrar efectos de `ret0` anteriores:
+  **UNKNOWN**.
+
+### 24.4 Hipótesis abiertas
+
+| Hipótesis | A favor | En contra / falta |
+|---|---|---|
+| H1. Matriz de hueso errónea desde el EE (animación, VU0 macro, estado arrastrado del checkpoint) | colapso de un grupo de vértices; determinista en los dos fotogramas | no hay `ret0` de animación activo en la ventana; falta ver la paleta de matrices |
+| H2. Microcódigo VU1 mal ejecutado para el grupo (p. ej., vértices con segunda matriz) | afecta a un subconjunto concreto | `verify` compilado frente a intérprete dio 0 diferencias (PERF_002), pero ambos comparten la semántica |
+| H3. VIF/DMA: paleta de matrices subida a otra dirección de VU1 | explicaría lectura de basura para un hueso | sin evidencia |
+| H4. Comportamiento real del juego | — | las capturas del juego muestran la cuña anclada a la cabeza en varias escenas; sin oráculo PCSX2 de esta escena |
+
+### 24.5 PCSX2
+
+- No hay una referencia PCSX2 de la cinemática: el estado s09 es posterior (juego con control) y la captura del
+  29-10 es de otra escena. El servidor MCP de PCSX2 no está conectado en esta sesión.
+- Referencias previas del proyecto sobre `VCLIPw` (parche 23) y ADC: corregidas para VU0 macro; no aplican a vértices
+  desplazados (§24.3).
+
+### 24.6 Experimento mínimo propuesto (requiere autorización)
+
+Una corrida corta desde `g002_castle_entry.dmck` con la captura VU1 existente (`G001K_VU1_CAPTURE_INSTRUMENTATION`)
+y GS Replay a la vez en el VSync 27100, para obtener la memoria VU1 de entrada (paleta de matrices y vértices) y los
+paquetes PATH1 de la llamada que dibuja la malla `TBP0=10752`. Criterio:
+- si la paleta ya contiene una matriz degenerada para el grupo C → origen en EE/VIF (H1/H3);
+- si las matrices son coherentes y la salida no → microcódigo VU1 (H2), reproducible después offline con
+  `vu1_replay`.
+Complemento: un savestate de PCSX2 en la misma cinemática para comparar la memoria VU1.
+
+## 25. GS-4: análisis causal con la evidencia existente (2026-10-31, sin ejecutar el juego)
+
+Evidencia local en `analysis/local/gs4/` (`groups.py`, `transform_fit.py`, `scan_vu1_office.py`, `scan_big.py`,
+`scan_pc.py`, `vu1_0300.lst`).
+
+### 25.1 Atributos de los grupos (HECHO)
+
+| | Cabeza H (982) | Racimo C (52) | Grupo L (3) |
+|---|---|---|---|
+| RGBA | R 15–225, G 15–162, B 15–106, A 128 | **igual rango** (15–225 / 15–162 / 15–106), A 128 | 140–173 / 103–126 / 69–83 |
+| `z/q` | 2,563–2,567·10⁶ | 2,598–2,599·10⁶ | 2,579·10⁶ |
+| niebla | 255 | 255 | 255 |
+
+- `z` es proporcional a `q` en los tres grupos (`z/q` casi constante, con una diferencia del 1,3 %): los vértices C y L
+  pasan por la misma proyección (misma cámara, mismo divisor) que la cabeza. **INFERENCIA:** el error está antes de
+  la proyección, en la posición en espacio de cámara; no en `DIV`, `FTOI` ni en el empaquetado.
+- Color: la diferencia media de R entre un vértice C y sus vecinos H es 23,5, frente a 26,8 entre vecinos H. El color
+  de los vértices desplazados es coherente con su posición real en la malla. **UNKNOWN:** si el color se calcula en el
+  VU1 con la normal transformada (entonces la parte de rotación usada para la luz sería correcta) o viene precalculado.
+
+### 25.2 ¿Una transformación común? (INFERENCIA, con límites)
+
+- Posición «prevista» de cada vértice C = media de sus vecinos H en las tiras (35 de 52 tienen vecinos H); espacio de
+  cámara salvo la focal: `X=(x−256)·w`, `Y=(y−112)·2·w`, `W=w`.
+- Ajuste afín observado = A·previsto + b: R² 0,97 en Y y 0,94 en W (0,61 en X). La dirección X prevista pasa a −Y
+  observada con escala ≈ 0,86–1,0; la otra dirección sale comprimida (0,12–0,43), pero los puntos previstos apenas
+  varían en Y (desviación 2 028 frente a 11 642) y son casi coplanares, así que esa escala está sesgada hacia cero por
+  el ruido de la estimación y no es fiable.
+- **Corrección de §24.2:** allí se infirió «matriz degenerada (escala casi nula)» por el tamaño del racimo en pantalla
+  (4×28 píxeles). El ajuste muestra que el racimo es compatible con el parche correcto girado ~90° en el plano y
+  acercado ~1 100 unidades a la cámara: **una transformación distinta**, no necesariamente degenerada. El grupo L
+  (3 vértices con texturas distintas en el mismo punto) sí está colapsado.
+
+### 25.3 Procedencia con las herramientas existentes
+
+- **GS Replay (HECHO):** registra lotes ya ensamblados; no guarda la ruta GIF ni el bit ADC. El entorno de coma
+  flotante tampoco la distingue: los 3 282 lotes de la malla están en `nearest`.
+- **Captura VU1 de la oficina (`gameplay_001k/cap_office`, HECHO):** el analizador GIF (`scan_vu1_office.py`)
+  decodifica las 3 779 muestras (392 tiras en las primeras 400; 9 980 de 24 252 vértices con ADC). Hay dos entradas
+  VU1 en la imagen `a0dbee2a…`: `0x00b8` (área mediana 7,8 px²) y `0x0300` (1,49 px², mallas de personaje). Los 39
+  triángulos grandes son escenario (tiras con área mediana de miles de px²); **ninguno** tiene la firma del castillo.
+  Al ser una captura muestreada, no prueba que la malla de la cabeza esté bien en la oficina.
+- **Microcódigo (HECHO, estático, `vu1_0300.lst`):** la entrada `0x0300` lee índices por vértice (`ILWR`/`ILW`),
+  transforma con `MULA/MADDA`, divide (`DIV`), recorta (`CLIP` + `FCAND`, que decide ADC), convierte (`FTOI4`) y emite
+  con `XGKICK`. **INFERENCIA:** la selección de matriz por vértice o por grupo es compatible con un subconjunto de
+  vértices mal transformado.
+- **No disponible:** memoria VU1 de entrada, paquetes PATH1 y transferencias VIF/DMA del castillo; memoria EE en el
+  VSync 27100; referencia PCSX2 de la escena.
+
+### 25.4 Hipótesis por respaldo
+
+| | Hipótesis | Respaldo |
+|---|---|---|
+| 1 | Matriz (o par índice/matriz) incorrecta para un grupo de vértices en la entrada del VU1: EE/VU0 o estado arrastrado del checkpoint | alto: error previo a la proyección, transformación distinta pero coherente, determinista en dos fotogramas |
+| 2 | VIF/DMA: matriz o índices escritos en otra dirección de VU1 | medio: mismo síntoma; sin evidencia directa |
+| 3 | Microcódigo VU1 mal ejecutado al seleccionar la matriz (`ILWR`/`ILW`, ramas) | bajo-medio: `verify` no lo detectaría si intérprete y compilado comparten el fallo |
+| 4 | Rasterizador, frontal GIF, ADC/VCLIPw | descartado (§24.3, §25.1) |
+| 5 | Comportamiento original | bajo: sin oráculo |
+
+### 25.5 PCSX2 (sin ejecutar)
+
+- Estados existentes: 01–08 (menú y oficina) y 09 (castillo con control, posterior a la cinemática). Ninguno es de la
+  cinemática del VSync 27100.
+- Para una comparación equivalente haría falta, con el mismo ISO PAL: un estado guardado durante la cinemática y, en
+  ese fotograma, un volcado GS de PCSX2 (`.gs`, todas las transferencias GIF) más la memoria VU1 del estado
+  (`vu1Memory.bin`, como en s09). El volcado GS permite comparar directamente los vértices de la malla `TBP0=10752`
+  con los de `cap2`.
+
+### 25.6 Plan de una corrida dirigida (no ejecutado)
+
+- **Instrumentación temporal mínima:** la captura VU1 de GAMEPLAY_001K (`G001K_VU1_CAPTURE_INSTRUMENTATION.diff`:
+  `ps2_vu1_capture.inc`, ganchos en `ps2_runtime.cpp` y `ps2_memory.cpp`, sin cabeceras) con un modo de ventana que
+  guarde **todas** las llamadas de la entrada `0x0300` en los VSync 27100–27101 (en lugar del muestreo), más el gancho
+  de GS Replay (`capture_hook.inc`) en la misma ventana. Opcional: volcado de la memoria EE de las fuentes DMA del
+  VIF1 en esos VSync.
+- **Datos:** memoria VU1 y registros antes y después de cada llamada, paquetes PATH1 (con ADC) y lotes del GS.
+- **Correspondencia:** cada lote de `cap2` (registros 9591–14271) se casa con los vértices PATH1 por coordenadas,
+  STQ y color.
+- **Coste estimado:** ~1 100 llamadas por VSync × ~37 KB ≈ 40–80 MB; corrida de 1–2 min hasta el VSync 27101;
+  compilación incremental de 3 unidades y enlace (~3 min), y otra para retirarla.
+- **Criterios:** matriz/índices anómalos ya en la memoria VU1 de entrada y también en la memoria EE de origen → EE/VU0
+  (o estado del checkpoint); anómalos en VU1 pero correctos en EE → VIF/DMA; entrada coherente y salida errónea →
+  microcódigo VU1, reproducible después offline con `vu1_replay`.
+
+## 26. GS-4: captura causal VU1/VIF/DMA y origen en el EE (2026-10-31, una ejecución)
+
+Autorizada una única ejecución corta e instrumentada. Sin correcciones. Evidencia en `analysis/local/gs4/` (no
+versionada): `cap/run1/` (captura), `ana/` (scripts y resultados), `instr/` (instrumentación retirada, sus diffs y el
+guion de la corrida), `morph_unit/` (prueba offline del código generado).
+
+### 26.1 Instrumentación y corrida
+
+- **Instrumentación temporal (retirada):**
+  - `instr/gs4_capture.inc`, incluido por `ps2_runtime.cpp`, más ganchos de solo observación en `ps2_memory.cpp`
+    (PATH1, segmentos de la cadena DMA del VIF1 y encolado de la cadena) y en `ps2_vif1_interpreter.cpp` (inicio de
+    cada flujo VIF1, con los registros VIF1);
+  - el gancho de GS Replay en `runtime/dmc_overrides.cpp`.
+  - Diffs: `instr/GS4_VENDOR_INSTRUMENTATION.diff` y `instr/GS4_OVERRIDES_HOOK.diff`.
+  - Compilación incremental: 4 unidades más el enlace (~3 min).
+- **Datos capturados:**
+  - todas las llamadas MSCAL/MSCNT de los VSync 27099–27101, en formato V1S1 de GAMEPLAY_001K, legible por
+    `vu1_replay`: estado VU1 y memoria de datos antes y después de cada llamada, y paquetes PATH1;
+  - cada flujo VIF1, con sus registros iniciales, su mapa de segmentos DMA (dirección EE de cada trozo) y sus bytes;
+  - RDRAM y scratchpad al entrar en los VSync 27100 y 27101;
+  - GS Replay de los VSync 27100–27101.
+- **Corrida:** una, desde `g002_castle_entry.dmck`. Duró 118 s y terminó por el fichero STOP en cuanto acabaron las dos
+  capturas, con 173 MB de datos VU1/VIF/EE.
+  - VU1: 2 772 llamadas.
+  - VIF1: 3 flujos, uno por VSync (una cadena DMA por fotograma: 9 773 etiquetas, 24 829 segmentos y 1 967 912 bytes).
+  - GS Replay: 28 631 registros.
+- **HECHO:** los registros 9591–14271 (malla de la cabeza) de la nueva captura GS son idénticos a los de `cap2`
+  (E2). El defecto se reproduce de forma determinista en esta corrida.
+- **Restauración:** se revirtieron los tres ficheros del vendor y `dmc_overrides.cpp`, y se recompiló de forma
+  incremental. El ejecutable resultante solo difiere de `9e07ee8b…` en las dos marcas de tiempo PE (4 bytes); se
+  repuso la copia `9e07ee8b…`.
+  - Vendor `614c0eee` limpio; 33 parches; lock sin cambios; checkpoint `4c841943…`.
+  - `gs_replay` da IDENTICAL sobre `cap2` (`--force-zte`) y sobre la nueva captura.
+
+### 26.2 De los vértices GS a la entrada del VU1 (HECHO)
+
+- **Programa VU1:** la cabeza se dibuja con el microprograma de *skinning* MSCAL `0x0f00` (carga matrices de la
+  memoria VU1 176–191), seguido de MSCNT en `0x0fc0`/`0x13a8`.
+  - Cada MSCNT procesa 48 vértices con doble búfer (TOP 192/592).
+  - Cada vértice ocupa 5 QW en `TOP+4+5k`: posición V3-32, normal V3-32, ST V2-16, índices V4-8 (`.y` = matriz, `.z`/`.w`
+    = matrices de mezcla) y pesos V4-5.
+  - En la malla, la llamada `k` emite el vértice GIF `k`.
+- **Llamadas con vértices anómalos:** los 52 vértices del grupo C y los 3 del grupo L (§24) salen de 19 llamadas
+  MSCNT por fotograma (18 en `0x13a8` y 1 en `0x0fc0`), mezclados con vértices sanos (1–19 por llamada). El patrón se repite igual en los
+  VSync 27099, 27100 y 27101.
+- **Matriz e índices:** en el VSync 27100 hay 2 724 vértices de la malla (106 apariciones de C y 12 de L). **C, L y la
+  mayoría de H usan la misma matriz** (`vi11=16`, sin mezcla, peso 248/248).
+- **Posición de entrada:** es la que difiere. Un vértice H del plano medio tiene ≈ (0; 817; 32); los C tienen
+  ≈ (0; 25; 843); los L, ≈ (−1,4; −0,7; 3,9).
+- **Validación del modelo:** reproducir en Python la transformación del programa con las matrices capturadas
+  recupera los vértices GS con un error mediano de 0,05 px (2 359 vértices).
+
+### 26.3 VIF y DMA (HECHO)
+
+- **VIF:** un decodificador VIF1 independiente (`ana/vifsim.py`, semántica del manual/PCSX2: STCYCL, máscaras, modos
+  y TOPS/DBF) recorrió el flujo del VSync 27100.
+  - De las 924 llamadas, comparó los 203 740 QW escritos por el VIF con la memoria VU1 capturada, sin contar las
+    componentes indefinidas de V2/V3.
+  - **0 diferencias**, y el TOP previsto coincide en las 924 llamadas.
+- **DMA:**
+  - los 24 829 segmentos del flujo coinciden byte a byte con la RDRAM volcada;
+  - recorrer la cadena de forma independiente desde el volcado da la misma secuencia de 9 773 etiquetas (CNT, NEXT,
+    REF y END);
+  - las posiciones llegan por `UNPACK V3-32` con etiquetas REF que apuntan directamente a matrices de la EE.
+- **Origen de los atributos:**
+  - En los lotes de la cara, las posiciones vienen de un búfer animado en `0x015E8A70`–`0x015F1B94`.
+  - Normales, ST, índices y pesos vienen de las matrices del modelo (`0x0151C000`–`0x01526000`).
+  - La fuente estática de cada entrada del búfer está en `entrada − 0xD1800`. 1 338 entradas son copias idénticas;
+    466 están modificadas.
+
+### 26.4 Primera divergencia: `Morph_sub_h` traducido (HECHO salvo donde se indica)
+
+- **Valores de los vértices C en el búfer:** son la posición estática con los componentes desplazados.
+  - Búfer `(0,000; 25,274; 843,076)` frente a estático `(25,416; 843,141; 14,890)`, es decir, `(dx, x+dy, y+dz)`.
+  - Otras entradas muestran `0xFFFFFFFF` en algún componente.
+- **`Morph_sub_h`** (`0x1b2090`–`0x1b2104`, `.symtab`; función de morph con deltas s16 y 4 bits fraccionarios) monta
+  la posición fuente con `pand`/`lwu`/`prot3w`/`or`/`lwu`/`or`/`prot3w`/`lwu`/`or`/`prot3w` y la pasa a VU0 en modo macro
+  (`qmtc2`, `vitof4`, `vmulx`, `vadd`). El resultado depende de dos semánticas de la traducción:
+  - **`PROT3W`:** el generador produce `_mm_shuffle_epi32(rt, _MM_SHUFFLE(0,3,2,1))`, que rota **las cuatro**
+    palabras `(w1, w2, w3, w0)`. El R5900 rota solo las tres inferiores y conserva la palabra 3: `(w1, w2, w0, w3)`.
+    La macro `PS2_PROT3W` tiene el mismo error.
+  - **`LWU`:** se traduce como `SET_GPR_U32`, que hace `(int64_t)(int32_t)`: extiende el signo, cuando el R5900
+    extiende con ceros.
+- **Prueba con el código generado real** (`morph_unit/`: el `Morph_sub_h_0x1b2090.cpp` existente, enlazado contra el
+  runtime del parche 33, con entradas sintéticas):
+
+  | Fuente | delta·ritmo | Generado | R5900 |
+  |---|---|---|---|
+  | (25,416; 843,141; 14,890) | (0,5; −1; 1,5) | (0,500; 24,416; 844,641) | (25,916; 842,141; 16,390) |
+  | (−3,312; 837,962; 30,996) | (0,5; −1; 1,5) | (0,500; −4,312; `0xFFFFFFFF`) | (−2,812; 836,962; 32,496) |
+  | (1; 2; 3) | 0 | (0; 1; 2) | (1; 2; 3) |
+
+- **Coincidencia con el búfer capturado** (`ana/sim_passes.py`): de las 466 entradas modificadas de la cara, el modelo
+  bit a bit de la semántica generada aplicada 1, 2 o 3 veces (una por objetivo de morph sobre el mismo búfer)
+  reproduce el patrón por componente de 321. Entre ellas están 89 de los 106 C (una pasada) y los 12 L (dos pasadas).
+  **La semántica del R5900 no reproduce ninguna.** Las 145 restantes no se explican con este modelo, que toma la
+  delta como 0 (UNKNOWN).
+- **Reconstrucción:**
+  - **Método:** tomar la posición estática más la delta recuperada (`dx = c0`, `dy = c1 − x`, `dz = c2 − y`; todas
+    menores de 0,33) y aplicar la transformación capturada.
+  - **Resultado:** los 89 vértices C de una pasada caen **dentro de la cabeza** (x 279–340, y 47–100), a una mediana
+    de 0,47 px (máximo 1,75) del vértice H más próximo.
+- **Efecto de cada error** sobre las 466 fuentes reales:
+  - corrigiendo solo `PROT3W`, el operando queda intacto en 231 (las que no tienen componentes negativos);
+  - corrigiendo solo `LWU`, en 0;
+  - corrigiendo los dos, en 466.
+- **VU1:** `vu1_replay` reproduce las 2 772 llamadas capturadas con el intérprete de forma exacta, bit a bit en estado,
+  memoria y PATH1.
+  - El programa compilado coincide con el intérprete en 2 715 llamadas, con 0 discrepancias y 57 sin programa
+    compilado.
+  - Limitación: ambos son implementaciones de PS2Recomp. Aquí no importa, porque la entrada ya llega mal.
+- **Alcance en el ELF:**
+  - `PROT3W` aparece en 9 instrucciones de 3 funciones: `Morph_sub_h` (afectada), `Morph_calc_h` (solo en la
+    secuencia de almacenamiento, que la rotación de 4 palabras no altera) e `InterpNode` (`ret0`).
+  - `LWU` aparece en 1 224 instrucciones de 269 funciones; el efecto depende de que se usen los bits altos.
+- **Upstream:** en la copia local de `origin/main` (eb8688b, 2026-10-14), `LWU` ya se traduce con `SET_GPR_ZE32`
+  (#244), pero `PROT3W` sigue igual. Nuestro vendor fijado no incluye #244.
+- **`ret0` llamados en la corrida:** solo `katVu0Setmat4_shw`.
+
+### 26.5 Conclusión y estado de las hipótesis de §25.4
+
+- **Conclusión (HECHO + INFERENCIA):** VIF/DMA y VU1 coinciden con sus entradas. La primera divergencia observable está
+  en el EE: el búfer de posiciones animadas de la cara contiene valores incompatibles con la semántica del R5900 y
+  explicados por la traducción generada de `PROT3W` (rotación de 4 palabras) y `LWU` (extensión de signo) en
+  `Morph_sub_h`.
+- **INFERENCIA:** `Morph_sub_h`, ejecutado por el RECOMP, es quien escribe esas entradas. No se trazó el EE: no se
+  observó la llamada ni su llamador (`Face_morph`, `Morph*`).
+- **Búfer estable:** el búfer no cambia entre los VSync 27100 y 27101. Pudo recalcularse igual en cada fotograma o
+  escribirse antes (incluso antes del checkpoint, que también lo grabó el RECOMP); el escritor sería el mismo.
+- **Corrección de §25.2 y §25.4:**
+  - **§25.2:** el aparente «giro de ~90° y acercamiento» era el desplazamiento de componentes `(x, y, z) → (dx, x, y)`.
+  - **Hipótesis 1** (matriz o índices incorrectos): refutada. Matriz e índices son iguales en C y H; lo erróneo es la
+    posición, generada en el EE.
+  - **Hipótesis 2** (VIF/DMA): refutada; 0 diferencias.
+  - **Hipótesis 3** (microcódigo VU1): refutada como causa; la entrada ya llega mal y el intérprete coincide con el
+    compilado.
+  - **Hipótesis 5** (comportamiento original): muy improbable, porque la semántica del R5900 deja intactas las 466
+    fuentes. Falta el oráculo de PCSX2.
+- **Abierto:** las 145 entradas sin explicar; el llamador; la comparación con PCSX2 (no hay estado guardado de la
+  cinemática).
+- **Corrección general propuesta (no aplicada):** como parche del generador, en `patches/`:
+  - `translatePROT3W` y `PS2_PROT3W` → `_MM_SHUFFLE(3,0,2,1)`;
+  - `LWU` con extensión a cero, equivalente a #244;
+  - pruebas en `ps2xTest` que comprueben la semántica, no solo el registro fuente.
+  - Requiere regenerar el código EE y volver a validar: `morph_unit` con el código regenerado, GS Replay del castillo
+    sin racimo C y, si es posible, PCSX2.
+
+## 27. GS-4: corrección de PROT3W y LWU (parche 34) y validación (2026-11-01 a 2026-11-06)
+
+Evidencia local en `analysis/local/gs4/p34/` (propuesta, auditoría, arneses y corridas) y `analysis/local/p34int/`
+(integración). Parche: `patches/GS4_prot3w_lwu_r5900_semantics.patch`.
+
+### 27.1 Corrección
+
+- `translatePROT3W` y `PS2_PROT3W`: `_MM_SHUFFLE(3,0,2,1)` = `{w1, w2, w0, w3}`, como PCSX2 (`MMI.cpp`).
+- `LWU`: `SET_GPR_U64(ctx, rt, (uint64_t)(uint32_t)…)`. Extiende con ceros los 64 bits bajos y deja los altos sin
+  tocar, como PCSX2 y con el mismo efecto que el arreglo upstream #244 (`SET_GPR_ZE32`).
+- Dos pruebas nuevas en `ps2xTest`: cadena emitida y semántica, con la secuencia `lwu`/`or`/`prot3w`.
+- Código EE afectado (HECHO, regeneración completa con el TOML versionado): 270 ficheros, 1 224 líneas `LWU` y 7
+  `PROT3W`, ninguna otra.
+
+### 27.2 Validación offline
+
+- `Morph_sub_h` generado (466 entradas reales del búfer facial): el código antiguo coincide bit a bit con el modelo
+  erróneo; el nuevo conserva la fuente.
+- **Auditoría de las 1 224 LWU** (flujo de datos por función con el C++ que emite PS2Recomp, seguido entre funciones;
+  antiguo y nuevo solo difieren en los bits 63..32 y solo con el bit 31 de la palabra a 1):
+  - 1 171 sin ningún observador de esos bits;
+  - 16 salen de la función sin observador;
+  - 1 retorno a un llamador indirecto, sin resolver;
+  - 27 acaban en un `sd` de 64 bits. En 10 el dato es estático, sin bit 31 en 4 estados reales; en 17 son campos
+    de registros GS (`TEX1.MXL`, `TEX0.TBP0`, contadores, transferencias de imagen);
+  - 3 en `Morph_sub_h` (GS-4);
+  - 6 en `printf` (`u_quad` de `va_arg(unsigned)`).
+- En ninguna instrucción el cambio empeora el resultado. Arnés diferencial antiguo/nuevo con la RDRAM real del
+  castillo:
+  - control `CreatPacketLineF5` idéntico, incluso con bit 31;
+  - `TEX1_2` con bit 31: el antiguo pierde K y el nuevo coincide con el modelo R5900;
+  - `__udivdi3`/`__umoddi3` exactos.
+- **Volcados reales:** 25 474 pares A+D de `TEX0`/`TEX1`/`BITBLTBUF`/`TRXPOS`/`TRXREG`, sin ninguna palabra alta
+  `0xFFFFFFFF`.
+- `printf`: los formatos sin signo referenciados van a pantallas de depuración (`eprintf2` es un stub vacío en esta
+  versión) o a errores de consola. INFERENCIA: no hay texto visible afectado.
+- **Reconstrucción de la cabeza (VSync 27100), no captura:** regla de ADC del microprograma `0x0f00` (indicador
+  `0x80` de la entrada o `CLIPw.xyz` de los tres últimos vértices), que reproduce 2 722/2 724 indicadores capturados.
+  - La ejecución antigua dibujaba 1 641 triángulos, 3 de ellos de más de 1 000 px² (las cuñas).
+  - Con la semántica R5900 serían 1 851 y ninguno de más de 1 000 px².
+  - Los 210 añadidos usan las 365 entradas H corrompidas, que el VU1 recortaba: la ejecución antigua dejaba
+    además huecos en la cara.
+
+### 27.3 Corridas
+
+- **Checkpoint (corrige una hipótesis anterior):**
+  - Hipótesis: `g002_castle_entry.dmck` guardaba el búfer facial ya dañado.
+  - Refutación (HECHO, lectura de bytes): el checkpoint lo contiene limpio, con 1 804/1 804 entradas iguales a su
+    fuente estática. En la captura antigua (`cap/run1`) hay 466 modificadas.
+  - Estado: el daño se producía durante la ejecución antigua, tras la carga.
+- **Corrida experimental** (2026-11-05, exe `1e845972…`): ni la cuña ni el triángulo aparecen en 27060 y
+  27240–27420; 0 FATAL. El guardado de checkpoint pedido en 27100 se rechazó («GS local->host buffer not fully
+  consumed», ya conocido en el castillo).
+- **Ronda A/B:**
+  - corrida A, exe estable `9e07ee8b…`: 433 capturas PrintWindow;
+  - corrida B, experimental: **no produjo capturas**. El capturador no encontró la ventana y terminó, y la corrida
+    se detuvo a los 73 s. Fallo de método;
+  - como lado experimental se usaron las 3 capturas PrintWindow de la corrida experimental anterior (mismo exe,
+    checkpoint y parámetros), emparejadas por contenido de imagen, no por tick.
+  - HECHO: en la estable aparecen las cuñas en 27060, 27240 (dos) y 27420 (también sobre la cara de Trish); en la
+    experimental, ninguna. El resto de la escena coincide.
+  - **Moteado de suelo y muro en 27240 (previo):** en tres zonas sin cuña, 0 píxeles distintos entre las dos
+    versiones y el mismo número de motas. Lo comparten ambas versiones, así que no lo causa el parche.
+- Logs con los mismos mensajes; 0 FATAL en las tres corridas.
+
+### 27.4 Estado
+
+- **GS-4 corregido en las escenas observadas del castillo.**
+- Abierto:
+  - la actualización del búfer facial no se ha observado directamente en ejecución (sin volcado de RDRAM en el
+    castillo);
+  - cobertura general de LWU fuera de los estados revisados (17 campos dinámicos, el retorno indirecto, `printf`
+    indirectos).
+- Hallazgos aparte, sin corregir:
+  - el generador traduce `bltz`/`bgez`/`blez`/`bgtz` mirando 32 bits (el R5900 mira el bit 63); ninguna LWU llega a
+    esas ramas;
+  - `PEXEH`/`PEXEW`/`PEXCH`/`PEXCW` difieren de PCSX2, sin usos en DMC.
+- El árbol EE activo difiere de la regeneración con el TOML versionado en 20 ficheros previos al parche. La
+  integración no los toca: solo sustituye los 270.
+
+### 27.5 Ejecutable integrado (BUILD_001D, 2026-11-06)
+
+- HECHO: el patchset local tiene 34 parches; los hashes de `upstream.lock.json` coinciden y `patched_commit`
+  `ea54616d…` se reprodujo con `pipeline.py bootstrap` sobre la base limpia. El vendor queda limpio en ese commit.
+- HECHO: `ps2x_tests` (herramientas compiladas desde el vendor integrado): 459 superadas y 24 fallos, la misma salida
+  que en la línea base del parche 33; las 2 pruebas nuevas pasan.
+- HECHO: la regeneración en un directorio nuevo es idéntica a `gen_fix` (10 129 ficheros); frente al árbol activo
+  difiere en los 270 ficheros del parche (1 224 líneas `LWU`, 7 `PROT3W`, 0 de otro tipo) y en los 20 previos, que no
+  se tocan. El árbol de entrada de la compilación es el activo más esos 270.
+- HECHO: árbol Ninja Multi-Config nuevo, con la configuración de BUILD_001C. La compilación completa (10 231 tareas)
+  la interrumpió dos veces una protección de memoria del entorno, por memoria ocupada fuera de la compilación;
+  se reanudó con el progreso de Ninja intacto (`-j4` y después `-j2`). Ninja termina con «no work to do».
+- HECHO: exe integrado `a1e08309e6d5731af8c32ee66927f695c91bcee4331ad1e83d370b597147c3de` (87 793 664 bytes).
+  Frente al experimental validado `1e845972…`: mismo tamaño y secciones; `.text`, `.data`, `.pdata`, `.rsrc` y
+  `.reloc` idénticos byte a byte; solo difieren la marca de tiempo COFF y la del directorio de depuración (POGO) en
+  `.rdata`. INFERENCIA: el código es el mismo que se validó en el castillo, así que contiene las mismas correcciones.
+- HECHO: el exe estable `9e07ee8b…`, los checkpoints (incluido `g002_castle_entry.dmck`, `4c841943…`), el árbol
+  activo (10 130 ficheros) y los 20 ficheros previos siguen intactos.
+- Pendiente: una corrida del exe integrado (requiere autorización) y el commit del patchset.
+
+### 27.6 Validación funcional del exe integrado (P34_VAL_001, 2026-11-06)
+
+Tres corridas cortas del exe `a1e08309…` desde copias de checkpoints, sin entrada de mando ni instrumentación, con
+un capturador corregido (búsqueda de ventana con reintentos, solo PrintWindow, capturas por tiempo de reloj):
+
+- HECHO, menú (`dmc_checkpoint_mainmenu_abi2_tsnd_visual001_v1`, 50 s): título correcto; la película de demostración
+  `0x234` se reproduce; 0 FATAL.
+- HECHO, oficina (`g002_O_office`, 122 s): una captura es idéntica píxel a píxel a la referencia del mismo checkpoint
+  con un exe anterior (`d4_restoreA`, tick 16700); 0 FATAL.
+- HECHO, castillo (`g002_castle_entry`, hasta el tick 27540, 714 capturas):
+  - dos capturas son idénticas píxel a píxel a las del exe experimental (val1) en ~27240 y ~27420;
+  - ninguna captura tiene la cuña: 0 con más de 5 000 px naranjas, frente a 210 de 433 en la corrida estable;
+  - el log tiene los mismos 75 tipos de mensaje que la corrida estable.
+- El tick de cada captura es aproximado (el log escribe cada 60 VSync, con retraso); las parejas se fijan por
+  contenido.
+- No observado: el búfer facial en memoria. No hay un mecanismo validado sin instrumentación; queda pendiente.
+- Cobertura: menú, demostración, oficina y castillo hasta 27540. No se han probado el combate, otras salas ni la
+  tarjeta de memoria.
+
+Evidencia local: `analysis/local/p34val/` (no está en Git).
+
+### 27.7 Estado actual (2026-11-06)
+
+- GS-4: **corregido visualmente con el parche 34** (exe integrado, 34 parches). Los §27.3–27.4 recogen el estado de
+  2026-11-05 y se conservan como históricos.
+- Corridas del exe integrado en el menú, la oficina y el castillo: sin regresiones observadas (§27.6).
+- El moteado de suelo y muro del castillo es previo al parche (§27.3).
+- El búfer facial no se ha observado directamente ni en la corrida experimental ni en la integrada.
+- La cobertura de LWU fuera de esas escenas sigue siendo limitada.
+- GS-1, GS-2, GS-3 y GS-5 (`PERF_003_GS_OPEN_ISSUES.md`) son incidencias independientes y siguen abiertas.

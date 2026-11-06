@@ -1,0 +1,304 @@
+diff --git a/ps2xRecomp/src/lib/instruction_translator.cpp b/ps2xRecomp/src/lib/instruction_translator.cpp
+index ae38ffa..88dc9df 100644
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -194,7 +194,8 @@ namespace ps2recomp
+         case OPCODE_LHU:
+             return fmt::format("SET_GPR_U32(ctx, {}, (uint16_t){});", inst.rt, genRead(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+         case OPCODE_LWU:
+-            return fmt::format("SET_GPR_U32(ctx, {}, {});", inst.rt, genRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
++            // Zero-extends the word into the low 64 bits; the upper 64 bits of rt are left unchanged.
++            return fmt::format("SET_GPR_U64(ctx, {}, (uint64_t)(uint32_t){});", inst.rt, genRead(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+         case OPCODE_SB:
+             return genWrite(8, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint8_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+         case OPCODE_SH:
+diff --git a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+index a2bcb77..485685a 100644
+--- a/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/mmi_translation_helpers.cpp
+@@ -520,8 +520,8 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translatePROT3W(const Instruction &inst)
+     {
+-        // Rotates words left by 3: [d,c,b,a] -> [a,d,c,b]
+-        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(0,3,2,1)));",
++        // Rotates the three low words and keeps word 3: rd = {rt.w1, rt.w2, rt.w0, rt.w3}
++        return fmt::format("SET_GPR_VEC(ctx, {}, _mm_shuffle_epi32(GPR_VEC(ctx, {}), _MM_SHUFFLE(3,0,2,1)));",
+                            inst.rd, inst.rt);
+     }
+ 
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index f7b3316..b026acf 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -727,7 +727,7 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
+ #define PS2_PCPYLD(rs, rt) _mm_unpacklo_epi64(rt, rs)
+ #define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(2, 3, 0, 1)), _MM_SHUFFLE(2, 3, 0, 1))
+ #define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
+-#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
++#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(3, 0, 2, 1))
+ 
+ // Additional VU0 operations
+ #define PS2_VSQRT(x) sqrtf(x)
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 07dbe32..afbf324 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -259,6 +259,28 @@ void register_code_generator_tests()
+                  "constant MMIO SW should not go through WRITE32 address classification");
+     });
+ 
++    tc.Run("LWU zero-extends and PROT3W keeps word 3", [](TestCase &t) {
++        CodeGenerator gen({}, {});
++
++        Instruction lwu = makeIType(0x1000, OPCODE_LWU, 5, 6, 8);
++        const std::string lwuOut = gen.translateInstruction(lwu);
++        t.IsTrue(lwuOut.find("SET_GPR_U64(ctx, 6, (uint64_t)(uint32_t)") != std::string::npos,
++                 "LWU should zero-extend the loaded word into the low 64 bits: " + lwuOut);
++        t.IsTrue(lwuOut.find("SET_GPR_U32(") == std::string::npos && lwuOut.find("SET_GPR_S32(") == std::string::npos,
++                 "LWU must not use the sign-extending 32-bit setters: " + lwuOut);
++
++        Instruction prot3w{};
++        prot3w.isMMI = true;
++        prot3w.opcode = OPCODE_MMI;
++        prot3w.function = MMI_MMI2;
++        prot3w.sa = MMI2_PROT3W;
++        prot3w.rd = 3;
++        prot3w.rt = 5;
++        const std::string protOut = gen.translateInstruction(prot3w);
++        t.IsTrue(protOut.find("_mm_shuffle_epi32(GPR_VEC(ctx, 5), _MM_SHUFFLE(3,0,2,1))") != std::string::npos,
++                 "PROT3W should be {w1, w2, w0, w3}: " + protOut);
++    });
++
+     tc.Run("constant RDRAM load and store emit fast memory access", [](TestCase &t) {
+         Function func;
+         func.name = "rdram_access";
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index a60d056..51170bc 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -18,6 +18,7 @@
+ #include "Stubs/VU.h"
+ #include "runtime/checkpoint/checkpoint.h"
+ 
++#include <array>
+ #include <atomic>
+ #include <cstdint>
+ #include <cstring>
+@@ -319,6 +320,64 @@ void register_ps2_runtime_expansion_tests()
+ {
+     MiniTest::Case("PS2RuntimeExpansion", [](TestCase &tc)
+     {
++        tc.Run("PROT3W and LWU follow R5900 semantics", [](TestCase &t)
++        {
++            auto words = [](__m128i v)
++            {
++                std::array<uint32_t, 4> w{};
++                std::memcpy(w.data(), &v, sizeof(w));
++                return w;
++            };
++            const uint32_t patterns[][4] = {
++                {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u},
++                {0x80000000u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x00000000u},
++                {0x41CA302Fu, 0x4452C4E2u, 0xC14FC0CEu, 0x7F800001u},
++                {0x00000000u, 0x00000000u, 0x00000000u, 0xDEADBEEFu},
++            };
++            for (const auto &p : patterns)
++            {
++                const __m128i rt = _mm_setr_epi32((int)p[0], (int)p[1], (int)p[2], (int)p[3]);
++                const std::array<uint32_t, 4> expected{p[1], p[2], p[0], p[3]};
++                t.IsTrue(words(_mm_shuffle_epi32(rt, _MM_SHUFFLE(3, 0, 2, 1))) == expected,
++                         "emitted PROT3W expression must give {w1, w2, w0, w3}");
++                t.IsTrue(words(PS2_PROT3W(rt)) == expected, "PS2_PROT3W must give {w1, w2, w0, w3}");
++            }
++
++            const uint32_t loads[] = {0u, 1u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0xC14FC0CEu, 0x4452C4E2u};
++            for (uint32_t value : loads)
++            {
++                R5900Context ctx{};
++                R5900Context *c = &ctx;
++                ctx.r[6] = _mm_setr_epi32((int)0xAAAAAAAAu, (int)0xBBBBBBBBu, (int)0xCCCCCCCCu, (int)0xDDDDDDDDu);
++                SET_GPR_U64(c, 6, (uint64_t)(uint32_t)value);
++                const std::array<uint32_t, 4> expected{value, 0u, 0xCCCCCCCCu, 0xDDDDDDDDu};
++                t.IsTrue(words(ctx.r[6]) == expected, "emitted LWU must zero-extend and keep the upper 64 bits");
++            }
++
++            // pand; lwu x; prot3w; lwu y; or; prot3w; lwu z; or; prot3w: builds {x, y, z, 0} from three words
++            const uint32_t sources[][3] = {
++                {0x41CB5375u, 0x4452C908u, 0x416E3D71u},
++                {0xC053F7CFu, 0x4451BD9Au, 0x41F7F7CFu},
++                {0xFFFFFFFFu, 0x80000000u, 0x7FFFFFFFu},
++            };
++            for (const auto &s : sources)
++            {
++                R5900Context ctx{};
++                R5900Context *c = &ctx;
++                SET_GPR_VEC(c, 6, _mm_setzero_si128());
++                SET_GPR_U64(c, 6, (uint64_t)(uint32_t)s[0]);
++                SET_GPR_VEC(c, 7, _mm_shuffle_epi32(GPR_VEC(c, 6), _MM_SHUFFLE(3, 0, 2, 1)));
++                SET_GPR_U64(c, 6, (uint64_t)(uint32_t)s[1]);
++                SET_GPR_U64(c, 7, GPR_U64(c, 7) | GPR_U64(c, 6));
++                SET_GPR_VEC(c, 7, _mm_shuffle_epi32(GPR_VEC(c, 7), _MM_SHUFFLE(3, 0, 2, 1)));
++                SET_GPR_U64(c, 6, (uint64_t)(uint32_t)s[2]);
++                SET_GPR_U64(c, 7, GPR_U64(c, 7) | GPR_U64(c, 6));
++                SET_GPR_VEC(c, 6, _mm_shuffle_epi32(GPR_VEC(c, 7), _MM_SHUFFLE(3, 0, 2, 1)));
++                const std::array<uint32_t, 4> expected{s[0], s[1], s[2], 0u};
++                t.IsTrue(words(ctx.r[6]) == expected, "LWU/OR/PROT3W sequence must assemble {x, y, z, 0}");
++            }
++        });
++
+         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
+         {
+             R5900Decoder decoder;
+@@ -357,6 +416,7 @@ void register_ps2_runtime_expansion_tests()
+             runtime.registerFunction(0x1100u, &testResumeNextFunctionHandler);
+ 
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.pc = 0x1010u;
+             auto fn = runtime.lookupFunction(ctx.pc);
+             fn(nullptr, &ctx, &runtime);
+@@ -375,6 +435,7 @@ void register_ps2_runtime_expansion_tests()
+             runtime.registerFunction(0x2000u, &testResumeOwnerFallbackHandler);
+ 
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.pc = 0x2010u;
+             auto fn = runtime.lookupFunction(ctx.pc);
+             fn(nullptr, &ctx, &runtime);
+@@ -391,6 +452,7 @@ void register_ps2_runtime_expansion_tests()
+             runtime.registerFunction(0x3000u, &testGuestBranchImplicitReturnHandler);
+ 
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.pc = 0x2000u;
+ 
+             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+@@ -417,6 +479,7 @@ void register_ps2_runtime_expansion_tests()
+             gGuestJumpTargetCount.store(0u, std::memory_order_relaxed);
+ 
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.pc = 0x2000u;
+ 
+             const bool continuedInCaller = runtime.dispatchGuestBranch(
+@@ -442,6 +505,7 @@ void register_ps2_runtime_expansion_tests()
+             runtime.registerFunction(0x3100u, &testGuestBranchTransferHandler);
+ 
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.pc = 0x2000u;
+ 
+             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+@@ -466,6 +530,7 @@ void register_ps2_runtime_expansion_tests()
+             runtime.registerFunction(0x3200u, &testGuestBranchImplicitReturnHandler);
+ 
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.pc = 0x2000u;
+ 
+             const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+@@ -865,6 +930,7 @@ void register_ps2_runtime_expansion_tests()
+                               uint32_t arg6 = 0u)
+             {
+                 R5900Context ctx{};
++                R5900Context *c = &ctx;
+                 setRegU32(ctx, 29, kStackAddr);
+                 setRegU32(ctx, 4, 1u);
+                 setRegU32(ctx, 5, command);
+@@ -908,6 +974,7 @@ void register_ps2_runtime_expansion_tests()
+             PS2Runtime runtime;
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.pc = 0x0010B470u;
+ 
+             ps2_stubs::sceIpuInit(rdram.data(), &ctx, &runtime);
+@@ -951,6 +1018,7 @@ void register_ps2_runtime_expansion_tests()
+             PS2Runtime runtime;
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+ 
+             constexpr uint32_t kDestAddr = 0x00002000u;
+             constexpr uint32_t kFormatAddr = 0x00002100u;
+@@ -1081,6 +1149,7 @@ void register_ps2_runtime_expansion_tests()
+         {
+             PS2Runtime runtime;
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+ 
+             ctx.pc = 0x2000u;
+             ctx.branch_pc = 0x1FFCu;
+@@ -1104,6 +1173,7 @@ void register_ps2_runtime_expansion_tests()
+         {
+             PS2Runtime runtime;
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+ 
+             ctx.pc = 0x3000u;
+             ctx.in_delay_slot = false;
+@@ -1122,6 +1192,7 @@ void register_ps2_runtime_expansion_tests()
+             PS2Runtime runtime;
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.in_delay_slot = true;
+ 
+             bool threw = false;
+@@ -1203,6 +1274,7 @@ void register_ps2_runtime_expansion_tests()
+             writeVuInstructionPair(code, 16u, makeVuSq(0xFu, 2u, 0u, 1), kVuEndNop);
+ 
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             runtime.executeVU0Microprogram(runtime.memory().getRDRAM(), &ctx, 0u);
+ 
+             float output[4]{};
+@@ -1240,6 +1312,7 @@ void register_ps2_runtime_expansion_tests()
+             const uint32_t expected =
+                 (((seed << 1) ^ x ^ y) & 0x007FFFFFu) | 0x3F800000u;
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.vu0_r = _mm_castsi128_ps(
+                 _mm_set1_epi32(static_cast<int32_t>(seed)));
+             runtime.executeVU0Microprogram(runtime.memory().getRDRAM(), &ctx, 0u);
+@@ -1301,6 +1374,7 @@ void register_ps2_runtime_expansion_tests()
+                 kVuUpperNop);
+ 
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+             ctx.vu0_fbrst = 1u << 3; // TE0
+             runtime.executeVU0Microprogram(runtime.memory().getRDRAM(), &ctx, 0u);
+ 
+@@ -1421,6 +1495,7 @@ void register_ps2_runtime_expansion_tests()
+         {
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+ 
+             constexpr uint32_t kOutAddr = 0x00100000u;
+             constexpr uint32_t kMatrixAddr = 0x00100040u;
+@@ -1455,6 +1530,7 @@ void register_ps2_runtime_expansion_tests()
+         {
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+ 
+             constexpr uint32_t kDstAddr = 0x00100100u;
+             constexpr uint32_t kSrcAddr = 0x00100140u;
+@@ -1489,6 +1565,7 @@ void register_ps2_runtime_expansion_tests()
+         {
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+ 
+             constexpr uint32_t kStateAddr = 0x00100200u;
+             constexpr uint32_t kBaseAddr = 0x00101000u;
+@@ -1533,6 +1610,7 @@ void register_ps2_runtime_expansion_tests()
+         {
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+             R5900Context ctx{};
++                R5900Context *c = &ctx;
+ 
+             constexpr uint32_t kStateAddr = 0x00100400u;
+             constexpr uint32_t kBaseAddr = 0x00102000u;
