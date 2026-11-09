@@ -139,6 +139,10 @@
     {
       "path": "patches/GS4_prot3w_lwu_r5900_semantics.patch",
       "sha256": "4b1769b1006045573c50cc72715bcba6437aaa1b41f79bad1fbafe38d703dd9f"
+    },
+    {
+      "path": "patches/VISUAL_010_gs_triangle_coverage.patch",
+      "sha256": "a4d1d20e2466422cb01bdefb25f33ef870bfd9e18e1866231341b6a8fe94068a"
     }
   ],
   "patch_identity": {
@@ -147,5 +151,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "ea54616dd3a3d0e5ab099d9150335fbdc27e1db7"
+  "patched_commit": "0a696611250982a739a385072357ba36ffee5dfc"
 }
