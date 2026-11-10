@@ -769,3 +769,31 @@ arriba). Los diecinueve patches actualmente activos:
       parche.
     - Coste: cambia `ps2_runtime_macros.h`, así que recompila todo el código generado (~10 000 objetos).
       Documentación: `analysis/notes/PERF_003_ARCHITECTURE_FEASIBILITY.md`, secciones 24 a 27.
+35. `VISUAL_010_gs_triangle_coverage.patch` (convención B). Fidelidad del GS: cobertura semiabierta de triángulos.
+    - `ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp`, `DrawTriangle`: la prueba de cobertura era inclusiva y con
+      margen (`w ≥ −1e-4`), y los píxeles de una arista compartida por dos triángulos vecinos se dibujaban dos veces.
+      Con mezcla aditiva salían puntos claros; en DMC, una fila de puntos en el cielo del castillo.
+    - Ahora se usan funciones de arista exactas en `double`, ancladas igual en los dos triángulos, con la regla
+      arriba-izquierda: la convención `[ceil, ceil)` del rasterizador SW de PCSX2, adaptada al muestreo en `+0,5`.
+      No cambian la posición de muestreo, `XYOFFSET`, la interpolación, la tijera, la mezcla ni ZTE.
+    - Tests: suite nueva `PS2GSTriangleCoverage` (6), por el camino de registros. Comprueba que no hay dobles ni
+      huecos y que el dueño no depende del orden, con:
+      - mallas subpíxel con las dos orientaciones;
+      - aristas horizontales, verticales y diagonales sobre centros de píxel;
+      - un abanico;
+      - triángulos diminutos y degenerados;
+      - tijera;
+      - una arista compartida con mezcla aditiva.
+    - En el corpus bilineal se vuelven a grabar los 24 hashes de triángulos STQ: en cada uno cambian 3 píxeles con el
+      centro exactamente sobre una arista derecha o inferior; los 144 sprites no cambian.
+    - Suite: 489 tests, los mismos 24 fallos preexistentes.
+    - Validación con GS Replay (`cap2`):
+      - desaparecen los 11 puntos del cielo;
+      - cambian 433 bytes de VRAM y 48 píxeles de la imagen, todos explicados por la regla o por su propagación
+        (posprocesado y copias);
+      - 0 grietas;
+      - el efecto de ZTE no cambia;
+      - es determinista.
+    - Coste: en torno al +2 % del tiempo del rasterizador en el banco.
+    - No corrige el moteado oscuro ni las líneas diagonales de la oficina (sin captura) ni el mar (GS-5).
+      Documentación: `analysis/notes/VISUAL_010_GS_TRIANGLE_COVERAGE.md`.

@@ -1,0 +1,447 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index cde2536..4a2e8a8 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1230,7 +1230,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+ 
+     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+-    constexpr float kEdgeEpsilon = 1.0e-4f;
++
++    // Half-open (top-left) coverage. An inclusive test with a tolerance (w >= -1e-4) drew the pixels of an edge shared
++    // by two adjacent triangles twice, which shows as bright dots with additive blending.
++    // Edge functions in double are exact here: positions are multiples of 1/16 and sample points of 1/2, so a shared
++    // edge evaluates to exactly opposite values in both triangles. On the edge (e == 0) the pixel belongs to the
++    // triangle whose inward normal points to +x, or to +y when the edge is horizontal (left and top edges), which is
++    // the [ceil(l), ceil(r)) x [ceil(t), ceil(b)) convention of PCSX2's GSRasterizer. Interpolation is unchanged.
++    struct CoverEdge
++    {
++        double ax, ay, nx, ny;
++        bool inclusive;
++    };
++    CoverEdge coverEdges[3];
++    {
++        const double ex[3] = {fx0, fx1, fx2};
++        const double ey[3] = {fy0, fy1, fy2};
++        for (int i = 0; i < 3; ++i)
++        {
++            const int j = (i + 1) % 3;
++            const int k = (i + 2) % 3;
++            double nx = -(ey[j] - ey[i]);
++            double ny = ex[j] - ex[i];
++            if (nx * (ex[k] - ex[i]) + ny * (ey[k] - ey[i]) < 0.0)
++            {
++                nx = -nx;
++                ny = -ny;
++            }
++            // Anchor on the lexicographically smaller endpoint so that both triangles of a shared edge evaluate the
++            // same expression with a negated normal.
++            const bool iFirst = ex[i] < ex[j] || (ex[i] == ex[j] && ey[i] <= ey[j]);
++            const int anchor = iFirst ? i : j;
++            coverEdges[i] = {ex[anchor], ey[anchor], nx, ny, nx > 0.0 || (nx == 0.0 && ny > 0.0)};
++        }
++    }
+ 
+     for (int y = minY; y <= maxY; ++y)
+     {
+@@ -1239,13 +1272,23 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+         {
+             float px = static_cast<float>(x) + 0.5f;
+ 
++            bool covered = true;
++            for (const CoverEdge &edge : coverEdges)
++            {
++                const double e = edge.nx * (static_cast<double>(px) - edge.ax) + edge.ny * (static_cast<double>(py) - edge.ay);
++                if (e < 0.0 || (e == 0.0 && !edge.inclusive))
++                {
++                    covered = false;
++                    break;
++                }
++            }
++            if (!covered)
++                continue;
++
+             float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+             float w2 = 1.0f - w0 - w1;
+ 
+-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+-                continue;
+-
+             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+ 
+             uint8_t r, g, b, a;
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 9220754..71f5bec 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -15,6 +15,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
+ #include <cstdint>
+ #include <cstring>
+ #include <string>
+@@ -3869,7 +3870,10 @@ void register_ps2_gs_tests()
+         {
+             // Differential corpus for SampleTexture's bilinear path. Every case draws into a cleared 64x32 CT32
+             // frame and the frame page is hashed. kGolden was recorded with the runtime BEFORE the zero-fraction
+-            // shortcut (PERF_001 P3); the shortcut must reproduce every hash exactly.
++            // shortcut (PERF_001 P3); the shortcut must reproduce every hash exactly. The 24 STQ-triangle hashes
++            // (every 7th case) were re-recorded with the half-open triangle coverage: each of those triangles has 3
++            // pixels whose centre lies exactly on a right or bottom edge, which the previous inclusive test drew.
++            // Interior pixels and all sprite cases are unchanged.
+             // Coverage: PSM CT32/CT24/CT16/CT16S/T8/T4 (CLUT CT32 and CT16), the four CLAMP modes, sprites whose
+             // per-pixel bilinear fractions are exactly zero (UV span == pixel span), near zero (span + 1 texel) and
+             // large (half span), origins inside the texture and across its right/bottom edge, TEXA, TFX/TCC,
+@@ -3877,60 +3881,60 @@ void register_ps2_gs_tests()
+             static const std::vector<uint64_t> kGolden = {
+                 0xBC857D0F03F8B888ull, 0xC0F02C48F6BA0EECull, 0xE525BCCA07E58322ull,
+                 0xEB96CC05C2CD260Aull, 0x7C93CD8E55F19944ull, 0xA0FF78F5A4A79909ull,
+-                0x0D0CE250551B2032ull, 0xF6CBAAFD52A0D63Dull, 0x36338E96E68DB2BCull,
++                0x1F359E69A28EE4B3ull, 0xF6CBAAFD52A0D63Dull, 0x36338E96E68DB2BCull,
+                 0xD9DB7FE20026F1F1ull, 0xEE86C4FE81D01F0Cull, 0x075C624BC2EAE511ull,
+-                0x1E541BA7880A9049ull, 0x5956A81DF0E2E02Cull, 0x80283F29E298ED5Eull,
++                0x1E541BA7880A9049ull, 0x00F7A9199CAA1FA0ull, 0x80283F29E298ED5Eull,
+                 0x9F2DFC7C948EF48Aull, 0x0B9EE9CE53A1413Full, 0x7F2A06372E7AEA43ull,
+-                0xA2F95DA912EA9343ull, 0xF99CFDA30EA4CE70ull, 0x4B514611EB8F397Eull,
++                0xA2F95DA912EA9343ull, 0xF99CFDA30EA4CE70ull, 0x254436A4B4571CCBull,
+                 0x03087198A4BB0B83ull, 0x1C61590E56F75CFBull, 0x070A5A375B4296E2ull,
+                 0x2C9491C01ABD9E63ull, 0x90D9A806E7E620C5ull, 0xE731AC6F28EC5E66ull,
+-                0xDC85913B3EFA1226ull, 0x234E0DD3B08167EDull, 0xA7A6F1371BBA2C20ull,
++                0x596EC7AA47E4459Eull, 0x234E0DD3B08167EDull, 0xA7A6F1371BBA2C20ull,
+                 0xF910994E63878213ull, 0xE2C8B56EDECA3AABull, 0x675815EFD05FE783ull,
+-                0x0BB19B590E847F2Bull, 0xF8A7A4A99FAD6F1Cull, 0x78CCEACDCEEDACA9ull,
++                0x0BB19B590E847F2Bull, 0x56D95FDFA9B8E2B6ull, 0x78CCEACDCEEDACA9ull,
+                 0x675815EFD05FE783ull, 0x4559543B8A28D691ull, 0xCD60DAACB0261736ull,
+-                0x128893EF97747BECull, 0xFE95131D514D4A0Cull, 0x827D07A7925A59A7ull,
++                0x128893EF97747BECull, 0xFE95131D514D4A0Cull, 0x2FA96A6A3DE1BCD9ull,
+                 0x3D17982BFAF4736Dull, 0xC36D6474FC5B17B5ull, 0x18BF344834DE41E7ull,
+                 0xF558E56F47CA2C83ull, 0xC37E5ACA3DEBF483ull, 0x11792B0692C7B985ull,
+-                0x5F16489EA0AC22D9ull, 0x6C49F25455BEE807ull, 0xBFEB6213EAC310DEull,
++                0x769C747AF3B286BAull, 0x6C49F25455BEE807ull, 0xBFEB6213EAC310DEull,
+                 0x98EA16D084E3F097ull, 0x51D29F9B372F0C33ull, 0xA8393F93D83CA55Bull,
+-                0xB3F9FFB3A12B4ADDull, 0x8722EBCA9A05E737ull, 0xACEB8832FDF0B075ull,
++                0xB3F9FFB3A12B4ADDull, 0x533AD8314B2F6F19ull, 0xACEB8832FDF0B075ull,
+                 0x056248DBBAC63D7Eull, 0xB49A0E1A9FA101F2ull, 0xEBE6B2C831FFA51Dull,
+-                0xED4261823FAB2251ull, 0x085875347C41C58Bull, 0x492547B8E3BA42E9ull,
++                0xED4261823FAB2251ull, 0x085875347C41C58Bull, 0x12BF2BEEEF941409ull,
+                 0x7385D03E1A14B31Cull, 0x8F579FB4AFF30D8Eull, 0x6D16CE2344FCB93Aull,
+                 0xAF6BD0D80DDC41B7ull, 0xA953E40478AF03E1ull, 0x1A4C6D7D90A6A1B6ull,
+-                0xC00BB643E8CE7677ull, 0x0CA1EEB633985F7Bull, 0x9895AF597FB27C0Dull,
++                0x144A3CEBDD09A2E4ull, 0x0CA1EEB633985F7Bull, 0x9895AF597FB27C0Dull,
+                 0x8BCF44E1118EAB46ull, 0x02CAA1C5069B4283ull, 0x9523461B519CEDA3ull,
+-                0x8BFB0F625AB6203Eull, 0xDDAC26880DE6DA5Eull, 0xEC40235FCD225183ull,
++                0x8BFB0F625AB6203Eull, 0xF1E544771F872573ull, 0xEC40235FCD225183ull,
+                 0x266DEC6777EB5E42ull, 0x0FEEE4C8E1B30294ull, 0xE18A91BF0DF79E33ull,
+-                0xEA15444E0EA59584ull, 0x675815EFD05FE783ull, 0x7F1FC9DAA31DC74Cull,
++                0xEA15444E0EA59584ull, 0x675815EFD05FE783ull, 0xCFFA58009FBA4868ull,
+                 0x1FD914069FB6AC6Cull, 0x8A48F8143289E97Cull, 0x84625283548764DDull,
+                 0xEDC7F756793448EFull, 0xC80CBBBE2099FFC4ull, 0xC4B16034EF1DE152ull,
+-                0xA1D18798BE7CF571ull, 0xB309927D92C8A84Bull, 0xA10170318273602Bull,
++                0x9135540F82D15341ull, 0xB309927D92C8A84Bull, 0xA10170318273602Bull,
+                 0x714C5FA69B0E610Bull, 0x4663AE2D851B93F7ull, 0xB1B922E719A46F26ull,
+-                0x0DA32E1212038BA7ull, 0x51E4278D282870F5ull, 0x0995F2F6E99CC786ull,
++                0x0DA32E1212038BA7ull, 0x62E670DD46E5EC7Aull, 0x0995F2F6E99CC786ull,
+                 0x1C571CF8195FA1ABull, 0x54F383D431210C6Dull, 0x7FAA4419AC393E03ull,
+-                0xE0BF5FDFCC787263ull, 0xB6204D54415FA96Cull, 0xFD21B8A73A808299ull,
++                0xE0BF5FDFCC787263ull, 0xB6204D54415FA96Cull, 0x24C4E2289DF837C4ull,
+                 0x5E8F7795940BAA03ull, 0xDAFD3C5530AF2CDDull, 0xE3334F1E7F227487ull,
+                 0x9F8651A56C823CE3ull, 0x881A27E2623D3DB3ull, 0xE1FD3E0D6EAA8F49ull,
+-                0x47C2305AE9D8F812ull, 0x79268493CCD96274ull, 0x5592DD401BED6383ull,
++                0x2C197E74221F8487ull, 0x79268493CCD96274ull, 0x5592DD401BED6383ull,
+                 0x675815EFD05FE783ull, 0x6FB8DE5FE353A383ull, 0x0E3626161C3AFB83ull,
+-                0x0E3626161C3AFB83ull, 0x6CC0B53D2FD056EBull, 0x8B9D7A09E24B6383ull,
++                0x0E3626161C3AFB83ull, 0x08559ECAF372DC57ull, 0x8B9D7A09E24B6383ull,
+                 0x0E3626161C3AFB83ull, 0x0E3626161C3AFB83ull, 0x6C12C9E6F08EFE27ull,
+-                0x7A2D0724A440DB83ull, 0x0E3626161C3AFB83ull, 0x0BEB1C0B5D9814E7ull,
++                0x7A2D0724A440DB83ull, 0x0E3626161C3AFB83ull, 0x2AE6137269E58CE4ull,
+                 0x675815EFD05FE783ull, 0x7933D83C05548F83ull, 0x33EFE9DED7C6A583ull,
+                 0x675815EFD05FE783ull, 0x675815EFD05FE783ull, 0xB4F68CECD582BF83ull,
+-                0x2A001CCB0226FC9Eull, 0xA300AE85CB1E30E3ull, 0x325894C357C5EBEBull,
++                0xB6625669CA05AFDEull, 0xA300AE85CB1E30E3ull, 0x325894C357C5EBEBull,
+                 0x36F6C92D5D70FB83ull, 0x0E3626161C3AFB83ull, 0xDD716B59F8163583ull,
+-                0x41A1704367D22A56ull, 0x19CBBD1084158953ull, 0x0E3626161C3AFB83ull,
++                0x41A1704367D22A56ull, 0x6506A7B84BEB7232ull, 0x0E3626161C3AFB83ull,
+                 0x675815EFD05FE783ull, 0xFDEE92F97CBE4F83ull, 0x058A95127525D783ull,
+-                0xAFDDCB1F35EFECE7ull, 0xD95CDAB618287F83ull, 0x61AD910AB9FB14DBull,
++                0xAFDDCB1F35EFECE7ull, 0xD95CDAB618287F83ull, 0xFF314271DC4047B1ull,
+                 0xDD531C2C0159D2E0ull, 0xC2F5D8A2B2979FB2ull, 0xA0F8838C01041383ull,
+                 0x029C85428A43B783ull, 0x0E3626161C3AFB83ull, 0x6FC861D2A563E583ull,
+-                0xD77E843C69FB4E4Bull, 0x627F82EF26AC1783ull, 0x675815EFD05FE783ull,
++                0xCAB8DC82ECDEF799ull, 0x627F82EF26AC1783ull, 0x675815EFD05FE783ull,
+                 0x675815EFD05FE783ull, 0x598D108DCE970383ull, 0x1DF8A2973F15DB03ull,
+-                0x81D273BF02E4FB83ull, 0xEE51071F91937393ull, 0x0E3626161C3AFB83ull,
++                0x81D273BF02E4FB83ull, 0x9DD8E12B42534DABull, 0x0E3626161C3AFB83ull,
+                 0x76F9E8113807E783ull, 0x0E3626161C3AFB83ull, 0x1E422320D20F8F83ull,
+-                0x350F55A570AACF83ull, 0xE2F569BFB1B3A383ull, 0x71765450BFB7885Eull,
++                0x350F55A570AACF83ull, 0xE2F569BFB1B3A383ull, 0xFDF5D61292E95906ull,
+             };
+             const size_t kGoldenCount = kGolden.size();
+ 
+@@ -5558,4 +5562,264 @@ void register_ps2_gs_tests()
+                      "CT16, ZTE=0: 16-bit colour written, neighbours and depth kept");
+         });
+     });
++    MiniTest::Case("PS2GSTriangleCoverage", [](TestCase &tc)
++    {
++        // Half-open (top-left) triangle coverage, as in PCSX2's GSRasterizer ([ceil(l), ceil(r)) x [ceil(t), ceil(b))
++        // at the backend's sample points): every pixel of an edge shared by two adjacent triangles is drawn exactly
++        // once, and adjacent triangles leave no gaps. Triangles go through the register path (PRIM, RGBAQ, XYZ2) into
++        // a 128x128 CT32 frame with TEST.ZTE = 0. A coverage count is drawn with additive blending (Cs * FIX / 128 + Cd,
++        // FIX = 128) of R = 1; the owner of each pixel is drawn without blending as the triangle id, in both orders.
++        struct Tri
++        {
++            float x[3];
++            float y[3];
++        };
++        constexpr uint32_t kW = 128u, kH = 128u, kFbw = kW / 64u;
++        struct Scissor
++        {
++            uint32_t x0 = 0u, x1 = kW - 1u, y0 = 0u, y1 = kH - 1u;
++        };
++        static const auto render = [](const std::vector<Tri> &tris, bool additive, bool reverse, const Scissor &sc)
++        {
++            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
++            GS gs;
++            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
++            gs.writeRegister(GS_REG_FRAME_1, (static_cast<uint64_t>(kFbw) << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
++            gs.writeRegister(GS_REG_ZBUF_1, 64ull | (1ull << 32));
++            gs.writeRegister(GS_REG_SCISSOR_1, static_cast<uint64_t>(sc.x0) | (static_cast<uint64_t>(sc.x1) << 16) |
++                                                   (static_cast<uint64_t>(sc.y0) << 32) | (static_cast<uint64_t>(sc.y1) << 48));
++            // XYZ2 holds unsigned 12.4 coordinates: vertices are sent with a 1024-pixel origin and XYOFFSET removes it.
++            constexpr uint64_t kOrigin = 1024u * 16u;
++            gs.writeRegister(GS_REG_XYOFFSET_1, kOrigin | (kOrigin << 32));
++            gs.writeRegister(GS_REG_TEST_1, 0ull);
++            gs.writeRegister(GS_REG_ALPHA_1, 0x68ull | (128ull << 32)); // A = Cs, B = 0, C = FIX, D = Cd
++            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (additive ? (1ull << 6) : 0ull));
++            for (size_t n = 0; n < tris.size(); ++n)
++            {
++                const size_t i = reverse ? tris.size() - 1u - n : n;
++                const uint64_t id = i + 1u;
++                const uint64_t rgba = additive ? (1ull | (0x80ull << 24))
++                                               : ((id & 0xFFu) | (((id >> 8) & 0xFFu) << 8) | (1ull << 16) | (0x80ull << 24));
++                gs.writeRegister(GS_REG_RGBAQ, rgba | (0x3F800000ull << 32));
++                for (int k = 0; k < 3; ++k)
++                    gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(std::lround(tris[i].x[k] * 16.0f) + kOrigin) |
++                                                      (static_cast<uint64_t>(std::lround(tris[i].y[k] * 16.0f) + kOrigin) << 16));
++            }
++            std::vector<uint32_t> out(kW * kH);
++            for (uint32_t y = 0; y < kH; ++y)
++                for (uint32_t x = 0; x < kW; ++x)
++                    out[y * kW + x] = readReferenceFramePSMCT32Pixel(vram, 0u, kFbw, x, y);
++            return out;
++        };
++        struct Report
++        {
++            uint32_t doubles = 0u, holes = 0u, extra = 0u, ownerChanges = 0u, covered = 0u;
++        };
++        // expected: 1 = covered exactly once, 0 = not covered, -1 = not judged.
++        static const auto check = [](const std::vector<Tri> &tris, const std::vector<int> &expected, const Scissor &sc)
++        {
++            const std::vector<uint32_t> count = render(tris, true, false, sc);
++            const std::vector<uint32_t> forward = render(tris, false, false, sc);
++            const std::vector<uint32_t> backward = render(tris, false, true, sc);
++            Report r;
++            for (uint32_t p = 0; p < kW * kH; ++p)
++            {
++                const uint32_t n = count[p] & 0xFFu;
++                r.covered += n >= 1u;
++                r.doubles += n >= 2u;
++                r.holes += expected[p] == 1 && n == 0u;
++                r.extra += expected[p] == 0 && n != 0u;
++                r.ownerChanges += n == 1u && (forward[p] & 0xFFFFu) != (backward[p] & 0xFFFFu);
++            }
++            return r;
++        };
++        static const auto rectangle = [](double x0, double x1, double y0, double y1, const Scissor &sc)
++        {
++            std::vector<int> e(kW * kH, 0);
++            for (uint32_t y = 0; y < kH; ++y)
++                for (uint32_t x = 0; x < kW; ++x)
++                {
++                    const double px = x + 0.5, py = y + 0.5;
++                    const bool inside = px >= x0 && px < x1 && py >= y0 && py < y1; // left and top edges inclusive
++                    e[y * kW + x] = inside && x >= sc.x0 && x <= sc.x1 && y >= sc.y0 && y <= sc.y1 ? 1 : 0;
++                }
++            return e;
++        };
++        // Mesh over [x0,x1]x[y0,y1] with nodes jittered on the 1/16 grid (boundary nodes stay on the rectangle), random
++        // diagonals, random winding and random first vertex. Deterministic LCG.
++        static const auto mesh = [](double x0, double x1, double y0, double y1, int nx, int ny, float jitter, uint32_t seed)
++        {
++            uint32_t rng = seed;
++            auto next = [&rng]() { return rng = rng * 1664525u + 1013904223u; };
++            auto q16 = [](float v) { return std::round(v * 16.0f) / 16.0f; };
++            std::vector<std::vector<std::pair<float, float>>> node(ny + 1, std::vector<std::pair<float, float>>(nx + 1));
++            for (int j = 0; j <= ny; ++j)
++                for (int i = 0; i <= nx; ++i)
++                {
++                    float x = static_cast<float>(x0 + (x1 - x0) * i / nx);
++                    float y = static_cast<float>(y0 + (y1 - y0) * j / ny);
++                    if (i > 0 && i < nx)
++                        x += jitter * ((next() % 2001u) / 1000.0f - 1.0f);
++                    if (j > 0 && j < ny)
++                        y += jitter * ((next() % 2001u) / 1000.0f - 1.0f);
++                    node[j][i] = {q16(x), q16(y)};
++                }
++            std::vector<Tri> tris;
++            auto add = [&](std::pair<float, float> a, std::pair<float, float> b, std::pair<float, float> c)
++            {
++                if (next() & 1u)
++                    std::swap(b, c);
++                const std::pair<float, float> v[3] = {a, b, c};
++                const uint32_t rot = next() % 3u;
++                Tri t{};
++                for (uint32_t k = 0; k < 3u; ++k)
++                {
++                    t.x[k] = v[(k + rot) % 3u].first;
++                    t.y[k] = v[(k + rot) % 3u].second;
++                }
++                tris.push_back(t);
++            };
++            for (int j = 0; j < ny; ++j)
++                for (int i = 0; i < nx; ++i)
++                {
++                    const auto a = node[j][i], b = node[j][i + 1], c = node[j + 1][i + 1], d = node[j + 1][i];
++                    if (next() & 1u)
++                    {
++                        add(a, b, c);
++                        add(a, c, d);
++                    }
++                    else
++                    {
++                        add(a, b, d);
++                        add(b, c, d);
++                    }
++                }
++            return tris;
++        };
++        static const auto exact = [](TestCase &t, const Report &r, uint32_t expectedCovered, const std::string &what)
++        {
++            t.Equals(r.doubles, 0u, what + ": no pixel drawn twice");
++            t.Equals(r.holes, 0u, what + ": no gap between adjacent triangles");
++            t.Equals(r.extra, 0u, what + ": nothing drawn outside the half-open region");
++            t.Equals(r.ownerChanges, 0u, what + ": owner of each pixel independent of the draw order");
++            if (expectedCovered)
++                t.Equals(r.covered, expectedCovered, what + ": covered pixel count");
++        };
++
++        tc.Run("adjacent_subpixel_triangles_cover_each_pixel_once", [](TestCase &t)
++        {
++            const Scissor sc;
++            const std::vector<Tri> tris = mesh(8.3125, 100.6875, 6.0625, 90.9375, 9, 7, 4.0f, 12345u);
++            exact(t, check(tris, rectangle(8.3125, 100.6875, 6.0625, 90.9375, sc), sc), 0u, "sub-pixel mesh, both windings");
++        });
++
++        tc.Run("edges_through_pixel_centres_follow_the_top_left_rule", [](TestCase &t)
++        {
++            // Horizontal, vertical and 45-degree edges through sample points: every edge pixel is an exact tie.
++            const Scissor sc;
++            const std::vector<Tri> tris = mesh(10.5, 106.5, 12.5, 108.5, 12, 12, 0.0f, 777u);
++            exact(t, check(tris, rectangle(10.5, 106.5, 12.5, 108.5, sc), sc), 96u * 96u, "mesh on pixel centres");
++            // One right triangle with its legs on pixel centres: left and top legs included, hypotenuse excluded.
++            const std::vector<Tri> one = {{{2.5f, 10.5f, 2.5f}, {2.5f, 2.5f, 10.5f}}};
++            std::vector<int> e(kW * kH, 0);
++            uint32_t n = 0;
++            for (uint32_t y = 0; y < kH; ++y)
++                for (uint32_t x = 0; x < kW; ++x)
++                    if (x >= 2u && y >= 2u && x + y < 12u)
++                    {
++                        e[y * kW + x] = 1;
++                        ++n;
++                    }
++            exact(t, check(one, e, sc), n, "single triangle on pixel centres");
++        });
++
++        tc.Run("fan_with_alternating_winding_has_no_doubles_or_gaps", [](TestCase &t)
++        {
++            const Scissor sc;
++            const float cx = 64.25f, cy = 63.75f;
++            constexpr int k = 48;
++            std::vector<std::pair<float, float>> ring;
++            for (int i = 0; i < k; ++i)
++            {
++                const double a = 2.0 * 3.14159265358979323846 * i / k;
++                ring.push_back({std::round(static_cast<float>(cx + 50.0 * std::cos(a)) * 16.0f) / 16.0f,
++                                std::round(static_cast<float>(cy + 47.0 * std::sin(a)) * 16.0f) / 16.0f});
++            }
++            std::vector<Tri> tris;
++            for (int i = 0; i < k; ++i)
++            {
++                Tri tr{{cx, ring[i].first, ring[(i + 1) % k].first}, {cy, ring[i].second, ring[(i + 1) % k].second}};
++                if (i & 1)
++                {
++                    std::swap(tr.x[1], tr.x[2]);
++                    std::swap(tr.y[1], tr.y[2]);
++                }
++                tris.push_back(tr);
++            }
++            std::vector<int> e(kW * kH, -1);
++            for (uint32_t y = 0; y < kH; ++y)
++                for (uint32_t x = 0; x < kW; ++x)
++                {
++                    int pos = 0, neg = 0;
++                    for (int i = 0; i < k; ++i)
++                    {
++                        const auto a = ring[i], b = ring[(i + 1) % k];
++                        const double s = (double(b.first) - a.first) * (y + 0.5 - a.second) -
++                                         (double(b.second) - a.second) * (x + 0.5 - a.first);
++                        pos += s > 0.0;
++                        neg += s < 0.0;
++                    }
++                    if (pos == k || neg == k)
++                        e[y * kW + x] = 1; // strictly inside the polygon
++                }
++            exact(t, check(tris, e, sc), 0u, "48-triangle fan");
++        });
++
++        tc.Run("tiny_and_degenerate_triangles", [](TestCase &t)
++        {
++            const Scissor sc;
++            const std::vector<Tri> tris = mesh(20.0625, 31.9375, 20.1875, 30.8125, 16, 16, 0.2f, 4242u);
++            exact(t, check(tris, rectangle(20.0625, 31.9375, 20.1875, 30.8125, sc), sc), 0u, "sub-pixel triangles");
++            const std::vector<Tri> collinear = {{{40.0f, 60.0f, 80.0f}, {40.0f, 50.0f, 60.0f}}};
++            const Report r = check(collinear, std::vector<int>(kW * kH, 0), sc);
++            t.Equals(r.covered, 0u, "a collinear triangle draws nothing");
++        });
++
++        tc.Run("scissor_clips_adjacent_triangles_without_doubles_or_gaps", [](TestCase &t)
++        {
++            Scissor sc;
++            sc.x0 = 21u;
++            sc.x1 = 69u;
++            sc.y0 = 15u;
++            sc.y1 = 60u;
++            const std::vector<Tri> tris = mesh(8.3125, 100.6875, 6.0625, 90.9375, 9, 7, 4.0f, 777u);
++            exact(t, check(tris, rectangle(8.3125, 100.6875, 6.0625, 90.9375, sc), sc), 0u, "scissored mesh");
++        });
++
++        tc.Run("additive_shared_edge_of_two_large_triangles_is_blended_once", [](TestCase &t)
++        {
++            // Two large adjacent triangles sharing a long, shallow edge (slope ~0.054), as in a sky dome. With an
++            // inclusive coverage test the shared edge produced a row of doubly blended (brighter) pixels.
++            const Scissor sc;
++            const float dx = 6.0f, dy = -30.0f;
++            const std::vector<Tri> tris = {
++                {{-65.0f + dx, 225.9375f + dx, 293.4375f + dx}, {47.5625f + dy, 470.125f + dy, 66.75f + dy}},
++                {{293.4375f + dx, 85.0625f + dx, -65.0f + dx}, {66.75f + dy, -368.0625f + dy, 47.5625f + dy}},
++            };
++            const double ax = -65.0 + dx, ay = 47.5625 + dy, bx = 293.4375 + dx, by = 66.75 + dy;
++            const double len = std::hypot(bx - ax, by - ay);
++            std::vector<int> e(kW * kH, -1);
++            for (uint32_t y = 0; y < kH; ++y)
++                for (uint32_t x = 0; x < kW; ++x)
++                    if (std::fabs(((bx - ax) * (y + 0.5 - ay) - (by - ay) * (x + 0.5 - ax)) / len) < 2.0)
++                        e[y * kW + x] = 1; // band around the shared edge, covered by one of the two triangles
++            exact(t, check(tris, e, sc), 0u, "shared edge of two large triangles");
++            const std::vector<uint32_t> count = render(tris, true, false, sc);
++            bool singleBlend = true;
++            for (uint32_t p = 0; p < kW * kH; ++p)
++                if (e[p] == 1 && (count[p] & 0x00FFFFFFu) != 1u)
++                    singleBlend = false;
++            t.IsTrue(singleBlend, "additive result along the shared edge is Cs + Cd once (R = 1)");
++        });
++    });
+ }
