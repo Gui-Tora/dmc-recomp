@@ -7,6 +7,61 @@
 #include <cstdlib>
 #include <string>
 #include "p311_pad_test.inc"
+#include "runtime/gs/gs_async_backend.h"
+
+// PERF_004D (experimental, candidate patch 36): asynchronous GS raster backend, opt-in.
+//   DMC_GS_ASYNC=1                  install gsasync::GSAsyncBackend before the checkpoint load; unset: the synchronous
+//                                   GSCpuBackend stays (default behaviour unchanged)
+//   DMC_GS_ASYNC_AFFINITY=physical  producer (game thread) and GS consumer on two different physical cores
+//   DMC_GS_ASYNC_FINISH_BARRIER=1   diagnostic: Sync(Finish) waits for the consumer
+//   DMC_GS_ASYNC_CAPACITY=<n>       queue slots (default 8192)
+//   DMC_GS_ASYNC_UPLOAD_RETAIN=<n>  largest upload buffer a slot keeps for reuse, bytes (PERF_004E; default 65536)
+//   DMC_GS_ASYNC_UPLOAD_BUDGET=<n>  upload bytes all slots may hold before buffers are released after use (PERF_004E; default 0)
+//   DMC_GS_ASYNC_PENDING_BUDGET=<n> upload payload bytes that may be queued and not yet executed (PERF_004F;
+//                                   default 33554432; 18446744073709551615 = no limit, the PERF_004E behaviour)
+// Presentation: the presenter's request goes to a mailbox; the game thread enqueues the marker at its next GS call,
+// and the presenter shows the newest complete VRAM copy with that request (one presentation of latency).
+// Statistics: one "[GS:async]" line on stderr every 2 s.
+static void startDmcGsAsync(PS2Runtime &runtime)
+{
+    const char *on = std::getenv("DMC_GS_ASYNC");
+    if (!on || std::string(on) != "1")
+        return;
+    gsasync::Options o;
+    if (const char *cap = std::getenv("DMC_GS_ASYNC_CAPACITY"))
+        o.capacity = static_cast<size_t>(std::strtoull(cap, nullptr, 0));
+    if (const char *v = std::getenv("DMC_GS_ASYNC_UPLOAD_RETAIN"))
+        o.uploadRetainBytes = static_cast<size_t>(std::strtoull(v, nullptr, 0));
+    if (const char *v = std::getenv("DMC_GS_ASYNC_UPLOAD_BUDGET"))
+        o.uploadRetainBudget = static_cast<size_t>(std::strtoull(v, nullptr, 0));
+    if (const char *v = std::getenv("DMC_GS_ASYNC_PENDING_BUDGET"))
+        o.pendingUploadBudget = static_cast<size_t>(std::strtoull(v, nullptr, 0));
+    const size_t uploadRetain = o.uploadRetainBytes, uploadBudget = o.uploadRetainBudget,
+                 pendingBudget = o.pendingUploadBudget;
+    const char *aff = std::getenv("DMC_GS_ASYNC_AFFINITY");
+    o.affinity = (aff && std::string(aff) == "physical") ? gsasync::Affinity::PhysicalCores : gsasync::Affinity::None;
+    const char *fin = std::getenv("DMC_GS_ASYNC_FINISH_BARRIER");
+    o.drainOnFinish = fin && std::string(fin) == "1";
+    o.statsIntervalSeconds = 2.0;
+    o.tick = [&runtime] { return runtime.memory().gs().vsyncTick.load(std::memory_order_acquire); };
+    // Default marker (Options::Marker::PresenterRequest): VRAM and display registers of the same instant. Two earlier
+    // variants were refuted in PERF_004D: a marker at the first GS call of each tick with the registers of that
+    // instant showed transient DISPFB/DISPLAY values (castle, FBP 100/84, 640x512); with the presenter's registers it
+    // showed buffers whose letterbox band was not yet drawn (office, 6 of 200 images).
+    auto backend = std::make_unique<gsasync::GSAsyncBackend>(std::move(o));
+    std::fprintf(stderr, "[GS:async] installed: capacity %zu, slot %zu B, affinity %s (producer mask %llx, consumer mask %llx), finish barrier %d, upload retain %zu budget %zu, pending budget %zu, tsc_hz %.0f\n",
+                 backend->capacity(), gsasync::GSAsyncBackend::slotBytes(), aff ? aff : "none",
+                 static_cast<unsigned long long>(backend->producerCoreMask()),
+                 static_cast<unsigned long long>(backend->consumerCoreMask()), fin && std::string(fin) == "1" ? 1 : 0,
+                 uploadRetain, uploadBudget, pendingBudget,
+                 [] {
+                     const auto t0 = std::chrono::steady_clock::now();
+                     const uint64_t c0 = __rdtsc();
+                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                     return double(__rdtsc() - c0) / std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                 }());
+    runtime.gs().setRasterBackend(std::move(backend));
+}
 
 // Instrumented ret0 stand-ins for the 15 R5900/VU0 functions that are still not
 // restored (SLES_503.58). History: they were stubbed when Ghidra's R6 language
@@ -99,6 +154,7 @@ namespace
     void applyHugeFunctionInstrumentation(PS2Runtime &runtime)
     {
         startP311PadTest();
+        startDmcGsAsync(runtime); // PERF_004D (opt-in: DMC_GS_ASYNC=1)
         registerRet0(runtime, 0x0016B8E0u, "Calc_md", dmcStub_Calc_md);
         registerRet0(runtime, 0x001A0180u, "capVu0MulMatrix_r", dmcStub_capVu0MulMatrix_r);
         registerRet0(runtime, 0x0016D920u, "Calc_scr_light", dmcStub_Calc_scr_light);
