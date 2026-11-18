@@ -143,6 +143,10 @@
     {
       "path": "patches/VISUAL_010_gs_triangle_coverage.patch",
       "sha256": "a4d1d20e2466422cb01bdefb25f33ef870bfd9e18e1866231341b6a8fe94068a"
+    },
+    {
+      "path": "patches/PERF_004D_gs_async_backend.patch",
+      "sha256": "b54c06be5e3b2ab3606a335ef1795988c915516bd75a4436ec9775295dd2a641"
     }
   ],
   "patch_identity": {
@@ -151,5 +155,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "0a696611250982a739a385072357ba36ffee5dfc"
+  "patched_commit": "247af5902d0c4936aa6b2b8a0e79f7a3f24ddbde"
 }

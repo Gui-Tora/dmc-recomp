@@ -1,0 +1,1186 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+new file mode 100644
+index 0000000..8504145
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -0,0 +1,1150 @@
++#pragma once
++// Experimental asynchronous GS raster backend (header-only, opt-in).
++//
++// GSAsyncBackend implements GSRasterBackend in front of an inner backend (normally GSCpuBackend). The calling thread
++// (producer) enqueues every operation that only mutates VRAM or backend state, with a deep copy of its inputs and the
++// caller's MXCSR control bits; one consumer thread executes them in the same order against the inner backend, which
++// therefore stays the single writer of VRAM. Operations whose result the caller needs (ReadVram, SnapshotVram,
++// GetTransferSnapshot, ConsumeLocalToHostBytes, Initialize, Sync(LocalToHost/DebugReadback/Reset)) first wait until
++// every earlier operation has executed ("drain"). Sync(Reset) and GetTransferSnapshot (checkpoint gates) also
++// invalidate published presentation frames.
++//
++// Presentation (Options::tick set): ordered presentation markers. By default Present() (any single presenter thread)
++// posts its request to a mailbox and the producer enqueues the marker at its next stream call; the consumer copies
++// the VRAM at that point of the stream into a triple buffer and Present() converts the newest complete copy with the
++// request that produced it. The presenter never reads VRAM the consumer is writing, the producer never waits for
++// presentation, and VRAM and display registers belong to the same instant (PERF_004D: a marker at the first GS call of
++// a tick paired with either the registers of that instant or the presenter's showed transient or unfinished
++// buffers in Devil May Cry; Options::Marker::VSyncBoundary keeps that variant for tests).
++// Without those options Present() enqueues a marker with the given request and waits for it (offline/replay use).
++//
++// Memory bound (PERF_004F): besides the slot count, the upload payload bytes published and not yet executed are limited
++// by Options::pendingUploadBudget. The producer reserves an upload's bytes before publishing it and waits while the
++// reservation would exceed the budget; the consumer returns them after executing (or discarding) the operation and
++// before advancing the tail, so the wait always ends: the queue keeps draining. An upload larger than the whole budget
++// is admitted alone, when no upload bytes are pending. Order and content of the stream do not change.
++//
++// Failure policy (default): a consumer exception or a wait longer than Options::hangTimeout logs and terminates the
++// process (fail-stop), because a detached consumer could still write VRAM after its owner is gone and silently
++// dropping operations would corrupt the frame. Tests may select the throwing/detaching policy instead.
++//
++// This header uses <windows.h> on Windows (topology, affinity, thread names); do not include it in a translation unit
++// that also includes raylib.h. It is not included by any runtime header, so generated code never depends on it.
++#include "runtime/gs/gs_cpu_backend.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <functional>
++#include <future>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++#include <xmmintrin.h>
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <intrin.h>
++#include <windows.h>
++#endif
++
++namespace gsasync
++{
++    inline constexpr uint32_t kMxcsrControlMask = 0xFFC0u;
++
++    inline uint64_t ticksNow()
++    {
++#if defined(_WIN32)
++        return __rdtsc();
++#else
++        return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
++#endif
++    }
++
++    enum class DrainReason : uint8_t
++    {
++        ReadVram, SnapshotVram, TransferSnapshot, ConsumeLocalToHost, Initialize, Sync, Explicit, Count
++    };
++
++    inline const char *drainReasonName(int r)
++    {
++        static const char *k[] = {"ReadVram", "SnapshotVram", "TransferSnapshot", "ConsumeLocalToHost", "Initialize", "Sync", "Explicit"};
++        return (r >= 0 && r < static_cast<int>(DrainReason::Count)) ? k[r] : "?";
++    }
++
++    enum class FailurePolicy : uint8_t
++    {
++        Terminate,      // log and terminate the process (default, safe)
++        ThrowAndDetach, // tests: store the exception and rethrow at the next drain; detach a hung consumer
++    };
++
++    enum class Affinity : uint8_t
++    {
++        None,          // scheduler's choice
++        PhysicalCores, // producer and consumer each restricted to (all logical processors of) a different physical core
++    };
++
++    struct Stats
++    {
++        // producer
++        uint64_t enqueued = 0, submits = 0, transfers = 0, uploads = 0, clears = 0, writes = 0, resets = 0;
++        uint64_t markers = 0, explicitPresents = 0;
++        uint64_t enqueueTicks = 0, copyTicks = 0, uploadBytes = 0;
++        uint64_t fullWaits = 0, fullWaitTicks = 0;
++        uint64_t drains = 0, drainsNonEmpty = 0, drainTicks = 0, drainMaxTicks = 0;
++        uint64_t drainsByReason[static_cast<int>(DrainReason::Count)] = {};
++        uint64_t occupancySum = 0, occupancyMax = 0;
++        uint64_t flushes = 0, textureFlushes = 0, syncFinish = 0, syncPresentation = 0, syncOther = 0;
++        uint64_t foreignProducerCalls = 0, wakeConsumer = 0;
++        uint64_t placementSamples = 0, placementSameCore = 0;
++        // consumer
++        uint64_t executed = 0, discarded = 0, execTicks = 0, mxcsrChanges = 0, sleeps = 0, sleepTicks = 0;
++        uint64_t clearMispredictions = 0, framesPublished = 0, framesOverwritten = 0, uploadTrims = 0;
++        // upload buffers (PERF_004E): producer allocations and their ticks, consumer releases (uploadTrims) and their
++        // ticks, bytes currently held by all slots (queued or idle) and the maximum seen by the producer
++        uint64_t uploadAllocs = 0, uploadAllocTicks = 0, uploadFreeTicks = 0, uploadHeldBytes = 0, uploadHeldMax = 0;
++        // pending upload bytes (PERF_004F): payload published and not yet executed, its maximum, producer waits for
++        // budget and their ticks, uploads larger than the whole budget (admitted alone)
++        uint64_t pendingBytes = 0, pendingMax = 0, budgetWaits = 0, budgetWaitTicks = 0, oversizeUploads = 0;
++        // presenter
++        uint64_t presentCalls = 0, framesConsumed = 0, framesStale = 0, presentNoNewFrame = 0, requestsReplaced = 0;
++        uint64_t latencyHist[5] = {}; // guest VSync tick at Present minus frame tick: 0,1,2,3,>=4
++    };
++
++    struct Options
++    {
++        size_t capacity = 8192;          // slots (rounded up to a power of two)
++        uint32_t spinIterations = 4000;  // busy polls before sleeping
++        std::chrono::milliseconds hangTimeout{10000};
++        bool propagateMxcsr = true;      // false only for the negative test
++        bool drainOnFinish = false;      // diagnostic: treat Sync(Finish) as a barrier
++        FailurePolicy failure = FailurePolicy::Terminate;
++        Affinity affinity = Affinity::None;
++        // Upload buffer retention (PERF_004E). After executing an upload the consumer keeps the slot's buffer for reuse
++        // only if it is at most uploadRetainBytes AND the bytes held by all slots (queued or idle) are at most
++        // uploadRetainBudget; otherwise it releases it. uploadRetainBudget = ~size_t(0) is the PERF_004D policy (per-slot
++        // limit only, which held 76-137 MB in game); the default 0 releases every buffer after use (PERF_004E: same speed,
++        // allocation and release cost < 0.1 ms per VSync).
++        size_t uploadRetainBytes = 64u * 1024u;
++        size_t uploadRetainBudget = 0;
++        // Upload payload bytes that may be queued (published, not yet executed) at once (PERF_004F). ~size_t(0): no
++        // limit (PERF_004E behaviour: up to capacity x upload size, 82 MB on DMC's static Options screen).
++        size_t pendingUploadBudget = 32u * 1024u * 1024u;
++        std::function<uint64_t()> tick;  // set: automatic presentation (Present() never waits for the consumer)
++        // Where the presentation marker goes in the stream (automatic presentation only):
++        //   PresenterRequest (default): Present() posts its request to a mailbox; the producer enqueues the marker at its
++        //       next stream call, so VRAM and display registers belong to the same instant, as with the synchronous
++        //       backend (one presentation of latency: Present() returns the newest frame already completed).
++        //   VSyncBoundary: marker at the first producer call that observes a new tick (registers: see below).
++        enum class Marker : uint8_t { PresenterRequest, VSyncBoundary } marker = Marker::PresenterRequest;
++        // Optional: display registers (pmode, smode2, dispfb1/2, display1/2, bgcolor) latched at the marker, merged by
++        // Present() over the request it receives. Unset: Present() uses its own request unchanged.
++        std::function<GSPresentationRequest()> presentationRequest;
++        double statsIntervalSeconds = 0.0; // > 0: periodic "[GS:async]" line on stderr (producer thread)
++    };
++
++    struct PresentResult
++    {
++        std::vector<uint8_t> vram;
++        GSPresentationRequest request{};
++        uint64_t tick = 0;
++    };
++
++    inline PresentationFrame convertFrame(const std::vector<uint8_t> &vram, const GSPresentationRequest &request)
++    {
++        thread_local GSCpuBackend viewer;
++        if (vram.empty())
++            return {};
++        viewer.Initialize(const_cast<uint8_t *>(vram.data()), static_cast<uint32_t>(vram.size()));
++        return viewer.Present(request);
++    }
++
++    // Physical core topology (logical processor masks of group 0, one per core).
++    inline const std::vector<uint64_t> &coreMasks()
++    {
++        static const std::vector<uint64_t> masks = [] {
++            std::vector<uint64_t> m;
++#if defined(_WIN32)
++            DWORD len = 0;
++            GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
++            std::vector<uint8_t> buf(len);
++            if (len && GetLogicalProcessorInformationEx(RelationProcessorCore,
++                                                        reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len))
++            {
++                for (DWORD off = 0; off < len;)
++                {
++                    auto *p = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
++                    if (p->Relationship == RelationProcessorCore && p->Processor.GroupCount >= 1 && p->Processor.GroupMask[0].Group == 0)
++                        m.push_back(static_cast<uint64_t>(p->Processor.GroupMask[0].Mask));
++                    off += p->Size;
++                }
++            }
++#endif
++            return m;
++        }();
++        return masks;
++    }
++
++    inline int coreOfProcessor(uint32_t cpu)
++    {
++        const auto &m = coreMasks();
++        for (size_t i = 0; i < m.size(); ++i)
++            if (cpu < 64 && (m[i] >> cpu) & 1u)
++                return static_cast<int>(i);
++        return -1;
++    }
++
++    inline uint32_t currentProcessor()
++    {
++#if defined(_WIN32)
++        return GetCurrentProcessorNumber();
++#else
++        return 0;
++#endif
++    }
++
++    class Core : public std::enable_shared_from_this<Core>
++    {
++    public:
++        Core(std::unique_ptr<GSRasterBackend> inner, Options options) : m_inner(std::move(inner)), m_options(std::move(options))
++        {
++            size_t cap = 1;
++            while (cap < std::max<size_t>(1, m_options.capacity))
++                cap <<= 1;
++            m_slots.resize(cap);
++            m_mask = cap - 1;
++            m_autoPresent = static_cast<bool>(m_options.tick);
++            if (m_options.affinity == Affinity::PhysicalCores && coreMasks().size() >= 3)
++            {
++                m_producerCoreMask = coreMasks()[1];
++                m_consumerCoreMask = coreMasks()[2];
++            }
++            m_lastStats = std::chrono::steady_clock::now();
++        }
++
++        void start()
++        {
++            auto self = shared_from_this();
++            m_thread = std::thread([self] { self->consumerMain(); });
++        }
++
++        // Stop: the consumer executes the queue, then leaves. Returns false only under ThrowAndDetach on a hang.
++        bool shutdown()
++        {
++            m_stop.store(true, std::memory_order_seq_cst);
++            wakeConsumer();
++            const auto deadline = std::chrono::steady_clock::now() + m_options.hangTimeout;
++            while (!m_exited.load(std::memory_order_acquire))
++            {
++                if (std::chrono::steady_clock::now() > deadline)
++                {
++                    if (m_options.failure == FailurePolicy::Terminate)
++                        fatal("consumer did not stop within the hang timeout at shutdown");
++                    m_abandoned.store(true, std::memory_order_release);
++                    std::fprintf(stderr, "[GS:async] consumer did not stop within the timeout: detached (test policy)\n");
++                    m_thread.detach();
++                    return false;
++                }
++                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            }
++            m_thread.join();
++            return true;
++        }
++
++        // ---- producer side (serialised by m_producerMutex; MPSC-safe, the expected caller is one thread) ----
++        void Initialize(uint8_t *vram, uint32_t size)
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            drainLocked(DrainReason::Initialize);
++            m_inner->Initialize(vram, size);
++            m_vramPresent = vram != nullptr;
++        }
++
++        void Reset() { simple(Op::Reset, [&](Slot &) { ++m_stats.resets; }); }
++
++        void Submit(const GSPrimitiveBatch &batch)
++        {
++            simple(Op::Submit, [&](Slot &s) {
++                const uint64_t c0 = ticksNow();
++                std::memcpy(&s.batch, &batch, sizeof batch);
++                m_stats.copyTicks += ticksNow() - c0;
++                ++m_stats.submits;
++            });
++        }
++
++        void BeginTransfer(const GSTransferCommand &command)
++        {
++            simple(Op::BeginTransfer, [&](Slot &s) { s.transfer = command; ++m_stats.transfers; });
++        }
++
++        void UploadImage(const uint8_t *data, uint32_t sizeBytes)
++        {
++            const uint32_t charge = data ? sizeBytes : 0u;
++            simple(Op::Upload, [&](Slot &s) {
++                s.charge = charge;
++                if (data && sizeBytes && s.bytes.capacity() < sizeBytes)
++                {
++                    // The slot is free (the consumer is past it): replace its buffer by one of exactly sizeBytes.
++                    const uint64_t a0 = ticksNow();
++                    const size_t before = s.bytes.capacity();
++                    std::vector<uint8_t>().swap(s.bytes);
++                    s.bytes.reserve(sizeBytes);
++                    const size_t after = s.bytes.capacity();
++                    const uint64_t held = m_uploadHeld.fetch_add(after - before, std::memory_order_relaxed) + (after - before);
++                    m_stats.uploadHeldMax = std::max<uint64_t>(m_stats.uploadHeldMax, held);
++                    ++m_stats.uploadAllocs;
++                    m_stats.uploadAllocTicks += ticksNow() - a0;
++                }
++                const uint64_t c0 = ticksNow();
++                if (data && sizeBytes)
++                    s.bytes.assign(data, data + sizeBytes);
++                else
++                    s.bytes.clear();
++                s.nullData = data == nullptr;
++                s.size = sizeBytes;
++                m_stats.copyTicks += ticksNow() - c0;
++                m_stats.uploadBytes += sizeBytes;
++                ++m_stats.uploads;
++            }, charge);
++        }
++
++        bool ClearFramebuffer(const GSContext &context, uint32_t rgba)
++        {
++            // Same test as GSCpuBackend::ClearFramebuffer; the consumer checks the prediction.
++            const bool predicted = m_vramPresent && context.frame.fbw != 0u &&
++                                   (context.frame.psm == GS_PSM_CT32 || context.frame.psm == GS_PSM_CT24 ||
++                                    context.frame.psm == GS_PSM_CT16 || context.frame.psm == GS_PSM_CT16S);
++            simple(Op::Clear, [&](Slot &s) { s.context = context; s.rgba = rgba; s.predicted = predicted; ++m_stats.clears; });
++            return predicted;
++        }
++
++        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++        {
++            simple(Op::WriteVram, [&](Slot &s) {
++                s.va[0] = psm; s.va[1] = base; s.va[2] = bw; s.va[3] = x; s.va[4] = y; s.va[5] = value;
++                ++m_stats.writes;
++            });
++        }
++
++        void Flush()
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            if (isProducerThread())
++                producerPrologue();
++            ++m_stats.flushes;
++        }
++
++        void TextureFlush()
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            producerPrologue();
++            ++m_stats.textureFlushes;
++        }
++
++        void Sync(GSSyncReason reason)
++        {
++            if (reason == GSSyncReason::Presentation)
++            {
++                // From the presenter thread: the presentation point is the ordered marker, nothing to wait for.
++                std::lock_guard<std::mutex> l(m_producerMutex);
++                ++m_stats.syncPresentation;
++                return;
++            }
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            if (reason == GSSyncReason::Finish)
++            {
++                producerPrologue(); // FINISH is part of the drawing stream (GS register write)
++                ++m_stats.syncFinish;
++                if (m_options.drainOnFinish)
++                    drainLocked(DrainReason::Sync);
++                return;
++            }
++            ++m_stats.syncOther;
++            drainLocked(DrainReason::Sync);
++            if (reason == GSSyncReason::Reset)
++                m_epoch.fetch_add(1, std::memory_order_acq_rel); // frames of the previous state are no longer shown
++        }
++
++        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            drainLocked(DrainReason::ConsumeLocalToHost);
++            return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
++        }
++
++        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            drainLocked(DrainReason::ReadVram);
++            return m_inner->ReadVram(psm, base, bw, x, y);
++        }
++
++        void SnapshotVram(std::vector<uint8_t> &out)
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            drainLocked(DrainReason::SnapshotVram);
++            m_inner->SnapshotVram(out);
++        }
++
++        GSTransferSnapshot GetTransferSnapshot()
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            drainLocked(DrainReason::TransferSnapshot);
++            // The runtime reads the transfer state only at checkpoint gates (GS::checkpointIdle: before saving and
++            // before loading VRAM): frames published for the state before that point are no longer presented.
++            m_epoch.fetch_add(1, std::memory_order_acq_rel);
++            return m_inner->GetTransferSnapshot();
++        }
++
++        void drain(DrainReason reason)
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            drainLocked(reason);
++        }
++
++        // Explicit ordered presentation point (offline use): the caller waits on the future, the producer does not.
++        std::future<PresentResult> PresentAsync(const GSPresentationRequest &request)
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            producerPrologue();
++            Slot &s = beginSlot(Op::Present);
++            s.present = std::make_shared<std::promise<PresentResult>>();
++            s.presentRequest = request;
++            s.tick = m_options.tick ? m_options.tick() : 0;
++            auto fut = s.present->get_future();
++            ++m_stats.explicitPresents;
++            publish();
++            return fut;
++        }
++
++        // ---- presenter side ----
++        PresentationFrame Present(const GSPresentationRequest &request)
++        {
++            if (!m_autoPresent)
++            {
++                PresentResult r = PresentAsync(request).get();
++                return convertFrame(r.vram, r.request);
++            }
++            std::lock_guard<std::mutex> l(m_presenterMutex);
++            ++m_pstats.presentCalls;
++            if (m_options.marker == Options::Marker::PresenterRequest)
++            {
++                std::lock_guard<std::mutex> ml(m_mailboxMutex);
++                if (m_mailboxPending.load(std::memory_order_relaxed))
++                    m_pstats.requestsReplaced.fetch_add(1, std::memory_order_relaxed);
++                m_mailboxRequest = request;
++                m_mailboxTick = m_options.tick();
++                m_mailboxPending.store(true, std::memory_order_release);
++            }
++            const uint32_t m = m_middle.load(std::memory_order_acquire);
++            if (m & kFresh)
++            {
++                const uint32_t old = m_middle.exchange(m_front, std::memory_order_acq_rel);
++                m_front = old & 3u;
++                const Frame &f = m_frames[m_front];
++                if (f.epoch == m_epoch.load(std::memory_order_acquire))
++                {
++                    // VRAM of the VSync boundary; display registers from the presenter's request (as the synchronous
++                    // backend uses them), or latched at the marker when Options::presentationRequest is set.
++                    GSPresentationRequest r = m_options.marker == Options::Marker::PresenterRequest ? f.request : request;
++                    if (m_options.marker == Options::Marker::VSyncBoundary && m_options.presentationRequest)
++                    {
++                        r.pmode = f.request.pmode;
++                        r.smode2 = f.request.smode2;
++                        r.dispfb1 = f.request.dispfb1;
++                        r.display1 = f.request.display1;
++                        r.dispfb2 = f.request.dispfb2;
++                        r.display2 = f.request.display2;
++                        r.bgcolor = f.request.bgcolor;
++                    }
++                    r.vsyncTick = f.tick;
++                    m_cachedFrame = convertFrame(f.vram, r);
++                    m_cachedTick = f.tick;
++                    ++m_pstats.framesConsumed;
++                    const uint64_t now = m_options.tick();
++                    const uint64_t lag = now >= f.tick ? now - f.tick : 0;
++                    ++m_pstats.latencyHist[std::min<uint64_t>(lag, 4)];
++                }
++                else
++                    ++m_pstats.framesStale; // published before a checkpoint gate: dropped; the last image stays shown
++            }
++            else
++                ++m_pstats.presentNoNewFrame;
++            return m_cachedFrame;
++        }
++
++        Stats stats()
++        {
++            Stats s;
++            {
++                std::lock_guard<std::mutex> l(m_producerMutex);
++                s = m_stats;
++            }
++            s.executed = m_cstats.executed.load(std::memory_order_relaxed);
++            s.discarded = m_cstats.discarded.load(std::memory_order_relaxed);
++            s.execTicks = m_cstats.execTicks.load(std::memory_order_relaxed);
++            s.mxcsrChanges = m_cstats.mxcsrChanges.load(std::memory_order_relaxed);
++            s.sleeps = m_cstats.sleeps.load(std::memory_order_relaxed);
++            s.sleepTicks = m_cstats.sleepTicks.load(std::memory_order_relaxed);
++            s.clearMispredictions = m_cstats.clearMispredictions.load(std::memory_order_relaxed);
++            s.framesPublished = m_cstats.framesPublished.load(std::memory_order_relaxed);
++            s.framesOverwritten = m_cstats.framesOverwritten.load(std::memory_order_relaxed);
++            s.uploadTrims = m_cstats.uploadTrims.load(std::memory_order_relaxed);
++            s.uploadFreeTicks = m_cstats.uploadFreeTicks.load(std::memory_order_relaxed);
++            s.uploadHeldBytes = m_uploadHeld.load(std::memory_order_relaxed);
++            s.pendingBytes = m_pendingBytes.load(std::memory_order_relaxed);
++            readPresenterStats(s);
++            return s;
++        }
++
++        // VSync tick of the frame returned by the last Present() (auto presentation); 0 before the first frame.
++        uint64_t lastPresentedTick() const
++        {
++            std::lock_guard<std::mutex> l(m_presenterMutex);
++            return m_cachedTick;
++        }
++
++        void readPresenterStats(Stats &s) const
++        {
++            s.presentCalls = m_pstats.presentCalls.load(std::memory_order_relaxed);
++            s.framesConsumed = m_pstats.framesConsumed.load(std::memory_order_relaxed);
++            s.framesStale = m_pstats.framesStale.load(std::memory_order_relaxed);
++            s.presentNoNewFrame = m_pstats.presentNoNewFrame.load(std::memory_order_relaxed);
++            s.requestsReplaced = m_pstats.requestsReplaced.load(std::memory_order_relaxed);
++            for (int i = 0; i < 5; ++i)
++                s.latencyHist[i] = m_pstats.latencyHist[i].load(std::memory_order_relaxed);
++        }
++
++        bool failed() const { return m_failed.load(std::memory_order_acquire); }
++        std::string failureMessage() const
++        {
++            std::lock_guard<std::mutex> l(m_errorMutex);
++            return m_errorText;
++        }
++        size_t capacity() const { return m_slots.size(); }
++        static size_t slotBytes() { return sizeof(Slot); }
++        size_t retainedUploadBytes() const
++        {
++            size_t n = 0;
++            for (const Slot &s : m_slots)
++                n += s.bytes.capacity();
++            return n;
++        }
++        size_t frameBufferBytes() const
++        {
++            size_t n = 0;
++            for (const Frame &f : m_frames)
++                n += f.vram.capacity();
++            return n;
++        }
++        std::thread::native_handle_type nativeHandle() { return m_thread.native_handle(); }
++        uint64_t producerCoreMask() const { return m_producerCoreMask; }
++        uint64_t consumerCoreMask() const { return m_consumerCoreMask; }
++
++    private:
++        enum class Op : uint8_t
++        {
++            Submit, BeginTransfer, Upload, Clear, WriteVram, Reset, Present, Marker
++        };
++
++        struct Slot
++        {
++            Op op = Op::Submit;
++            uint32_t mxcsr = 0;
++            GSPrimitiveBatch batch{};
++            GSTransferCommand transfer{};
++            GSContext context{};
++            uint32_t rgba = 0;
++            bool predicted = false;
++            bool nullData = false;
++            uint32_t size = 0;
++            uint32_t charge = 0; // upload payload bytes reserved in m_pendingBytes (PERF_004F)
++            uint32_t va[6] = {};
++            uint32_t epoch = 0;
++            uint64_t tick = 0;
++            std::vector<uint8_t> bytes;
++            GSPresentationRequest presentRequest{};
++            std::shared_ptr<std::promise<PresentResult>> present;
++        };
++
++        struct Frame
++        {
++            std::vector<uint8_t> vram;
++            GSPresentationRequest request{};
++            uint64_t tick = 0;
++            uint32_t epoch = 0;
++        };
++
++        struct ConsumerStats
++        {
++            std::atomic<uint64_t> executed{0}, discarded{0}, execTicks{0}, mxcsrChanges{0}, sleeps{0}, sleepTicks{0};
++            std::atomic<uint64_t> clearMispredictions{0}, framesPublished{0}, framesOverwritten{0}, uploadTrims{0};
++            std::atomic<uint64_t> uploadFreeTicks{0};
++        };
++
++        struct PresenterStats // atomics: the producer's periodic line reads them without taking the presenter lock
++        {
++            std::atomic<uint64_t> presentCalls{0}, framesConsumed{0}, framesStale{0}, presentNoNewFrame{0};
++            std::atomic<uint64_t> requestsReplaced{0}; // mailbox request overwritten before the producer took it
++            std::atomic<uint64_t> latencyHist[5] = {};
++        };
++
++        static constexpr uint32_t kFresh = 4u;
++
++        [[noreturn]] void fatal(const char *what)
++        {
++            std::fprintf(stderr, "[GS:async] FATAL: %s; terminating (fail-stop policy)\n", what);
++            std::fflush(stderr);
++            std::_Exit(70);
++        }
++
++        bool isProducerThread() const { return m_producerId == std::this_thread::get_id(); }
++
++        // Every stream operation (enqueue, TextureFlush, Flush/Finish from the producer): thread bookkeeping, first-call
++        // affinity, VSync presentation marker, periodic stats. Drain-only calls (reads, snapshots, Sync other than
++        // Finish/Presentation) skip it, so a debug or presenter thread never becomes the producer or gets its affinity.
++        void producerPrologue()
++        {
++            const auto id = std::this_thread::get_id();
++            if (m_producerId != id)
++            {
++                if (m_producerId == std::thread::id())
++                {
++                    m_producerId = id;
++#if defined(_WIN32)
++                    if (m_producerCoreMask)
++                        SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(m_producerCoreMask));
++#endif
++                }
++                else
++                    ++m_stats.foreignProducerCalls;
++            }
++            if (m_autoPresent && m_options.marker == Options::Marker::PresenterRequest)
++            {
++                if (m_mailboxPending.load(std::memory_order_acquire))
++                {
++                    std::lock_guard<std::mutex> ml(m_mailboxMutex);
++                    m_mailboxPending.store(false, std::memory_order_relaxed);
++                    Slot &s = beginSlot(Op::Marker);
++                    s.presentRequest = m_mailboxRequest;
++                    s.tick = m_mailboxTick;
++                    ++m_stats.markers;
++                    publish();
++                }
++            }
++            else if (m_autoPresent)
++            {
++                const uint64_t t = m_options.tick();
++                if (!m_haveMarkTick || t != m_markTick)
++                {
++                    m_haveMarkTick = true;
++                    m_markTick = t;
++                    Slot &s = beginSlot(Op::Marker);
++                    s.presentRequest = m_options.presentationRequest ? m_options.presentationRequest() : GSPresentationRequest{};
++                    s.tick = t;
++                    ++m_stats.markers;
++                    publish();
++                }
++            }
++            if ((++m_prologueCount & 1023u) == 0u)
++            {
++                const int pc = coreOfProcessor(currentProcessor());
++                const int cc = m_consumerCore.load(std::memory_order_relaxed);
++                if (pc >= 0 && cc >= 0)
++                {
++                    ++m_stats.placementSamples;
++                    m_stats.placementSameCore += pc == cc ? 1u : 0u;
++                }
++                if (m_options.statsIntervalSeconds > 0.0)
++                {
++                    const auto now = std::chrono::steady_clock::now();
++                    if (std::chrono::duration<double>(now - m_lastStats).count() >= m_options.statsIntervalSeconds)
++                    {
++                        m_lastStats = now;
++                        printStatsLocked();
++                    }
++                }
++            }
++        }
++
++        template <typename Fill>
++        void simple(Op op, Fill &&fill, uint64_t charge = 0)
++        {
++            std::lock_guard<std::mutex> l(m_producerMutex);
++            producerPrologue();
++            reservePendingBytes(charge); // before taking a slot: the stream order is unchanged
++            Slot *sp = nullptr;
++            try
++            {
++                sp = &beginSlot(op);
++            }
++            catch (...)
++            {
++                // full-queue hang under the test policy: nothing was published, return the reservation
++                if (charge)
++                    m_pendingBytes.fetch_sub(charge, std::memory_order_seq_cst);
++                throw;
++            }
++            Slot &s = *sp;
++            fill(s);
++            publish();
++        }
++
++        // Reserve upload payload bytes before publishing (PERF_004F). Only the producer adds (under m_producerMutex),
++        // the consumer only subtracts, so the check cannot be invalidated by another reservation. Admitted when the
++        // reservation fits the budget or when nothing is pending (an upload larger than the budget goes alone).
++        void reservePendingBytes(uint64_t n)
++        {
++            if (n == 0)
++                return;
++            const uint64_t budget = m_options.pendingUploadBudget;
++            auto fits = [&] {
++                const uint64_t p = m_pendingBytes.load(std::memory_order_seq_cst);
++                return p == 0 || (p <= budget && n <= budget - p);
++            };
++            if (!fits())
++            {
++                const uint64_t w0 = ticksNow();
++                waitUntil(fits);
++                const uint64_t dt = ticksNow() - w0;
++                ++m_stats.budgetWaits;
++                m_stats.budgetWaitTicks += dt;
++            }
++            if (n > budget)
++                ++m_stats.oversizeUploads;
++            const uint64_t p = m_pendingBytes.fetch_add(n, std::memory_order_seq_cst) + n;
++            m_stats.pendingMax = std::max(m_stats.pendingMax, p);
++        }
++
++        Slot &beginSlot(Op op)
++        {
++            m_enqueueStart = ticksNow();
++            const uint64_t head = m_head.load(std::memory_order_relaxed);
++            if (head - m_tail.load(std::memory_order_acquire) >= m_slots.size())
++            {
++                const uint64_t w0 = ticksNow();
++                waitTail(head - m_slots.size() + 1);
++                const uint64_t dt = ticksNow() - w0;
++                ++m_stats.fullWaits;
++                m_stats.fullWaitTicks += dt;
++                m_enqueueStart += dt;
++            }
++            Slot &s = m_slots[head & m_mask];
++            s.op = op;
++            s.charge = 0; // set by UploadImage's fill; the consumer zeroes it again when it returns the bytes
++            s.mxcsr = _mm_getcsr() & kMxcsrControlMask;
++            s.epoch = m_epoch.load(std::memory_order_relaxed);
++            return s;
++        }
++
++        void publish()
++        {
++            const uint64_t head = m_head.load(std::memory_order_relaxed) + 1;
++            m_head.store(head, std::memory_order_seq_cst);
++            ++m_stats.enqueued;
++            const uint64_t occ = head - m_tail.load(std::memory_order_relaxed);
++            m_stats.occupancySum += occ;
++            m_stats.occupancyMax = std::max(m_stats.occupancyMax, occ);
++            if (m_consumerSleeping.load(std::memory_order_seq_cst))
++            {
++                ++m_stats.wakeConsumer;
++                wakeConsumer();
++            }
++            m_stats.enqueueTicks += ticksNow() - m_enqueueStart;
++        }
++
++        void wakeConsumer()
++        {
++            std::lock_guard<std::mutex> l(m_sleepMutex);
++            m_consumerCv.notify_one();
++        }
++
++        void waitTail(uint64_t target)
++        {
++            waitUntil([&] { return m_tail.load(std::memory_order_seq_cst) >= target; });
++        }
++
++        // Producer wait for consumer progress (tail position or returned upload bytes). The consumer changes both with
++        // seq_cst before it reads m_producerWaiting, and the producer re-checks after setting it (Dekker), so a
++        // notification is never lost.
++        template <typename Pred>
++        void waitUntil(Pred &&ready)
++        {
++            for (uint32_t i = 0; i < m_options.spinIterations; ++i)
++            {
++                if (ready())
++                    return;
++                _mm_pause();
++            }
++            const auto deadline = std::chrono::steady_clock::now() + m_options.hangTimeout;
++            std::unique_lock<std::mutex> l(m_sleepMutex);
++            while (!ready())
++            {
++                m_producerWaiting.store(true, std::memory_order_seq_cst);
++                if (ready())
++                    break;
++                if (m_producerCv.wait_until(l, deadline) == std::cv_status::timeout && !ready())
++                {
++                    m_producerWaiting.store(false, std::memory_order_seq_cst);
++                    if (m_options.failure == FailurePolicy::Terminate)
++                        fatal("consumer did not progress within the hang timeout");
++                    throw std::runtime_error("async GS: consumer did not progress within the hang timeout");
++                }
++            }
++            m_producerWaiting.store(false, std::memory_order_seq_cst);
++        }
++
++        void drainLocked(DrainReason reason)
++        {
++            const uint64_t t0 = ticksNow();
++            const uint64_t target = m_head.load(std::memory_order_relaxed);
++            const bool nonEmpty = m_tail.load(std::memory_order_acquire) != target;
++            waitTail(target);
++            const uint64_t dt = ticksNow() - t0;
++            ++m_stats.drains;
++            m_stats.drainsNonEmpty += nonEmpty ? 1u : 0u;
++            ++m_stats.drainsByReason[static_cast<int>(reason)];
++            m_stats.drainTicks += dt;
++            m_stats.drainMaxTicks = std::max(m_stats.drainMaxTicks, dt);
++            if (m_failed.load(std::memory_order_acquire))
++            {
++                std::lock_guard<std::mutex> l(m_errorMutex);
++                if (m_error)
++                    std::rethrow_exception(m_error);
++                throw std::runtime_error("async GS: consumer failed");
++            }
++        }
++
++        void printStatsLocked()
++        {
++            const Stats s = [&] {
++                Stats x = m_stats;
++                x.executed = m_cstats.executed.load(std::memory_order_relaxed);
++                x.execTicks = m_cstats.execTicks.load(std::memory_order_relaxed);
++                x.framesPublished = m_cstats.framesPublished.load(std::memory_order_relaxed);
++                x.framesOverwritten = m_cstats.framesOverwritten.load(std::memory_order_relaxed);
++                x.sleeps = m_cstats.sleeps.load(std::memory_order_relaxed);
++                x.uploadTrims = m_cstats.uploadTrims.load(std::memory_order_relaxed);
++                x.uploadFreeTicks = m_cstats.uploadFreeTicks.load(std::memory_order_relaxed);
++                x.uploadHeldBytes = m_uploadHeld.load(std::memory_order_relaxed);
++                x.pendingBytes = m_pendingBytes.load(std::memory_order_relaxed);
++                readPresenterStats(x);
++                return x;
++            }();
++            double consumerCpu = 0.0, producerCpu = 0.0;
++#if defined(_WIN32)
++            FILETIME c, e, k, u;
++            auto sec = [](FILETIME t) { return double((uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime) * 1e-7; };
++            if (GetThreadTimes(static_cast<HANDLE>(m_thread.native_handle()), &c, &e, &k, &u))
++                consumerCpu = sec(k) + sec(u);
++            if (GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u))
++                producerCpu = sec(k) + sec(u);
++#endif
++            // Cumulative counters; the analysis takes differences between lines. Ticks are raw TSC (see tsc_hz).
++            std::fprintf(stderr,
++                         "[GS:async] t=%.3f tick=%llu enq=%llu exec=%llu submit=%llu markers=%llu occ_sum=%llu occ_max=%llu "
++                         "fullwaits=%llu fullwait_tk=%llu drains=%llu drains_ne=%llu drain_tk=%llu drain_max_tk=%llu "
++                         "enqueue_tk=%llu exec_tk=%llu sleeps=%llu finish=%llu sync_other=%llu foreign=%llu "
++                         "published=%llu overwritten=%llu presents=%llu consumed=%llu stale=%llu nonew=%llu replaced=%llu "
++                         "lat=%llu/%llu/%llu/%llu/%llu place_samples=%llu place_same=%llu cpu_consumer=%.3f cpu_producer=%.3f "
++                         "uploads=%llu upload_bytes=%llu upload_allocs=%llu upload_alloc_tk=%llu upload_frees=%llu "
++                         "upload_free_tk=%llu upload_held=%llu upload_held_max=%llu pend=%llu pend_max=%llu bwaits=%llu "
++                         "bwait_tk=%llu oversize=%llu\n",
++                         std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
++                         (unsigned long long)(m_haveMarkTick ? m_markTick : 0), (unsigned long long)s.enqueued,
++                         (unsigned long long)s.executed, (unsigned long long)s.submits, (unsigned long long)s.markers,
++                         (unsigned long long)s.occupancySum, (unsigned long long)s.occupancyMax,
++                         (unsigned long long)s.fullWaits, (unsigned long long)s.fullWaitTicks, (unsigned long long)s.drains,
++                         (unsigned long long)s.drainsNonEmpty, (unsigned long long)s.drainTicks,
++                         (unsigned long long)s.drainMaxTicks, (unsigned long long)s.enqueueTicks,
++                         (unsigned long long)s.execTicks, (unsigned long long)s.sleeps, (unsigned long long)s.syncFinish,
++                         (unsigned long long)s.syncOther, (unsigned long long)s.foreignProducerCalls,
++                         (unsigned long long)s.framesPublished, (unsigned long long)s.framesOverwritten,
++                         (unsigned long long)s.presentCalls, (unsigned long long)s.framesConsumed,
++                         (unsigned long long)s.framesStale, (unsigned long long)s.presentNoNewFrame, (unsigned long long)s.requestsReplaced,
++                         (unsigned long long)s.latencyHist[0], (unsigned long long)s.latencyHist[1],
++                         (unsigned long long)s.latencyHist[2], (unsigned long long)s.latencyHist[3],
++                         (unsigned long long)s.latencyHist[4], (unsigned long long)s.placementSamples,
++                         (unsigned long long)s.placementSameCore, consumerCpu, producerCpu, (unsigned long long)s.uploads,
++                         (unsigned long long)s.uploadBytes, (unsigned long long)s.uploadAllocs,
++                         (unsigned long long)s.uploadAllocTicks, (unsigned long long)s.uploadTrims,
++                         (unsigned long long)s.uploadFreeTicks, (unsigned long long)s.uploadHeldBytes,
++                         (unsigned long long)s.uploadHeldMax, (unsigned long long)s.pendingBytes,
++                         (unsigned long long)s.pendingMax, (unsigned long long)s.budgetWaits,
++                         (unsigned long long)s.budgetWaitTicks, (unsigned long long)s.oversizeUploads);
++            std::fflush(stderr);
++        }
++
++        void execute(Slot &s)
++        {
++            switch (s.op)
++            {
++            case Op::Submit:
++                m_inner->Submit(s.batch);
++                break;
++            case Op::BeginTransfer:
++                m_inner->BeginTransfer(s.transfer);
++                break;
++            case Op::Upload:
++                m_inner->UploadImage(s.nullData ? nullptr : s.bytes.data(), s.size);
++                {
++                    // The consumer owns the slot until it advances m_tail, so releasing here cannot race the producer.
++                    const size_t cap = s.bytes.capacity();
++                    if (cap != 0 && (cap > m_options.uploadRetainBytes ||
++                                     m_uploadHeld.load(std::memory_order_relaxed) > m_options.uploadRetainBudget))
++                    {
++                        const uint64_t f0 = ticksNow();
++                        std::vector<uint8_t>().swap(s.bytes);
++                        m_uploadHeld.fetch_sub(cap, std::memory_order_relaxed);
++                        m_cstats.uploadTrims.fetch_add(1, std::memory_order_relaxed);
++                        m_cstats.uploadFreeTicks.fetch_add(ticksNow() - f0, std::memory_order_relaxed);
++                    }
++                }
++                break;
++            case Op::Clear:
++                if (m_inner->ClearFramebuffer(s.context, s.rgba) != s.predicted)
++                    m_cstats.clearMispredictions.fetch_add(1, std::memory_order_relaxed);
++                break;
++            case Op::WriteVram:
++                m_inner->WriteVram(s.va[0], s.va[1], s.va[2], s.va[3], s.va[4], s.va[5]);
++                break;
++            case Op::Reset:
++                m_inner->Reset();
++                break;
++            case Op::Present:
++            {
++                PresentResult r;
++                r.request = s.presentRequest;
++                r.tick = s.tick;
++                m_inner->SnapshotVram(r.vram);
++                auto p = std::move(s.present);
++                p->set_value(std::move(r));
++                break;
++            }
++            case Op::Marker:
++            {
++                Frame &f = m_frames[m_back];
++                m_inner->SnapshotVram(f.vram);
++                f.request = s.presentRequest;
++                f.tick = s.tick;
++                f.epoch = s.epoch;
++                const uint32_t old = m_middle.exchange(m_back | kFresh, std::memory_order_acq_rel);
++                if (old & kFresh)
++                    m_cstats.framesOverwritten.fetch_add(1, std::memory_order_relaxed);
++                m_back = old & 3u;
++                m_cstats.framesPublished.fetch_add(1, std::memory_order_relaxed);
++                break;
++            }
++            }
++        }
++
++        void consumerMain()
++        {
++#if defined(_WIN32)
++            SetThreadDescription(GetCurrentThread(), L"GS async consumer");
++            if (m_consumerCoreMask)
++                SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(m_consumerCoreMask));
++#endif
++            uint32_t current = _mm_getcsr();
++            const uint32_t original = current;
++            uint64_t tail = 0;
++            for (;;)
++            {
++                if (m_head.load(std::memory_order_acquire) == tail)
++                {
++                    bool got = false;
++                    for (uint32_t i = 0; i < m_options.spinIterations && !got; ++i)
++                    {
++                        _mm_pause();
++                        got = m_head.load(std::memory_order_acquire) != tail;
++                    }
++                    if (got)
++                        continue;
++                    if (m_stop.load(std::memory_order_seq_cst) && m_head.load(std::memory_order_seq_cst) == tail)
++                        break;
++                    const uint64_t s0 = ticksNow();
++                    {
++                        std::unique_lock<std::mutex> l(m_sleepMutex);
++                        m_consumerSleeping.store(true, std::memory_order_seq_cst);
++                        while (m_head.load(std::memory_order_seq_cst) == tail && !m_stop.load(std::memory_order_seq_cst))
++                            m_consumerCv.wait_for(l, std::chrono::milliseconds(50));
++                        m_consumerSleeping.store(false, std::memory_order_seq_cst);
++                    }
++                    m_cstats.sleeps.fetch_add(1, std::memory_order_relaxed);
++                    m_cstats.sleepTicks.fetch_add(ticksNow() - s0, std::memory_order_relaxed);
++                    continue;
++                }
++                Slot &s = m_slots[tail & m_mask];
++                if (m_options.propagateMxcsr)
++                {
++                    const uint32_t want = (current & ~kMxcsrControlMask) | s.mxcsr;
++                    if (want != current)
++                    {
++                        _mm_setcsr(want);
++                        current = want;
++                        m_cstats.mxcsrChanges.fetch_add(1, std::memory_order_relaxed);
++                    }
++                }
++                if (!m_failed.load(std::memory_order_relaxed) && !m_abandoned.load(std::memory_order_acquire))
++                {
++                    const uint64_t e0 = ticksNow();
++                    try
++                    {
++                        execute(s);
++                        m_cstats.executed.fetch_add(1, std::memory_order_relaxed);
++                    }
++                    catch (...)
++                    {
++                        std::string text = "unknown exception";
++                        try { throw; }
++                        catch (const std::exception &e) { text = e.what(); }
++                        catch (...) {}
++                        if (m_options.failure == FailurePolicy::Terminate)
++                            fatal(("consumer exception: " + text).c_str());
++                        {
++                            std::lock_guard<std::mutex> l(m_errorMutex);
++                            m_error = std::current_exception();
++                            m_errorText = text;
++                        }
++                        m_failed.store(true, std::memory_order_release);
++                    }
++                    m_cstats.execTicks.fetch_add(ticksNow() - e0, std::memory_order_relaxed);
++                }
++                else
++                {
++                    m_cstats.discarded.fetch_add(1, std::memory_order_relaxed);
++                    if (s.present)
++                    {
++                        auto p = std::move(s.present);
++                        p->set_exception(std::make_exception_ptr(std::runtime_error("async GS: consumer failed earlier")));
++                    }
++                }
++                if (s.charge)
++                {
++                    // executed or discarded: return its bytes before the tail moves (PERF_004F)
++                    m_pendingBytes.fetch_sub(s.charge, std::memory_order_seq_cst);
++                    s.charge = 0;
++                }
++                if ((tail & 1023u) == 0u)
++                    m_consumerCore.store(coreOfProcessor(currentProcessor()), std::memory_order_relaxed);
++                ++tail;
++                m_tail.store(tail, std::memory_order_seq_cst);
++                if (m_producerWaiting.load(std::memory_order_seq_cst))
++                {
++                    std::lock_guard<std::mutex> l(m_sleepMutex);
++                    m_producerCv.notify_one();
++                }
++            }
++            _mm_setcsr(original);
++            m_exited.store(true, std::memory_order_release);
++        }
++
++        std::unique_ptr<GSRasterBackend> m_inner;
++        Options m_options;
++        std::vector<Slot> m_slots;
++        size_t m_mask = 0;
++        bool m_autoPresent = false;
++        uint64_t m_producerCoreMask = 0, m_consumerCoreMask = 0;
++        alignas(64) std::atomic<uint64_t> m_head{0};
++        alignas(64) std::atomic<uint64_t> m_tail{0};
++        alignas(64) std::atomic<bool> m_consumerSleeping{false};
++        std::atomic<bool> m_producerWaiting{false};
++        std::atomic<bool> m_stop{false}, m_exited{false}, m_failed{false}, m_abandoned{false};
++        std::atomic<uint32_t> m_epoch{0};
++        std::atomic<int> m_consumerCore{-1};
++        std::atomic<uint64_t> m_uploadHeld{0}; // capacity of all slot upload buffers (producer adds, consumer subtracts)
++        std::atomic<uint64_t> m_pendingBytes{0}; // upload payload published, not yet executed (PERF_004F)
++        mutable std::mutex m_errorMutex;
++        std::exception_ptr m_error;
++        std::string m_errorText;
++        std::mutex m_sleepMutex;
++        std::condition_variable m_consumerCv, m_producerCv;
++        std::thread m_thread;
++        // producer state (m_producerMutex)
++        std::mutex m_producerMutex;
++        std::thread::id m_producerId{};
++        bool m_vramPresent = false;
++        bool m_haveMarkTick = false;
++        uint64_t m_markTick = 0;
++        uint64_t m_enqueueStart = 0;
++        uint64_t m_prologueCount = 0;
++        std::chrono::steady_clock::time_point m_lastStats;
++        Stats m_stats;
++        // consumer state
++        alignas(64) ConsumerStats m_cstats;
++        // triple buffer: m_back (consumer), m_middle (shared, index | kFresh), m_front (presenter)
++        std::array<Frame, 3> m_frames;
++        uint32_t m_back = 0;
++        alignas(64) std::atomic<uint32_t> m_middle{1};
++        // presenter state (m_presenterMutex)
++        mutable std::mutex m_presenterMutex;
++        uint32_t m_front = 2;
++        PresentationFrame m_cachedFrame;
++        // presentation mailbox (presenter -> producer)
++        std::mutex m_mailboxMutex;
++        std::atomic<bool> m_mailboxPending{false};
++        GSPresentationRequest m_mailboxRequest{};
++        uint64_t m_mailboxTick = 0;
++        uint64_t m_cachedTick = 0;
++        PresenterStats m_pstats;
++    };
++
++    // GSRasterBackend facade. The consumer thread shares the core, so a detached (test-policy) consumer never touches
++    // freed backend state; under the default policy a hang terminates the process instead.
++    class GSAsyncBackend final : public GSRasterBackend
++    {
++    public:
++        explicit GSAsyncBackend(Options options = {}, std::unique_ptr<GSRasterBackend> inner = std::make_unique<GSCpuBackend>())
++            : m_core(std::make_shared<Core>(std::move(inner), std::move(options)))
++        {
++            m_core->start();
++        }
++        ~GSAsyncBackend() override { m_core->shutdown(); }
++
++        void Initialize(uint8_t *vram, uint32_t vramSize) override { m_core->Initialize(vram, vramSize); }
++        void Reset() override { m_core->Reset(); }
++        void Submit(const GSPrimitiveBatch &batch) override { m_core->Submit(batch); }
++        void BeginTransfer(const GSTransferCommand &command) override { m_core->BeginTransfer(command); }
++        void UploadImage(const uint8_t *data, uint32_t sizeBytes) override { m_core->UploadImage(data, sizeBytes); }
++        void Flush() override { m_core->Flush(); }
++        void TextureFlush() override { m_core->TextureFlush(); }
++        void Sync(GSSyncReason reason) override { m_core->Sync(reason); }
++        PresentationFrame Present(const GSPresentationRequest &request) override { return m_core->Present(request); }
++        bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override { return m_core->ClearFramebuffer(context, rgba); }
++        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { return m_core->ConsumeLocalToHostBytes(dst, maxBytes); }
++        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override { return m_core->ReadVram(psm, base, bw, x, y); }
++        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override { m_core->WriteVram(psm, base, bw, x, y, value); }
++        void SnapshotVram(std::vector<uint8_t> &out) const override { m_core->SnapshotVram(out); }
++        GSTransferSnapshot GetTransferSnapshot() const override { return m_core->GetTransferSnapshot(); }
++
++        std::future<PresentResult> PresentAsync(const GSPresentationRequest &request) { return m_core->PresentAsync(request); }
++        void drain(DrainReason reason = DrainReason::Explicit) { m_core->drain(reason); }
++        Stats stats() const { return m_core->stats(); }
++        bool failed() const { return m_core->failed(); }
++        uint64_t lastPresentedTick() const { return m_core->lastPresentedTick(); }
++        std::string failureMessage() const { return m_core->failureMessage(); }
++        size_t capacity() const { return m_core->capacity(); }
++        static size_t slotBytes() { return Core::slotBytes(); }
++        size_t retainedUploadBytes() const { return m_core->retainedUploadBytes(); }
++        size_t frameBufferBytes() const { return m_core->frameBufferBytes(); }
++        std::thread::native_handle_type nativeHandle() { return m_core->nativeHandle(); }
++        uint64_t producerCoreMask() const { return m_core->producerCoreMask(); }
++        uint64_t consumerCoreMask() const { return m_core->consumerCoreMask(); }
++
++    private:
++        std::shared_ptr<Core> m_core;
++    };
++} // namespace gsasync
+diff --git a/ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp b/ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp
+index 02dfbf5..90abf2b 100644
+--- a/ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp
++++ b/ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp
+@@ -441,6 +441,12 @@ namespace ps2x::checkpoint
+ 
+     std::vector<uint8_t> CheckpointManager::serializeMem(const PS2Runtime &runtime)
+     {
++        // GS VRAM is read raw below. An asynchronous raster backend must have executed every queued operation first:
++        // checkpointIdle() reads the backend transfer state, which drains such a backend (no effect on GSCpuBackend).
++        {
++            std::string gsIdleReason;
++            (void)runtime.gs().checkpointIdle(gsIdleReason);
++        }
+         ByteWriter w;
+         const auto regions = memRegions(runtime);
+         w.u32(static_cast<uint32_t>(regions.size()));
+@@ -467,6 +473,12 @@ namespace ps2x::checkpoint
+     CheckpointError CheckpointManager::deserializeMem(PS2Runtime &runtime,
+                                                       const std::vector<uint8_t> &payload)
+     {
++        // GS VRAM is overwritten raw below: drain an asynchronous raster backend first (see serializeMem); that drain
++        // also discards presentation frames it published for the previous state.
++        {
++            std::string gsIdleReason;
++            (void)runtime.gs().checkpointIdle(gsIdleReason);
++        }
+         ByteReader r(payload.data(), payload.size());
+         uint32_t regionCount = 0;
+         if (!r.u32(regionCount))

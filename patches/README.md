@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los diecinueve patches actualmente activos:
+arriba). Los treinta y seis patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -797,3 +797,32 @@ arriba). Los diecinueve patches actualmente activos:
     - Coste: en torno al +2 % del tiempo del rasterizador en el banco.
     - No corrige el moteado oscuro ni las líneas diagonales de la oficina (sin captura) ni el mar (GS-5).
       Documentación: `analysis/notes/VISUAL_010_GS_TRIANGLE_COVERAGE.md`.
+36. `PERF_004D_gs_async_backend.patch` (convención A — companion `PERF_004D_gs_async_backend.md`). Rendimiento,
+    opcional y **desactivado por defecto**: backend GS asíncrono. El nombre conserva la fase en que empezó la
+    implementación (PERF_004D); la revisión publicada es la de PERF_004F.
+    - `ps2xRuntime/include/runtime/gs/gs_async_backend.h` (nuevo, solo cabecera; ninguna cabecera del runtime la
+      incluye, así que el EE generado no se recompila). Encola las operaciones del GS en una cola SPSC de 8192
+      ranuras, con copia profunda y MXCSR por operación, y las ejecuta en un hilo consumidor sobre `GSCpuBackend`.
+      - Barreras en las lecturas de VRAM y de transferencias.
+      - Presentación por marca pedida por el presentador.
+      - *Fail-stop* (código 70) ante una excepción o un bloqueo del consumidor.
+      - Liberación de los búferes de subida tras usarlos.
+      - **Presupuesto de bytes de subida pendientes** (por defecto 32 MiB). Una subida individual mayor que el
+        presupuesto se admite sola, cuando no hay nada pendiente.
+    - `ps2xRuntime/src/lib/checkpoint/checkpoint_sections.cpp`: `GS::checkpointIdle()` antes de leer o escribir la
+      VRAM en checkpoints. No hace nada con el backend síncrono.
+    - Lado DMC, `runtime/dmc_overrides.cpp`: instala el backend solo con `DMC_GS_ASYNC=1`. Variables opcionales:
+      - `DMC_GS_ASYNC_PENDING_BUDGET=<bytes>` (`18446744073709551615` = sin límite);
+      - `DMC_GS_ASYNC_CAPACITY`;
+      - `DMC_GS_ASYNC_UPLOAD_RETAIN`, `DMC_GS_ASYNC_UPLOAD_BUDGET`;
+      - `DMC_GS_ASYNC_AFFINITY=physical`;
+      - `DMC_GS_ASYNC_FINISH_BARRIER=1`.
+    - Validación:
+      - 85/85 tests de concurrencia, integración, memoria y presupuesto;
+      - GS Replay `cap2` idéntico al síncrono byte a byte, también con ZTE forzado;
+      - checkpoints síncrono y asíncrono idénticos en las 12 secciones;
+      - cierre ordenado.
+    - Medido en PERF_004E con carga comparable: ×1,64 en la oficina y ×1,77 en el castillo.
+    - Pendiente: combate, pausa y gameplay con mando en asíncrono; comparación de imágenes en PERF_004F.
+      Documentación: `PERF_004D_gs_async_backend.md` (este directorio) y
+      `analysis/notes/PERF_004F_GS_QUEUE_BYTE_BUDGET.md`.

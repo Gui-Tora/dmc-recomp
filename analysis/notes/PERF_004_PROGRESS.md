@@ -1,6 +1,6 @@
 # PERF_004: progreso de rendimiento y fidelidad del GS (punto de entrada)
 
-Esta nota resume las investigaciones VISUAL_007–010 y PERF_004A–E y enlaza a sus notas. Los informes originales
+Esta nota resume las investigaciones VISUAL_007–010 y PERF_004A–F y enlaza a sus notas. Los informes originales
 están en `analysis/local/` (no versionado, no incluido en el repositorio). Las notas versionadas enlazadas conservan
 sus conclusiones.
 
@@ -12,15 +12,15 @@ sus conclusiones.
 - **ESTIMACIÓN:** cálculo, no medida.
 - **UNKNOWN.**
 
-## 1. Estado del proyecto (2026-11-18)
+## 1. Estado del proyecto (2026-11-18, tras PERF_004F)
 
 | Elemento | Estado |
 |---|---|
 | Juego | Devil May Cry PAL, `SLES_503.58`, SHA-256 `d0753a6b…bab4`, CRC32 `77654AD2`, entry `0x00100008` |
-| `master` | `529e9ed572241b15793ac47dd850a5b5c259b924` (PR #13) |
+| `master` | `5f64f1f7be48aee135884d5fefe32d22435c5f84` (PR #14, documentación) |
 | Vendor | `0a696611250982a739a385072357ba36ffee5dfc`, limpio |
 | Parches integrados | **35** (`patches/`, `upstream.lock.json`; ver [../../patches/README.md](../../patches/README.md)) |
-| Parche 36 (GS asíncrono) | **candidato experimental, no integrado ni publicado.** Desactivado por defecto: solo actúa con `DMC_GS_ASYNC=1` |
+| Parche 36 (GS asíncrono) | **propuesto para integración** (rama `perf-004f-gs-async-patch36`, revisión PERF_004F, `patched_commit` `247af590`). Opcional y desactivado por defecto: solo actúa con `DMC_GS_ASYNC=1` |
 | Ejecutable de referencia | `7571ae5b…`, master con 35 parches, build local |
 | Checkpoints de medida | copias locales de `g002_O_office.dmck` (`5f9576eb…`, oficina) y `g002_castle_entry.dmck` (`4c841943…`, castillo), los de [GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md](GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md) |
 | Ventanas de medida | oficina, VSync (16420, 17000]; castillo, (26800, 28000] |
@@ -36,6 +36,7 @@ sus conclusiones.
 | PERF_004C | [PERF_004C_GS_SYNCHRONIZATION.md](PERF_004C_GS_SYNCHRONIZATION.md) |
 | PERF_004D | [PERF_004D_ASYNC_GS_INTEGRATION.md](PERF_004D_ASYNC_GS_INTEGRATION.md) |
 | PERF_004E | [PERF_004E_ASYNC_GS_HARDENING.md](PERF_004E_ASYNC_GS_HARDENING.md) |
+| PERF_004F | [PERF_004F_GS_QUEUE_BYTE_BUDGET.md](PERF_004F_GS_QUEUE_BYTE_BUDGET.md) |
 | Antecedentes | [PERF_001_BASELINE.md](PERF_001_BASELINE.md), [PERF_002_CASTLE_BASELINE.md](PERF_002_CASTLE_BASELINE.md), [PERF_003_ARCHITECTURE_FEASIBILITY.md](PERF_003_ARCHITECTURE_FEASIBILITY.md), [PERF_003_GS_OPEN_ISSUES.md](PERF_003_GS_OPEN_ISSUES.md) |
 
 ## 2. Cronología
@@ -51,7 +52,7 @@ sus conclusiones.
 | PERF_004C | Barreras en el juego | Pocas o ninguna | 0 obligatorias en 5340 VSync de dos cinemáticas; `Finish` sin barrera; local→host sin consumir | Integración experimental | completada | [PERF_004C](PERF_004C_GS_SYNCHRONIZATION.md) |
 | PERF_004D | Integrar y medir | Marca de presentación y barreras de checkpoint | ×1,77 castillo, ×1,92–1,96 oficina limpia; guardados idénticos; 2 diseños de presentación refutados | Continuar; reducir memoria | completada (experimental) | [PERF_004D](PERF_004D_ASYNC_GS_INTEGRATION.md) |
 | PERF_004E | Memoria retenida y validación final | Liberar tras usar sin perder velocidad | RSS del castillo 288 → 196 MB; ×1,64 / ×1,77; menús, FMV y movimiento iguales en los dos modos | Candidato 36 preparado; queda el riesgo de memoria en vuelo | completada (experimental) | [PERF_004E](PERF_004E_ASYNC_GS_HARDENING.md) |
-| PERF_004F | Memoria en vuelo con la cola llena | Limitar la cola también por bytes | — | — | **pendiente** (propuesta) | — |
+| PERF_004F | Memoria en vuelo con la cola llena | Limitar la cola también por bytes | Pendiente acotado al presupuesto exacto (Opciones 78,8 → 32,0 MB; RSS +81 → +33 MB); sin efecto en oficina y castillo; 85/85 tests; Replay y checkpoints idénticos | Presupuesto por defecto 32 MiB; proponer el parche 36 | completada; parche 36 propuesto | [PERF_004F](PERF_004F_GS_QUEUE_BYTE_BUDGET.md) |
 
 ## 3. Resultados principales
 
@@ -111,6 +112,10 @@ gameplay ni en otros escenarios.
 **HECHO (PERF_004E):** RSS media del castillo en asíncrono, de 288 a 196 MB, sin cambio de velocidad. Exceso frente al
 síncrono: +19 MB.
 
+**HECHO (PERF_004F):** en la pantalla estática de Opciones, los bytes de subida en vuelo quedan acotados al
+presupuesto (32 MiB por defecto; 78,8 MB sin límite). Una subida individual mayor que el presupuesto se admite sola.
+En oficina y castillo el límite no actúa (máximo 6,6 MB pendientes).
+
 ### Fidelidad
 
 **HECHO:**
@@ -130,7 +135,8 @@ síncrono: +19 MB.
 
 **GS asíncrono:**
 
-- **Memoria en vuelo con la cola llena:** 82 MB en Opciones. Es el motivo de PERF_004F.
+- **Memoria en vuelo con la cola llena:** 82 MB en Opciones en PERF_004E. Resuelta en PERF_004F con el presupuesto
+  de bytes; queda la excepción de una subida individual mayor que el presupuesto.
 - **Carreras:** sin detector formal para MSVC.
 - **Carga externa:** con dos núcleos ocupados, el asíncrono pierde un 15–22 %.
 
@@ -173,8 +179,8 @@ síncrono: +19 MB.
 
 | Fase | Contenido | Estado |
 |---|---|---|
-| PERF_004F | Presupuesto de bytes de la cola del GS asíncrono, para limitar la memoria en vuelo | **pendiente** (propuesta, no iniciada) |
-| Publicación del parche 36 | Revisar el candidato de PERF_004E, aplicarlo a `patches/` y al lock, *bootstrap* limpio y PR. Desactivado por defecto | **pendiente de autorización** |
+| PERF_004F | Presupuesto de bytes de la cola del GS asíncrono, para limitar la memoria en vuelo | **completada** ([nota](PERF_004F_GS_QUEUE_BYTE_BUDGET.md)) |
+| Publicación del parche 36 | Candidato de PERF_004F en `patches/` y el lock; reproducción desde cero; PR. Desactivado por defecto | **PR abierta, pendiente de revisión y fusión** |
 | PERF_005 | Optimizar el rasterizador GS: especialización por estado de lote, con la ruta genérica como oráculo | **propuesta** |
 | VU1 | Una función por entrada y compilar las entradas interpretadas (plan A2 de PERF_003) | **propuesta** |
 | Gameplay y fluidez | Validar el ataque, la pausa y escenas nuevas, y medir con mando | **pendiente** |
