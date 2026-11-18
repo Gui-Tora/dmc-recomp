@@ -1,6 +1,7 @@
 # Índice histórico de investigación — dmc-recomp
 
-Orden cronológico. Estado actual resumido: [GAMEPLAY_CURRENT_STATUS.md](GAMEPLAY_CURRENT_STATUS.md).
+Orden cronológico. [GAMEPLAY_CURRENT_STATUS.md](GAMEPLAY_CURRENT_STATUS.md) es una referencia histórica (estado al
+2026-10-29). Estado reciente de la investigación de rendimiento y del GS: [PERF_004_PROGRESS.md](PERF_004_PROGRESS.md).
 Las fechas proceden de las propias notas o, en su defecto, del historial de Git.
 «Local» significa que el código o resultado existe en el árbol de trabajo del mantenedor, pero no está
 versionado.
@@ -106,7 +107,11 @@ P4.0–P4.2.4 y Q6–Q10.1:
 | PERF_001 | rendimiento en la oficina | perfil por subsistema; 11 entradas VU1 compiladas con `/d2OptimizeHugeFunctions` (P1-A, +17 %); atajo bilineal de fracción cero (parche 28, +5,3 %); 6,76 VSync/s | integrado (PR #7 y #8) | [PERF_001_BASELINE.md](PERF_001_BASELINE.md) |
 | GAMEPLAY_002 | acceso al gameplay | punto seguro de checkpoint en gameplay (parche 29); checkpoint del castillo; **FIRST_PLAYABLE_FRAME** (definición limitada) | integrado (PR #10) | [GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md](GAMEPLAY_002_FIRST_PLAYABLE_DIAGNOSIS.md) |
 | GAMEPLAY_003 | Dante atraviesa el suelo al saltar | `CFC2 $vi17` leía siempre 0: las FMAC de VU0 no actualizaban MAC; corrección general (parche 30); salto y aterrizaje confirmados | integrado (PR #10) | [GAMEPLAY_003_JUMP_COLLISION_DIAGNOSIS.md](GAMEPLAY_003_JUMP_COLLISION_DIAGNOSIS.md) |
-| PERF_002 | rendimiento en el castillo | línea base de cinemática y gameplay (4,62 VSync/s); GS 55 % y VU1 38 % del hilo; C1: `exactFlags` sin `_ldsign` (parche 31, +5,2 % atribuible, A/B/B/A) | parche 31 local, pendiente de publicar | [PERF_002_CASTLE_BASELINE.md](PERF_002_CASTLE_BASELINE.md) |
+| PERF_002 | rendimiento en el castillo | línea base de cinemática y gameplay (4,62 VSync/s); GS 55 % y VU1 38 % del hilo; C1: `exactFlags` sin `_ldsign` (parche 31, +5,2 % atribuible, A/B/B/A) | integrado (PR #11, parche 31) | [PERF_002_CASTLE_BASELINE.md](PERF_002_CASTLE_BASELINE.md) |
+| PERF_003 | viabilidad de optimizaciones estructurales | GS Replay; ZTE (parche 32); despacho de VRAM (parche 33); GS-4 por `PROT3W`/`LWU` en el EE (parche 34); experimentos E1, C2a-3, C2b-2 y C2b-3 descartados | integrado (PR #12) | [PERF_003_ARCHITECTURE_FEASIBILITY.md](PERF_003_ARCHITECTURE_FEASIBILITY.md), [PERF_003_GS_OPEN_ISSUES.md](PERF_003_GS_OPEN_ISSUES.md) |
+| VISUAL_007–009 | defectos visuales tras el parche 34; puntos del cielo | auditoría con PCSX2; doble cobertura de aristas compartidas con mezcla aditiva (11/11 puntos); regla semiabierta validada offline | cerrado | [VISUAL_007_009_GS_INVESTIGATIONS.md](VISUAL_007_009_GS_INVESTIGATIONS.md) |
+| VISUAL_010 | regla de cobertura de triángulos | parche 35 (cobertura semiabierta), tests y nuevas referencias de GS Replay | integrado (PR #13) | [VISUAL_010_GS_TRIANGLE_COVERAGE.md](VISUAL_010_GS_TRIANGLE_COVERAGE.md) |
+| PERF_004A–E | rendimiento con 35 parches y GS asíncrono | línea base (GS 50–53 %); prototipo SPSC; 0 barreras en dos cinemáticas; integración ×1,64–1,96; memoria retenida reducida | candidato a parche 36 **experimental, no integrado**; PERF_004F pendiente | [PERF_004_PROGRESS.md](PERF_004_PROGRESS.md) (entrada), [A](PERF_004A_RUNTIME_BASELINE.md), [B](PERF_004B_ASYNC_GS_PROTOTYPE.md), [C](PERF_004C_GS_SYNCHRONIZATION.md), [D](PERF_004D_ASYNC_GS_INTEGRATION.md), [E](PERF_004E_ASYNC_GS_HARDENING.md) |
 
 ### Fichas de fases sin documento propio (resumen; detalle en la nota GAMEPLAY_001)
 
