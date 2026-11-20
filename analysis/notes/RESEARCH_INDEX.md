@@ -113,6 +113,8 @@ P4.0–P4.2.4 y Q6–Q10.1:
 | VISUAL_010 | regla de cobertura de triángulos | parche 35 (cobertura semiabierta), tests y nuevas referencias de GS Replay | integrado (PR #13) | [VISUAL_010_GS_TRIANGLE_COVERAGE.md](VISUAL_010_GS_TRIANGLE_COVERAGE.md) |
 | PERF_004A–E | rendimiento con 35 parches y GS asíncrono | línea base (GS 50–53 %); prototipo SPSC; 0 barreras en dos cinemáticas; integración ×1,64–1,96; memoria retenida reducida | cerradas; su resultado es el parche 36 (PERF_004F) | [PERF_004_PROGRESS.md](PERF_004_PROGRESS.md) (entrada), [A](PERF_004A_RUNTIME_BASELINE.md), [B](PERF_004B_ASYNC_GS_PROTOTYPE.md), [C](PERF_004C_GS_SYNCHRONIZATION.md), [D](PERF_004D_ASYNC_GS_INTEGRATION.md), [E](PERF_004E_ASYNC_GS_HARDENING.md) |
 | PERF_004F | memoria en vuelo del GS asíncrono con la cola llena (Opciones) | presupuesto de bytes de subida pendientes (32 MiB; una subida mayor entra sola); 85/85 tests; Replay y checkpoints idénticos; Opciones 78,8 → 32,0 MB pendientes | parche 36 propuesto (opcional, desactivado por defecto) | [PERF_004F_GS_QUEUE_BYTE_BUDGET.md](PERF_004F_GS_QUEUE_BYTE_BUDGET.md) |
+| AUDIO_001 / AUDIO_002-0 | estado del audio; contabilidad de comandos; pasos de Dante mudos | solo suena la voz XAG; EE→IOP sin pérdidas; los pasos se descartan en el EE porque `SdrGetState(0x80000006)` cae en el fallback de RPC (0); en el IRX es el estado del puerto (1 = TQ, 2 = SQ), igual a la tabla `0x742C30[4..9]` en los savestates de PCSX2 | causa localizada; **corrección no implementada** | [AUDIO_002_SDRGETSTATE_PORT_STATES.md](AUDIO_002_SDRGETSTATE_PORT_STATES.md) |
+| AUDIO_002-1/2 | XAG por reloj de host y cola sin límite; sin referencia determinista | mezclador en el hilo del guest (960 frames por tick PAL), anillo SPSC acotado, WAV determinista, modos `guest`/`free`/`off`; 18/18 y 85/85; WAV del castillo bit a bit frente a un decodificador independiente; checkpoints 12/12; rendimiento ±2,5 % | parche 37 propuesto (experimental; ruta anterior con `PS2X_AUDIO_MIXER=0`); PCSX2 en vivo no medido | [AUDIO_002_1_2_MIXER_CLOCK.md](AUDIO_002_1_2_MIXER_CLOCK.md) |
 
 ### Fichas de fases sin documento propio (resumen; detalle en la nota GAMEPLAY_001)
 
@@ -152,6 +154,8 @@ P4.0–P4.2.4 y Q6–Q10.1:
 | Capturas pasivas de ventana en 001G → escritorio, inválidas | [GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md](GAMEPLAY_001G_CDMODULE_AND_RET0_SHADOW.md) |
 | Parche TTE mínimo de 001H «suficiente» → requería también conservar TTE en `sceDmaSend` | [GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md](GAMEPLAY_001I_TTE_PROMOTION_ADD_SUB_VF0.md) |
 | Origen de `vf0.w = 0` «`StartThread` o checkpoint (UNKNOWN)» → creación de contexto; el checkpoint solo lo perpetúa | ídem |
+| AUDIO_001: traza `[IOP/RPC trace:unhandled]` «inactiva» → activa; bloqueo de los pasos por `SdrGetState(4)` → por `0x80000006` | [AUDIO_002_SDRGETSTATE_PORT_STATES.md](AUDIO_002_SDRGETSTATE_PORT_STATES.md) |
+| AUDIO_002-1/2: primera prueba de `WM_CLOSE` «con voz en curso» → el worker ya había terminado; repetida a mitad de clip | [AUDIO_002_1_2_MIXER_CLOCK.md](AUDIO_002_1_2_MIXER_CLOCK.md) |
 
 ## 6. Política documental
 

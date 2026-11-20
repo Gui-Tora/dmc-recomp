@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los treinta y seis patches actualmente activos:
+arriba). Los treinta y siete patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -826,3 +826,32 @@ arriba). Los treinta y seis patches actualmente activos:
     - Pendiente: combate, pausa y gameplay con mando en asíncrono; comparación de imágenes en PERF_004F.
       Documentación: `PERF_004D_gs_async_backend.md` (este directorio) y
       `analysis/notes/PERF_004F_GS_QUEUE_BYTE_BUDGET.md`.
+37. `AUDIO_002_1_mixer_clock.patch` (convención A — companion `AUDIO_002_1_mixer_clock.md`). Audio, **experimental y
+    activo por defecto**: mezclador con reloj de guest y salida WAV determinista. Solo cambia la salida; las
+    respuestas de TSNDDRVM que ve el juego no cambian.
+    - `ps2xIOP/include/ps2x/iop/audio_dsp.h` (nuevo, solo cabecera): SPU-ADPCM (movido sin cambios desde
+      TSNDDRVM), remuestreador Catmull-Rom en enteros, lector de clips XAG e interfaz `AudioRenderSource`.
+    - `ps2xRuntime/src/lib/audio/audio_mixer.h` (nuevo, privado): anillo SPSC acotado (el productor nunca toca el
+      índice de lectura), `DeviceGate` entre callback y cierre, `WavSink` y `AudioMixer` (960 frames por tick:
+      48 000 / `PS2X_AUDIO_FIELD_HZ`, 50 por defecto).
+    - `ps2_iop_host.{h,cpp}`: un `AudioStream` de 48 kHz s16 estéreo; `iop_host.h`: API opcional con
+      implementación vacía.
+    - `ee_scheduler.h`/`EeScheduler.cpp`: observador de VBlank (no cambia ciclos, orden de eventos ni los 60 Hz);
+      `ps2_runtime.cpp` lo registra.
+    - `tsnddrvm_xag.cpp`: el XAG entra como fuente de guest (WAV); en modo `free` (defecto) un worker reproduce
+      una copia independiente en tiempo real por un flujo acotado (~0,5 s), en lugar del `std::deque` sin límite.
+    - `ps2xTest`: 18 tests.
+    - Ninguna cabecera incluida por el EE generado cambia: no se regenera ni se recompila `generated`.
+    - Variables: `PS2X_AUDIO_MIXER=0` (ruta anterior), `PS2X_AUDIO_XAG_MODE=guest|free|off`,
+      `PS2X_AUDIO_DEVICE=0`, `PS2X_AUDIO_WAV=<ruta>`, `PS2X_AUDIO_WAV_TICKS=a:b`, `PS2X_AUDIO_FIELD_HZ`,
+      `PS2X_AUDIO_STATS_TICKS`.
+    - Validación:
+      - 18/18 tests del mezclador (×5) y 85/85 del GS asíncrono; GS Replay sin cambios;
+      - WAV del castillo idéntico en 5 configuraciones y bit a bit frente a un decodificador independiente;
+      - checkpoints idénticos en las 12 secciones; restauración a mitad de clip sin audio antiguo;
+      - mismas líneas `[TSNDDRVM]` que la referencia, también con `PS2X_AUDIO_MIXER=0`;
+      - rendimiento dentro de ±2,5 % de la referencia con carga comparable.
+    - Limitaciones: el exe sale con `std::_Exit(0)` (sin destructores al cerrar), así que la cabecera del WAV puede
+      quedar hasta 1 s por detrás de los datos; no se midió PCSX2 en vivo; no implementa PSS, SE, BGM ni SPU2.
+      Documentación: `AUDIO_002_1_mixer_clock.md` (este directorio) y
+      `analysis/notes/AUDIO_002_1_2_MIXER_CLOCK.md`.

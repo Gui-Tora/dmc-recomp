@@ -147,6 +147,10 @@
     {
       "path": "patches/PERF_004D_gs_async_backend.patch",
       "sha256": "b54c06be5e3b2ab3606a335ef1795988c915516bd75a4436ec9775295dd2a641"
+    },
+    {
+      "path": "patches/AUDIO_002_1_mixer_clock.patch",
+      "sha256": "411e4862a462f24dc368546015495ccac23a3bad836992c9375fc5d0c6b4297f"
     }
   ],
   "patch_identity": {
@@ -155,5 +159,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "247af5902d0c4936aa6b2b8a0e79f7a3f24ddbde"
+  "patched_commit": "acacdf88cf4ea06b8dd50fd6f5face6974a46e38"
 }
