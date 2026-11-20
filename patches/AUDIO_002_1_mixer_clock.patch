@@ -1,0 +1,2144 @@
+diff --git a/ps2xIOP/include/ps2x/iop/audio_dsp.h b/ps2xIOP/include/ps2x/iop/audio_dsp.h
+new file mode 100644
+index 0000000..6274305
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/audio_dsp.h
+@@ -0,0 +1,276 @@
++#pragma once
++// AUDIO_002-1/2: audio building blocks shared by IOP sound services and the runtime mixer (header-only).
++// Not included by recompiled EE code.
++//   * decodeSpuAdpcm: SPU ADPCM (16-byte frames of 28 samples, filters 0-4). Moved verbatim from TSNDDRVM's XAG
++//     decoder; same output bit for bit.
++//   * CubicResampler: integer Catmull-Rom resampler (32.32 phase, Q16 interpolation fraction). Fully integer, so the
++//     output is identical on every host and thread and can be reproduced by an independent reference.
++//   * AudioRenderSource: a source the mixer pulls at the mix rate (48 kHz, interleaved stereo s16).
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace ps2x::iop::audio
++{
++    inline constexpr uint32_t kMixRate = 48000u;
++
++    // Mixer groups: each has its own device mode (AUDIO_002-1/2) and, later, its own master gain.
++    enum class AudioGroup : uint8_t
++    {
++        Xag = 0,
++        Pss = 1,
++        Se = 2,
++        Bgm = 3,
++    };
++    inline constexpr size_t kAudioGroupCount = 4u;
++
++    inline const char *audioGroupName(AudioGroup group)
++    {
++        switch (group)
++        {
++        case AudioGroup::Xag: return "xag";
++        case AudioGroup::Pss: return "pss";
++        case AudioGroup::Se: return "se";
++        case AudioGroup::Bgm: return "bgm";
++        }
++        return "?";
++    }
++
++    // Device mode of a group:
++    //   Guest: the guest-timed mix (960 frames per PAL field) is also sent to the device.
++    //   Free:  the guest-timed mix goes to the WAV only; the service feeds the device with an independent
++    //          real-time copy (XAG transition path, keeps today's continuous voice).
++    //   Off:   WAV only.
++    enum class DeviceMode : uint8_t
++    {
++        Guest = 0,
++        Free = 1,
++        Off = 2,
++    };
++
++    struct AdpcmChannelState
++    {
++        int32_t s1 = 0;
++        int32_t s2 = 0;
++    };
++
++    inline void decodeSpuAdpcm(const uint8_t *data, size_t bytes, AdpcmChannelState &state, int16_t *out, size_t stride)
++    {
++        static constexpr int32_t kCoef[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
++        for (size_t frame = 0; frame + 16u <= bytes; frame += 16u)
++        {
++            const uint8_t head = data[frame];
++            const int shift = head & 0x0F;
++            const int filter = std::min(head >> 4, 4);
++            for (size_t i = 2; i < 16u; ++i)
++            {
++                const uint8_t byte = data[frame + i];
++                for (int nibbleIndex = 0; nibbleIndex < 2; ++nibbleIndex)
++                {
++                    int32_t nibble = nibbleIndex == 0 ? (byte & 0x0F) : (byte >> 4);
++                    if (nibble >= 8)
++                        nibble -= 16;
++                    int32_t value = shift <= 12 ? ((nibble << 12) >> shift) : 0;
++                    value += (state.s1 * kCoef[filter][0] + state.s2 * kCoef[filter][1]) >> 6;
++                    value = std::clamp(value, -32768, 32767);
++                    state.s2 = state.s1;
++                    state.s1 = value;
++                    *out = static_cast<int16_t>(value);
++                    out += stride;
++                }
++            }
++        }
++    }
++
++    // Pulled by the mixer. render() fills up to `frames` interleaved stereo frames at kMixRate and returns how many
++    // it produced (the rest of the block is silence). Called on one thread at a time; must not call into the guest.
++    class AudioRenderSource
++    {
++    public:
++        virtual ~AudioRenderSource() = default;
++        virtual size_t render(int16_t *stereo, size_t frames) = 0;
++        [[nodiscard]] virtual bool finished() const = 0;
++    };
++
++    // Streaming resampler, 1 or 2 input channels -> interleaved stereo at outRate.
++    // Output frame k is the Catmull-Rom interpolation at input position k * step / 2^32 between input frames
++    // floor(pos) and floor(pos) + 1 (the frame before input 0 and the frames after the end are 0). Production
++    // stops once floor(pos) reaches the input length, so the output length is ceil(N * 2^32 / step) for N input
++    // frames, step = floor(inRate * 2^32 / outRate). With inRate == outRate the output equals the input.
++    class CubicResampler
++    {
++    public:
++        CubicResampler(uint32_t inRate, uint32_t outRate, uint32_t channels)
++            : m_channels(channels == 1u ? 1u : 2u),
++              m_step(outRate == 0u ? (1ull << 32) : (static_cast<uint64_t>(inRate) << 32) / outRate)
++        {
++        }
++
++        [[nodiscard]] uint64_t step() const { return m_step; }
++        [[nodiscard]] bool finished() const { return m_ended && m_p1Index >= m_inputFrames; }
++        [[nodiscard]] uint64_t inputFramesSeen() const { return m_inputFrames; }
++
++        // pull(int16_t *dst, size_t maxFrames) -> size_t: copies up to maxFrames interleaved input frames
++        // (m_channels samples each) and returns the count; 0 means end of input.
++        template <typename Pull>
++        size_t produce(int16_t *out, size_t frames, Pull &&pull)
++        {
++            if (!m_primed)
++            {
++                m_primed = true;
++                for (int i = 1; i < 4; ++i)
++                    shiftIn(pull);
++                m_p1Index = 0; // p1 holds input frame 0
++            }
++            size_t produced = 0;
++            while (produced < frames)
++            {
++                while (m_frac >= kOne)
++                {
++                    shiftIn(pull);
++                    ++m_p1Index;
++                    m_frac -= kOne;
++                }
++                if (m_ended && m_p1Index >= m_inputFrames)
++                    break;
++                const int64_t t = static_cast<int64_t>(m_frac >> 16); // Q16
++                for (uint32_t c = 0; c < 2u; ++c)
++                {
++                    const uint32_t ch = m_channels == 1u ? 0u : c;
++                    out[produced * 2u + c] = interpolate(m_win[0][ch], m_win[1][ch], m_win[2][ch], m_win[3][ch], t);
++                }
++                ++produced;
++                m_frac += m_step;
++            }
++            return produced;
++        }
++
++        static int16_t interpolate(int64_t p0, int64_t p1, int64_t p2, int64_t p3, int64_t t)
++        {
++            // y = p1 + t/2 * ((p2 - p0) + t * ((2p0 - 5p1 + 4p2 - p3) + t * (-p0 + 3p1 - 3p2 + p3))), t in Q16.
++            // Arithmetic right shifts round toward minus infinity (C++20).
++            const int64_t a = -p0 + 3 * p1 - 3 * p2 + p3;
++            const int64_t b = 2 * p0 - 5 * p1 + 4 * p2 - p3;
++            const int64_t c = p2 - p0;
++            int64_t v = (a * t) >> 16;
++            v = ((v + b) * t) >> 16;
++            v = ((v + c) * t) >> 16;
++            const int64_t y = p1 + (v >> 1);
++            return static_cast<int16_t>(std::clamp<int64_t>(y, -32768, 32767));
++        }
++
++    private:
++        static constexpr uint64_t kOne = 1ull << 32;
++
++        template <typename Pull>
++        void shiftIn(Pull &pull)
++        {
++            m_win[0][0] = m_win[1][0]; m_win[0][1] = m_win[1][1];
++            m_win[1][0] = m_win[2][0]; m_win[1][1] = m_win[2][1];
++            m_win[2][0] = m_win[3][0]; m_win[2][1] = m_win[3][1];
++            int16_t frame[2] = {0, 0};
++            if (!m_ended)
++            {
++                if (pull(frame, 1u) == 1u)
++                    ++m_inputFrames;
++                else
++                {
++                    m_ended = true;
++                    frame[0] = frame[1] = 0;
++                }
++            }
++            m_win[3][0] = frame[0];
++            m_win[3][1] = m_channels == 1u ? frame[0] : frame[1];
++        }
++
++        uint32_t m_channels;
++        uint64_t m_step;
++        uint64_t m_frac = 0u;
++        uint64_t m_inputFrames = 0u;
++        uint64_t m_p1Index = 0u;
++        bool m_primed = false;
++        bool m_ended = false;
++        int32_t m_win[4][2] = {};
++    };
++
++    // Reads an XAG clip (TSNDDRVM layout) from a host file: chunks of `channels` blocks of `blockBytes` SPU ADPCM,
++    // one block per channel; produces interleaved frames of `channels` samples. Buffers are sized once.
++    // readAt(offset, dst, size, &got) -> bool is the host file read.
++    struct XagClipLayout
++    {
++        uint64_t base = 0u;       // byte offset of the clip in the file
++        uint64_t bytes = 0u;      // clip length in bytes
++        uint32_t blockBytes = 0u; // per-channel block, multiple of 16
++        uint32_t channels = 0u;   // 1 or 2
++        uint32_t sampleRate = 0u;
++    };
++
++    class XagClipReader
++    {
++    public:
++        explicit XagClipReader(const XagClipLayout &layout)
++            : m_layout(layout),
++              m_framesPerChunk(layout.blockBytes / 16u * 28u),
++              m_chunk(static_cast<size_t>(layout.blockBytes) * layout.channels),
++              m_pcm(static_cast<size_t>(layout.blockBytes / 16u * 28u) * layout.channels)
++        {
++        }
++
++        [[nodiscard]] uint32_t channels() const { return m_layout.channels; }
++        [[nodiscard]] uint64_t chunksRead() const { return m_chunksRead; }
++
++        // Copies up to maxFrames frames; returns 0 at the end of the clip or on a read failure.
++        template <typename ReadAt>
++        size_t read(int16_t *dst, size_t maxFrames, ReadAt &&readAt)
++        {
++            size_t done = 0;
++            while (done < maxFrames)
++            {
++                if (m_pcmPos == m_pcmFrames && !refill(readAt))
++                    break;
++                const size_t n = std::min(maxFrames - done, m_pcmFrames - m_pcmPos);
++                std::copy_n(m_pcm.data() + m_pcmPos * m_layout.channels, n * m_layout.channels,
++                            dst + done * m_layout.channels);
++                m_pcmPos += n;
++                done += n;
++            }
++            return done;
++        }
++
++    private:
++        template <typename ReadAt>
++        bool refill(ReadAt &readAt)
++        {
++            const uint64_t chunkBytes = m_chunk.size();
++            if (m_failed || chunkBytes == 0u || m_done >= m_layout.bytes)
++                return false;
++            size_t got = 0;
++            if (!readAt(m_layout.base + m_done, m_chunk.data(), m_chunk.size(), got) || got == 0u)
++            {
++                m_failed = true;
++                return false;
++            }
++            const size_t blocks = got / m_layout.blockBytes;
++            std::fill(m_pcm.begin(), m_pcm.end(), int16_t{0});
++            for (uint32_t ch = 0; ch < m_layout.channels && ch < blocks; ++ch)
++                decodeSpuAdpcm(m_chunk.data() + static_cast<size_t>(ch) * m_layout.blockBytes, m_layout.blockBytes,
++                               m_state[ch], m_pcm.data() + ch, m_layout.channels);
++            m_pcmFrames = m_framesPerChunk;
++            m_pcmPos = 0;
++            m_done += chunkBytes;
++            ++m_chunksRead;
++            return true;
++        }
++
++        XagClipLayout m_layout;
++        size_t m_framesPerChunk;
++        std::vector<uint8_t> m_chunk;
++        std::vector<int16_t> m_pcm;
++        AdpcmChannelState m_state[2] = {};
++        size_t m_pcmFrames = 0, m_pcmPos = 0;
++        uint64_t m_done = 0, m_chunksRead = 0;
++        bool m_failed = false;
++    };
++}
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 895fd73..ab05cb9 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -1,10 +1,13 @@
+ #pragma once
+ 
++#include "ps2x/iop/audio_dsp.h"
+ #include "ps2x/iop/iop_types.h"
+ 
+ #include <array>
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
++#include <memory>
+ #include <string>
+ #include <string_view>
+ 
+@@ -121,5 +124,52 @@ namespace ps2x::iop
+         {
+             (void)streamId;
+         }
++
++        // AUDIO_002-1/2 (patch 37): guest-timed mixer. When audioMixerEnabled() is false (no mixer, or
++        // PS2X_AUDIO_MIXER=0), services keep using streamPcm/stopPcmStream above.
++        [[nodiscard]] virtual bool audioMixerEnabled() const
++        {
++            return false;
++        }
++
++        // Effective device mode of a group (Free: the service feeds the device itself with pushFreeRunningPcm).
++        [[nodiscard]] virtual audio::DeviceMode audioDeviceMode(audio::AudioGroup group) const
++        {
++            (void)group;
++            return audio::DeviceMode::Off;
++        }
++
++        // Adds a source rendered once per emulated field on the executor thread (WAV, and the device in Guest mode).
++        // Call from the guest (RPC) thread. Returns 0 when there is no mixer. The mixer owns the source.
++        virtual uint64_t addGuestAudioSource(audio::AudioGroup group, std::unique_ptr<audio::AudioRenderSource> source)
++        {
++            (void)group;
++            (void)source;
++            return 0u;
++        }
++
++        // Removes (and destroys) a source; unknown ids (e.g. sources that already finished) are ignored.
++        virtual void removeGuestAudioSource(uint64_t id)
++        {
++            (void)id;
++        }
++
++        // Free mode: queues interleaved stereo frames at 48 kHz on a bounded real-time stream. Blocks while the
++        // stream is full; returns false when cancelled (*cancel) or when there is no device to play it.
++        virtual bool pushFreeRunningPcm(uint32_t streamId, const int16_t *stereo48k, size_t frames,
++                                        const std::atomic<bool> *cancel)
++        {
++            (void)streamId;
++            (void)stereo48k;
++            (void)frames;
++            (void)cancel;
++            return false;
++        }
++
++        // Drops what is queued on a free-running stream (applied by the device side; never blocks).
++        virtual void flushFreeRunningPcm(uint32_t streamId)
++        {
++            (void)streamId;
++        }
+     };
+ }
+diff --git a/ps2xIOP/src/modules/tsnddrvm_xag.cpp b/ps2xIOP/src/modules/tsnddrvm_xag.cpp
+index 899c59f..6aa7397 100644
+--- a/ps2xIOP/src/modules/tsnddrvm_xag.cpp
++++ b/ps2xIOP/src/modules/tsnddrvm_xag.cpp
+@@ -33,6 +33,7 @@
+ // into "playing" (XagChkPlay keeps answering >= 0 until the clip has elapsed).
+ #include "../module_factories.h"
+ #include "../checkpoint_bytes.h"
++#include "ps2x/iop/audio_dsp.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -133,40 +134,52 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
+-        // PS2 SPU ADPCM: 16-byte frames (shift/filter, flags, 14 bytes = 28 samples).
+-        struct AdpcmChannel
++        // PS2 SPU ADPCM: 16-byte frames (shift/filter, flags, 14 bytes = 28 samples). AUDIO_002-1/2: the decoder
++        // moved verbatim to ps2x/iop/audio_dsp.h so the mixer source and this worker share it.
++        using AdpcmChannel = audio::AdpcmChannelState;
++
++        inline void decodeAdpcm(const uint8_t *data, size_t bytes, AdpcmChannel &state, int16_t *out, size_t stride)
+         {
+-            int32_t s1 = 0;
+-            int32_t s2 = 0;
+-        };
++            audio::decodeSpuAdpcm(data, bytes, state, out, stride);
++        }
+ 
+-        void decodeAdpcm(const uint8_t *data, size_t bytes, AdpcmChannel &state, int16_t *out, size_t stride)
++        // AUDIO_002-1/2 (patch 37): guest-timed XAG source for the mixer. Pulled once per emulated field on the
++        // executor thread: reads the clip from the CD image on demand (one chunk at a time), decodes it and
++        // resamples it to 48 kHz. Its content depends only on the clip, never on host timing. Owns its file handle.
++        class XagGuestSource final : public audio::AudioRenderSource
+         {
+-            static constexpr int32_t kCoef[5][2] = {{0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
+-            for (size_t frame = 0; frame + 16u <= bytes; frame += 16u)
++        public:
++            XagGuestSource(IopHost &host, uint64_t handle, const audio::XagClipLayout &layout)
++                : m_host(host), m_handle(handle), m_reader(layout),
++                  m_resampler(layout.sampleRate, audio::kMixRate, layout.channels)
+             {
+-                const uint8_t head = data[frame];
+-                const int shift = head & 0x0F;
+-                const int filter = std::min(head >> 4, 4);
+-                for (size_t i = 2; i < 16u; ++i)
+-                {
+-                    const uint8_t byte = data[frame + i];
+-                    for (int nibbleIndex = 0; nibbleIndex < 2; ++nibbleIndex)
+-                    {
+-                        int32_t nibble = nibbleIndex == 0 ? (byte & 0x0F) : (byte >> 4);
+-                        if (nibble >= 8)
+-                            nibble -= 16;
+-                        int32_t value = shift <= 12 ? ((nibble << 12) >> shift) : 0;
+-                        value += (state.s1 * kCoef[filter][0] + state.s2 * kCoef[filter][1]) >> 6;
+-                        value = std::clamp(value, -32768, 32767);
+-                        state.s2 = state.s1;
+-                        state.s1 = value;
+-                        *out = static_cast<int16_t>(value);
+-                        out += stride;
+-                    }
+-                }
+             }
+-        }
++
++            ~XagGuestSource() override
++            {
++                m_host.closeHostFile(m_handle);
++            }
++
++            size_t render(int16_t *stereo, size_t frames) override
++            {
++                return m_resampler.produce(stereo, frames, [this](int16_t *dst, size_t n) {
++                    return m_reader.read(dst, n, [this](uint64_t offset, void *out, size_t size, size_t &got) {
++                        return m_host.readHostFile(m_handle, offset, out, size, got);
++                    });
++                });
++            }
++
++            [[nodiscard]] bool finished() const override
++            {
++                return m_resampler.finished();
++            }
++
++        private:
++            IopHost &m_host;
++            uint64_t m_handle;
++            audio::XagClipReader m_reader;
++            audio::CubicResampler m_resampler;
++        };
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+@@ -313,6 +326,13 @@ namespace ps2x::iop::detail
+             bool deserializeCheckpointState(const uint8_t *data, size_t size, size_t &consumed,
+                                             std::string &error) override
+             {
++                if (m_host.audioMixerEnabled())
++                {
++                    // AUDIO_002-1/2: audio of the previous state must not survive the restore. v2 payloads are not
++                    // relaunched (unchanged guest behaviour, AUDIO_002-4).
++                    for (uint32_t core = 0; core < 2u; ++core)
++                        stopAudio(core);
++                }
+                 std::lock_guard<std::mutex> lock(m_mutex);
+                 size_t pos = 0;
+                 uint8_t version = 0, core = 0, initialized = 0;
+@@ -407,7 +427,64 @@ namespace ps2x::iop::detail
+                     worker.thread.join();
+                 }
+                 worker.cancel = false;
+-                m_host.stopPcmStream(core);
++                if (m_host.audioMixerEnabled())
++                {
++                    // AUDIO_002-1/2: drop the guest-timed source and whatever the free stream still holds.
++                    m_host.removeGuestAudioSource(m_guestSource[core]);
++                    m_guestSource[core] = 0u;
++                    m_host.flushFreeRunningPcm(core);
++                }
++                else
++                    m_host.stopPcmStream(core);
++            }
++
++            // AUDIO_002-1/2 (patch 37): mixer path. The guest-visible state machine above is unchanged; only the
++            // output differs. Guest source -> WAV (and the device in Guest mode). In Free mode (default for XAG) a
++            // worker also plays an independent copy of the clip in real time on a bounded stream (~0.5 s): it owns
++            // its own reader/resampler/file handle, never touches guest or service state, and stops on cancel.
++            void startMixedAudio(uint32_t core, const AudioClip &clip)
++            {
++                const audio::XagClipLayout layout{static_cast<uint64_t>(clip.lba) * 2048u + clip.offset, clip.bytes,
++                                                  clip.blockBytes, clip.channels, clip.sampleRate};
++                const std::string imagePath = m_host.hostPath(HostPathKind::CdImage);
++                const uint64_t guestHandle = imagePath.empty() ? 0u : m_host.openHostFile(imagePath);
++                if (guestHandle == 0u)
++                {
++                    logAudio(LogLevel::Warning, "XAG audio core=%u: CD image unavailable, stream not rendered", core);
++                    return;
++                }
++                m_guestSource[core] = m_host.addGuestAudioSource(
++                    audio::AudioGroup::Xag, std::make_unique<XagGuestSource>(m_host, guestHandle, layout));
++                if (m_host.audioDeviceMode(audio::AudioGroup::Xag) != audio::DeviceMode::Free)
++                    return;
++                const uint64_t handle = m_host.openHostFile(imagePath);
++                if (handle == 0u)
++                    return;
++                AudioWorker &worker = m_audio[core];
++                worker.cancel = false;
++                worker.thread = std::thread([this, core, layout, handle, &worker]() {
++                    audio::XagClipReader reader(layout);
++                    audio::CubicResampler resampler(layout.sampleRate, audio::kMixRate, layout.channels);
++                    std::vector<int16_t> out(2u * 1024u);
++                    auto pull = [&](int16_t *dst, size_t n) {
++                        return reader.read(dst, n, [&](uint64_t offset, void *buffer, size_t size, size_t &got) {
++                            return m_host.readHostFile(handle, offset, buffer, size, got);
++                        });
++                    };
++                    bool output = true;
++                    while (!worker.cancel && output)
++                    {
++                        const size_t n = resampler.produce(out.data(), 1024u, pull);
++                        if (n == 0u)
++                            break;
++                        output = m_host.pushFreeRunningPcm(core, out.data(), n, &worker.cancel);
++                    }
++                    m_host.closeHostFile(handle);
++                    const uint64_t frames = reader.chunksRead() * (layout.blockBytes / 16u * 28u);
++                    logAudio(LogLevel::Info, "XAG audio core=%u: queued %llu frames at %u Hz (%s)", core,
++                             static_cast<unsigned long long>(frames), layout.sampleRate,
++                             worker.cancel ? "cancelled" : (!output ? "host has no audio output" : "complete"));
++                });
+             }
+ 
+             void startAudio(uint32_t core, AudioClip clip)
+@@ -417,6 +494,11 @@ namespace ps2x::iop::detail
+                     return;
+                 if (clip.channels == 0u || clip.channels > 2u || clip.blockBytes == 0u || (clip.blockBytes % 16u) != 0u)
+                     return;
++                if (m_host.audioMixerEnabled())
++                {
++                    startMixedAudio(core, clip);
++                    return;
++                }
+                 const std::string imagePath = m_host.hostPath(HostPathKind::CdImage);
+                 const uint64_t handle = imagePath.empty() ? 0u : m_host.openHostFile(imagePath);
+                 if (handle == 0u)
+@@ -855,6 +937,7 @@ namespace ps2x::iop::detail
+             std::array<bool, 2> m_pendingAudioStart{};
+             std::array<bool, 2> m_pendingAudioStop{};
+             std::array<AudioWorker, 2> m_audio{};
++            std::array<uint64_t, 2> m_guestSource{}; // AUDIO_002-1/2: mixer source ids
+             const std::array<uint32_t, 2> m_sids = {kCommandSid, kStateSid};
+         };
+     }
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index ba1c636..a53e855 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -338,6 +338,11 @@ public:
+     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
+     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
++    // AUDIO_002-1/2 (patch 37): host-side observer called on the executor thread at every VBlankStart, right after
++    // the tick is incremented and published. It must not run guest code; it does not change cycles, priorities or
++    // the order of guest-visible events. nullptr removes it.
++    using HostVBlankObserver = void (*)(void *user, uint64_t tick);
++    void setHostVBlankObserver(HostVBlankObserver observer, void *user) noexcept;
+ 
+     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
+     void completeVSync(uint64_t tick);
+@@ -537,6 +542,8 @@ private:
+     uint32_t m_gsVSyncCallback = 0;
+     uint32_t m_gsVSyncCallbackGp = 0;
+     uint32_t m_gsVSyncCallbackSp = 0;
++    HostVBlankObserver m_hostVBlankObserver = nullptr; // AUDIO_002-1/2
++    void *m_hostVBlankObserverUser = nullptr;
+     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
+     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index f9508f8..35cabf5 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2258,6 +2258,12 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
+     }
+ }
+ 
++void EeScheduler::setHostVBlankObserver(HostVBlankObserver observer, void *user) noexcept
++{
++    m_hostVBlankObserver = observer;
++    m_hostVBlankObserverUser = user;
++}
++
+ uint64_t EeScheduler::currentVSyncTick() const noexcept
+ {
+     return m_vsyncTick;
+@@ -2830,6 +2836,10 @@ void EeScheduler::processEvent(const EeEvent &event)
+             }
+         }
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
++        if (m_hostVBlankObserver)
++        {
++            m_hostVBlankObserver(m_hostVBlankObserverUser, m_vsyncTick); // AUDIO_002-1/2: host audio only
++        }
+         if ((m_vsyncTick & 1u) != 0u)
+         {
+             m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
+diff --git a/ps2xRuntime/src/lib/audio/audio_mixer.h b/ps2xRuntime/src/lib/audio/audio_mixer.h
+new file mode 100644
+index 0000000..51d6a90
+--- /dev/null
++++ b/ps2xRuntime/src/lib/audio/audio_mixer.h
+@@ -0,0 +1,699 @@
++#pragma once
++// AUDIO_002-1/2 (patch 37, experimental): guest-timed audio mixer (header-only, private to the runtime).
++// Not included by recompiled EE code. No raylib dependency: the device glue lives in ps2_iop_host.cpp.
++//
++// Threads and ownership
++//   executor (guest) thread : AudioMixer::onVBlank (render + WAV + device-ring producer), addSource/removeSource
++//                             (RPC handlers run on the executor; a mutex also covers teardown from other threads).
++//   device callback thread  : AudioMixer::deviceRender (device-ring consumer and free-ring consumer). Never locks,
++//                             never allocates, never waits.
++//   service worker threads  : AudioMixer::pushFree (one producer per free ring at a time).
++//
++// SpscFrameRing protocol (stereo s16 frames, capacity a power of two). Indices are monotonic 64-bit counters.
++//   W (write) is stored only by the producer, R (read) only by the consumer.
++//   Producer: free = cap - (W - R.acquire); copies at most `free` frames into [W, W+n); W.release = W+n.
++//             Frames that do not fit are dropped (newest) and counted. The producer never touches R.
++//   Consumer: avail = W.acquire - R; reads [R, R+n) ; R.release = R+n.
++//             Overflow policy "drop oldest" is applied by the CONSUMER: if avail > maxFill it advances its own R to
++//             W - targetFill before reading (counted as trimmed).
++//   Flush (checkpoint restore, stream stop): the producer side stores flushTo = W (release) and then increments
++//             flushSeq (release). The consumer, on seeing a new flushSeq (acquire), sets R = max(R, flushTo).
++//             flushTo <= W at all times, so R <= W holds; the consumer stays the only writer of R.
++//   Happens-before: producer writes slot data before W.release; consumer W.acquire precedes its reads. Consumer
++//   finishes reading slots before R.release; producer R.acquire precedes overwriting them. So a slot is never
++//   written while it is being read.
++//
++// DeviceGate (callback vs. shutdown): the callback does enter (seq_cst ++inside) -> load target (seq_cst) -> use ->
++//   exit (--inside). detach stores target = nullptr (seq_cst) then waits for inside == 0. In the seq_cst total order
++//   either the callback's load follows the null store (it sees nullptr) or its increment precedes detach's read of
++//   `inside`, which then waits for its exit. After detach() returns nothing can touch the old target.
++
++#include "ps2x/iop/audio_dsp.h"
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace ps2audio
++{
++    using ps2x::iop::audio::AudioGroup;
++    using ps2x::iop::audio::AudioRenderSource;
++    using ps2x::iop::audio::DeviceMode;
++    using ps2x::iop::audio::kAudioGroupCount;
++    using ps2x::iop::audio::kMixRate;
++
++    inline int16_t saturate16(int32_t v)
++    {
++        return static_cast<int16_t>(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
++    }
++
++    class SpscFrameRing
++    {
++    public:
++        // capacityFrames is rounded up to a power of two. maxFill/targetFill: consumer-side trimming (0 = none).
++        explicit SpscFrameRing(size_t capacityFrames, size_t maxFill = 0u, size_t targetFill = 0u)
++        {
++            size_t cap = 1u;
++            while (cap < capacityFrames)
++                cap <<= 1u;
++            m_cap = cap;
++            m_mask = cap - 1u;
++            m_data.assign(cap * 2u, int16_t{0});
++            m_maxFill = maxFill;
++            m_targetFill = targetFill < maxFill ? targetFill : maxFill;
++        }
++
++        [[nodiscard]] size_t capacity() const { return m_cap; }
++
++        // Producer side.
++        size_t push(const int16_t *stereo, size_t frames)
++        {
++            const uint64_t w = m_w.load(std::memory_order_relaxed);
++            const uint64_t r = m_r.load(std::memory_order_acquire);
++            const size_t space = m_cap - static_cast<size_t>(w - r);
++            const size_t n = frames < space ? frames : space;
++            for (size_t i = 0; i < n; ++i)
++            {
++                const size_t slot = static_cast<size_t>((w + i) & m_mask) * 2u;
++                m_data[slot] = stereo[i * 2u];
++                m_data[slot + 1u] = stereo[i * 2u + 1u];
++            }
++            m_w.store(w + n, std::memory_order_release);
++            if (n < frames)
++                m_dropped.fetch_add(frames - n, std::memory_order_relaxed);
++            m_pushed.fetch_add(n, std::memory_order_relaxed);
++            return n;
++        }
++
++        [[nodiscard]] size_t freeSpace() const
++        {
++            return m_cap - static_cast<size_t>(m_w.load(std::memory_order_relaxed) - m_r.load(std::memory_order_acquire));
++        }
++
++        void requestFlush()
++        {
++            m_flushTo.store(m_w.load(std::memory_order_relaxed), std::memory_order_release);
++            m_flushSeq.fetch_add(1u, std::memory_order_release);
++        }
++
++        // Consumer side: reads up to `frames` frames into dst (interleaved stereo); returns frames read.
++        size_t pop(int16_t *dst, size_t frames)
++        {
++            uint64_t r = m_r.load(std::memory_order_relaxed);
++            const uint32_t seq = m_flushSeq.load(std::memory_order_acquire);
++            if (seq != m_seenFlushSeq)
++            {
++                m_seenFlushSeq = seq;
++                const uint64_t to = m_flushTo.load(std::memory_order_acquire);
++                if (to > r)
++                {
++                    m_flushed.fetch_add(to - r, std::memory_order_relaxed);
++                    r = to;
++                }
++            }
++            const uint64_t w = m_w.load(std::memory_order_acquire);
++            size_t avail = static_cast<size_t>(w - r);
++            if (m_maxFill != 0u && avail > m_maxFill)
++            {
++                const size_t drop = avail - m_targetFill;
++                r += drop;
++                avail -= drop;
++                m_trimmed.fetch_add(drop, std::memory_order_relaxed);
++            }
++            const size_t n = frames < avail ? frames : avail;
++            for (size_t i = 0; i < n; ++i)
++            {
++                const size_t slot = static_cast<size_t>((r + i) & m_mask) * 2u;
++                dst[i * 2u] = m_data[slot];
++                dst[i * 2u + 1u] = m_data[slot + 1u];
++            }
++            m_r.store(r + n, std::memory_order_release);
++            if (n < frames)
++                m_underrun.fetch_add(frames - n, std::memory_order_relaxed);
++            return n;
++        }
++
++        struct Stats
++        {
++            uint64_t pushed, dropped, trimmed, flushed, underrun, fill;
++        };
++        [[nodiscard]] Stats stats() const
++        {
++            return {m_pushed.load(), m_dropped.load(), m_trimmed.load(), m_flushed.load(), m_underrun.load(),
++                    m_w.load() - m_r.load()};
++        }
++
++    private:
++        size_t m_cap = 0, m_mask = 0, m_maxFill = 0, m_targetFill = 0;
++        std::vector<int16_t> m_data;
++        alignas(64) std::atomic<uint64_t> m_w{0};
++        alignas(64) std::atomic<uint64_t> m_r{0};
++        uint32_t m_seenFlushSeq = 0; // consumer-owned
++        alignas(64) std::atomic<uint64_t> m_flushTo{0};
++        std::atomic<uint32_t> m_flushSeq{0};
++        std::atomic<uint64_t> m_pushed{0}, m_dropped{0}, m_trimmed{0}, m_flushed{0}, m_underrun{0};
++    };
++
++    template <typename T>
++    class DeviceGate
++    {
++    public:
++        void attach(T *target) { m_target.store(target); }
++        // Callback side.
++        template <typename Fn, typename Fallback>
++        void with(Fn &&fn, Fallback &&fallback)
++        {
++            m_inside.fetch_add(1);
++            T *target = m_target.load();
++            if (target)
++                fn(*target);
++            else
++                fallback();
++            m_inside.fetch_sub(1);
++        }
++        void detach()
++        {
++            m_target.store(nullptr);
++            while (m_inside.load() != 0)
++                std::this_thread::yield();
++        }
++        [[nodiscard]] bool attached() const { return m_target.load() != nullptr; }
++
++    private:
++        std::atomic<T *> m_target{nullptr};
++        std::atomic<int> m_inside{0};
++    };
++
++    // RIFF/WAVE PCM s16 stereo 48 kHz. Blocks are buffered (64 KB) and the RIFF sizes are rewritten every
++    // `headerEvery` blocks, so a file cut by process termination stays readable up to the last rewrite.
++    class WavSink
++    {
++    public:
++        ~WavSink() { close(); }
++
++        bool open(const std::string &path)
++        {
++            close();
++            m_path = path;
++            m_file = std::fopen(path.c_str(), "wb");
++            if (!m_file)
++            {
++                ++m_errors;
++                return false;
++            }
++            m_dataBytes = 0;
++            m_buffer.clear();
++            m_buffer.reserve(kBufferBytes);
++            writeHeader();
++            return true;
++        }
++
++        [[nodiscard]] bool isOpen() const { return m_file != nullptr; }
++
++        void append(const int16_t *stereo, size_t frames)
++        {
++            if (!m_file)
++                return;
++            const auto t0 = std::chrono::steady_clock::now();
++            const size_t bytes = frames * 4u;
++            const auto *p = reinterpret_cast<const uint8_t *>(stereo);
++            m_buffer.insert(m_buffer.end(), p, p + bytes);
++            m_dataBytes += bytes;
++            if (m_buffer.size() >= kBufferBytes)
++                flushBuffer();
++            if (++m_blocks % m_headerEvery == 0u)
++                checkpointHeader();
++            m_writeNs += static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++        }
++
++        void close()
++        {
++            if (!m_file)
++                return;
++            flushBuffer();
++            checkpointHeader();
++            std::fclose(m_file);
++            m_file = nullptr;
++        }
++
++        void setHeaderEvery(uint64_t blocks) { m_headerEvery = blocks == 0u ? 50u : blocks; }
++        [[nodiscard]] uint64_t dataBytes() const { return m_dataBytes; }
++        [[nodiscard]] uint64_t writeNs() const { return m_writeNs; }
++        [[nodiscard]] uint64_t errors() const { return m_errors; }
++
++        static void encodeHeader(uint8_t out[44], uint32_t dataBytes)
++        {
++            auto u32 = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; ++i) out[at + i] = uint8_t(v >> (8 * i)); };
++            auto u16 = [&](size_t at, uint16_t v) { out[at] = uint8_t(v); out[at + 1] = uint8_t(v >> 8); };
++            std::memcpy(out, "RIFF", 4); u32(4, 36u + dataBytes); std::memcpy(out + 8, "WAVEfmt ", 8);
++            u32(16, 16u); u16(20, 1u); u16(22, 2u); u32(24, kMixRate); u32(28, kMixRate * 4u); u16(32, 4u);
++            u16(34, 16u); std::memcpy(out + 36, "data", 4); u32(40, dataBytes);
++        }
++
++    private:
++        static constexpr size_t kBufferBytes = 64u * 1024u;
++
++        void writeHeader()
++        {
++            uint8_t h[44];
++            encodeHeader(h, static_cast<uint32_t>(m_written));
++            if (std::fseek(m_file, 0, SEEK_SET) != 0 || std::fwrite(h, 1, 44, m_file) != 44)
++                ++m_errors;
++            std::fseek(m_file, 0, SEEK_END);
++        }
++        void flushBuffer()
++        {
++            if (!m_buffer.empty())
++            {
++                if (std::fwrite(m_buffer.data(), 1, m_buffer.size(), m_file) != m_buffer.size())
++                    ++m_errors;
++                m_written += m_buffer.size();
++                m_buffer.clear();
++            }
++        }
++        void checkpointHeader()
++        {
++            flushBuffer();
++            writeHeader();
++            std::fflush(m_file);
++        }
++
++        std::string m_path;
++        std::FILE *m_file = nullptr;
++        std::vector<uint8_t> m_buffer;
++        uint64_t m_dataBytes = 0, m_written = 0, m_blocks = 0, m_headerEvery = 50u, m_writeNs = 0, m_errors = 0;
++    };
++
++    struct MixerConfig
++    {
++        bool device = true;                                   // PS2X_AUDIO_DEVICE (0 = no device output at all)
++        std::array<DeviceMode, kAudioGroupCount> modes{DeviceMode::Free, DeviceMode::Guest, DeviceMode::Guest,
++                                                       DeviceMode::Guest};
++        std::string wavPath;                                  // PS2X_AUDIO_WAV
++        uint64_t wavFrom = 0u, wavTo = UINT64_MAX;            // PS2X_AUDIO_WAV_TICKS=a:b (fields [a, b))
++        uint32_t fieldHz = 50u;                               // PS2X_AUDIO_FIELD_HZ (DMC PAL: 50 -> 960 frames)
++        size_t deviceRingFrames = 16384u;                     // ~341 ms
++        size_t deviceMaxFill = 12000u;                        // 250 ms: above this the consumer trims ...
++        size_t deviceTargetFill = 2880u;                      // ... to 60 ms
++        size_t freeRingFrames = 24576u;                       // ~512 ms per free stream
++        uint64_t statsEveryFields = 500u;                     // PS2X_AUDIO_STATS_TICKS
++
++        static DeviceMode parseMode(const char *v, DeviceMode fallback)
++        {
++            if (!v) return fallback;
++            const std::string s(v);
++            if (s == "guest") return DeviceMode::Guest;
++            if (s == "free") return DeviceMode::Free;
++            if (s == "off") return DeviceMode::Off;
++            return fallback;
++        }
++
++        static MixerConfig fromEnv()
++        {
++            MixerConfig c;
++            if (const char *v = std::getenv("PS2X_AUDIO_DEVICE"))
++                c.device = std::string(v) != "0";
++            c.modes[0] = parseMode(std::getenv("PS2X_AUDIO_XAG_MODE"), DeviceMode::Free);
++            if (const char *v = std::getenv("PS2X_AUDIO_WAV"))
++                c.wavPath = v;
++            if (const char *v = std::getenv("PS2X_AUDIO_WAV_TICKS"))
++            {
++                const std::string s(v);
++                const size_t colon = s.find(':');
++                c.wavFrom = std::strtoull(s.substr(0, colon).c_str(), nullptr, 0);
++                if (colon != std::string::npos && colon + 1 < s.size())
++                    c.wavTo = std::strtoull(s.substr(colon + 1).c_str(), nullptr, 0);
++            }
++            if (const char *v = std::getenv("PS2X_AUDIO_FIELD_HZ"))
++            {
++                const unsigned long hz = std::strtoul(v, nullptr, 0);
++                if (hz >= 24u && hz <= 120u)
++                    c.fieldHz = static_cast<uint32_t>(hz);
++            }
++            if (const char *v = std::getenv("PS2X_AUDIO_STATS_TICKS"))
++                c.statsEveryFields = std::strtoull(v, nullptr, 0);
++            return c;
++        }
++    };
++
++    class AudioMixer
++    {
++    public:
++        static constexpr size_t kMaxFieldFrames = 2048u; // fieldHz >= 24
++        static constexpr uint32_t kFreeStreams = 2u;
++
++        explicit AudioMixer(MixerConfig config)
++            : m_config(std::move(config)),
++              m_deviceRing(m_config.deviceRingFrames, m_config.deviceMaxFill, m_config.deviceTargetFill)
++        {
++            for (auto &ring : m_freeRings)
++                ring = std::make_unique<SpscFrameRing>(m_config.freeRingFrames);
++            m_scratch.assign(kMaxFieldFrames * 2u, 0);
++            m_accWav.assign(kMaxFieldFrames * 2u, 0);
++            m_accDev.assign(kMaxFieldFrames * 2u, 0);
++            m_outWav.assign(kMaxFieldFrames * 2u, 0);
++            m_outDev.assign(kMaxFieldFrames * 2u, 0);
++            m_wav.setHeaderEvery(m_config.fieldHz);
++        }
++
++        ~AudioMixer() { shutdown(); }
++
++        [[nodiscard]] const MixerConfig &config() const { return m_config; }
++
++        // Effective device mode of a group (global device switch applied).
++        [[nodiscard]] DeviceMode mode(AudioGroup group) const
++        {
++            if (!m_config.device)
++                return DeviceMode::Off;
++            return m_config.modes[static_cast<size_t>(group)];
++        }
++
++        uint64_t addSource(AudioGroup group, std::unique_ptr<AudioRenderSource> source)
++        {
++            if (!source)
++                return 0u;
++            noteThread();
++            std::lock_guard<std::mutex> lock(m_sourceMutex);
++            const uint64_t id = ++m_nextId;
++            m_sources.push_back(Entry{id, group, std::move(source)});
++            ++m_sourcesAdded;
++            return id;
++        }
++
++        void removeSource(uint64_t id)
++        {
++            if (id == 0u)
++                return;
++            noteThread();
++            std::unique_ptr<AudioRenderSource> doomed;
++            {
++                std::lock_guard<std::mutex> lock(m_sourceMutex);
++                for (auto it = m_sources.begin(); it != m_sources.end(); ++it)
++                {
++                    if (it->id == id)
++                    {
++                        doomed = std::move(it->source);
++                        m_sources.erase(it);
++                        ++m_sourcesRemoved;
++                        break;
++                    }
++                }
++            }
++        }
++
++        [[nodiscard]] size_t sourceCount()
++        {
++            std::lock_guard<std::mutex> lock(m_sourceMutex);
++            return m_sources.size();
++        }
++
++        // Frames of field `field` (48000 / fieldHz, remainder carried so no drift for rates not dividing 48000).
++        size_t framesForNextField()
++        {
++            const uint64_t total = static_cast<uint64_t>(kMixRate) + m_remainder;
++            const size_t frames = static_cast<size_t>(total / m_config.fieldHz);
++            m_remainder = static_cast<uint32_t>(total % m_config.fieldHz);
++            return frames;
++        }
++
++        // Executor thread, at VBlankStart with the new tick T: renders field T-1.
++        void onVBlank(uint64_t tick)
++        {
++            if (m_shutdown)
++                return;
++            m_executor = std::this_thread::get_id();
++            const auto t0 = std::chrono::steady_clock::now();
++            if (m_haveTick && tick != m_lastTick + 1u)
++                discontinuity(m_lastTick, tick);
++            m_haveTick = true;
++            m_lastTick = tick;
++            if (tick == 0u)
++                return;
++            const uint64_t field = tick - 1u;
++            const size_t frames = framesForNextField();
++            renderField(field, frames);
++            ++m_fields;
++            const uint64_t ns = static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++            m_renderNs += ns;
++            if (ns > m_renderMaxNs)
++                m_renderMaxNs = ns;
++            if (m_config.statsEveryFields != 0u && m_fields % m_config.statsEveryFields == 0u)
++                logStats("periodic");
++        }
++
++        // Device callback thread.
++        void deviceRender(int16_t *out, size_t frames) noexcept
++        {
++            constexpr size_t kChunk = 256u;
++            int16_t tmp[kChunk * 2u];
++            int32_t acc[kChunk * 2u];
++            size_t done = 0;
++            while (done < frames)
++            {
++                const size_t n = frames - done < kChunk ? frames - done : kChunk;
++                std::memset(acc, 0, n * 2u * sizeof(int32_t));
++                const size_t g = m_deviceRing.pop(tmp, n);
++                for (size_t i = 0; i < g * 2u; ++i)
++                    acc[i] += tmp[i];
++                for (auto &ring : m_freeRings)
++                {
++                    const size_t f = ring->pop(tmp, n);
++                    for (size_t i = 0; i < f * 2u; ++i)
++                        acc[i] += tmp[i];
++                }
++                for (size_t i = 0; i < n * 2u; ++i)
++                    out[(done * 2u) + i] = saturate16(acc[i]);
++                done += n;
++            }
++            m_deviceFrames.fetch_add(frames, std::memory_order_relaxed);
++        }
++
++        // Service worker thread: real-time copy for a Free-mode group. Waits (2 ms steps) while the ring is full;
++        // returns false when cancelled or when there is no device to consume it.
++        bool pushFree(uint32_t stream, const int16_t *stereo, size_t frames, const std::atomic<bool> *cancel)
++        {
++            if (stream >= kFreeStreams || !m_deviceAttached.load() || m_shutdown)
++                return false;
++            SpscFrameRing &ring = *m_freeRings[stream];
++            size_t done = 0;
++            while (done < frames)
++            {
++                const size_t space = ring.freeSpace();
++                if (space == 0u)
++                {
++                    if ((cancel && cancel->load()) || m_shutdown || !m_deviceAttached.load())
++                        return false;
++                    m_freeWaits.fetch_add(1u, std::memory_order_relaxed);
++                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
++                    continue;
++                }
++                const size_t n = frames - done < space ? frames - done : space;
++                ring.push(stereo + done * 2u, n);
++                done += n;
++            }
++            return true;
++        }
++
++        void flushFree(uint32_t stream)
++        {
++            if (stream < kFreeStreams)
++                m_freeRings[stream]->requestFlush();
++        }
++
++        void setDeviceAttached(bool attached) { m_deviceAttached.store(attached); }
++        [[nodiscard]] bool deviceAttached() const { return m_deviceAttached.load(); }
++
++        // Destroys all sources and closes the WAV. The device must be detached by the caller first.
++        void shutdown()
++        {
++            if (m_shutdown)
++                return;
++            m_shutdown = true;
++            logStats("final");
++            std::vector<Entry> doomed;
++            {
++                std::lock_guard<std::mutex> lock(m_sourceMutex);
++                doomed.swap(m_sources);
++            }
++            doomed.clear();
++            m_wav.close();
++        }
++
++        [[nodiscard]] SpscFrameRing &deviceRing() { return m_deviceRing; }
++        [[nodiscard]] SpscFrameRing &freeRing(uint32_t i) { return *m_freeRings[i]; }
++        [[nodiscard]] uint64_t fieldsRendered() const { return m_fields; }
++        [[nodiscard]] uint64_t wavFields() const { return m_wavFields; }
++        [[nodiscard]] uint64_t discontinuities() const { return m_discontinuities; }
++        [[nodiscard]] const WavSink &wav() const { return m_wav; }
++        [[nodiscard]] uint64_t offThreadCalls() const { return m_offThread.load(); }
++
++        void logStats(const char *why)
++        {
++            const auto dev = m_deviceRing.stats();
++            uint64_t freePushed = 0, freeUnder = 0, freeFlushed = 0;
++            for (auto &ring : m_freeRings)
++            {
++                const auto s = ring->stats();
++                freePushed += s.pushed;
++                freeUnder += s.underrun;
++                freeFlushed += s.flushed;
++            }
++            std::fprintf(stderr,
++                         "[AUDIO:mix] %s tick=%llu fields=%llu frames=%llu sources=%zu added=%llu removed=%llu "
++                         "render_avg_us=%.2f render_max_us=%.1f wav_fields=%llu wav_bytes=%llu wav_write_ms=%.2f "
++                         "wav_err=%llu dev{pushed=%llu dropped=%llu trimmed=%llu flushed=%llu underrun=%llu fill=%llu} "
++                         "free{pushed=%llu underrun=%llu flushed=%llu waits=%llu} device_frames=%llu disc=%llu "
++                         "offthread=%llu\n",
++                         why, static_cast<unsigned long long>(m_lastTick), static_cast<unsigned long long>(m_fields),
++                         static_cast<unsigned long long>(m_framesRendered), m_sources.size(),
++                         static_cast<unsigned long long>(m_sourcesAdded),
++                         static_cast<unsigned long long>(m_sourcesRemoved),
++                         m_fields ? double(m_renderNs) / double(m_fields) / 1000.0 : 0.0, double(m_renderMaxNs) / 1000.0,
++                         static_cast<unsigned long long>(m_wavFields), static_cast<unsigned long long>(m_wav.dataBytes()),
++                         double(m_wav.writeNs()) / 1e6, static_cast<unsigned long long>(m_wav.errors()),
++                         static_cast<unsigned long long>(dev.pushed), static_cast<unsigned long long>(dev.dropped),
++                         static_cast<unsigned long long>(dev.trimmed), static_cast<unsigned long long>(dev.flushed),
++                         static_cast<unsigned long long>(dev.underrun), static_cast<unsigned long long>(dev.fill),
++                         static_cast<unsigned long long>(freePushed), static_cast<unsigned long long>(freeUnder),
++                         static_cast<unsigned long long>(freeFlushed),
++                         static_cast<unsigned long long>(m_freeWaits.load()),
++                         static_cast<unsigned long long>(m_deviceFrames.load()),
++                         static_cast<unsigned long long>(m_discontinuities),
++                         static_cast<unsigned long long>(m_offThread.load()));
++            std::fflush(stderr);
++        }
++
++    private:
++        struct Entry
++        {
++            uint64_t id;
++            AudioGroup group;
++            std::unique_ptr<AudioRenderSource> source;
++        };
++
++        void noteThread()
++        {
++            if (m_haveTick && std::this_thread::get_id() != m_executor)
++                m_offThread.fetch_add(1u, std::memory_order_relaxed);
++        }
++
++        void discontinuity(uint64_t from, uint64_t to)
++        {
++            ++m_discontinuities;
++            m_deviceRing.requestFlush();
++            m_remainder = 0u;
++            // A checkpoint load jumps the tick: restart an open WAV so that sample = (field - first_field) * 960
++            // keeps holding (explicit PS2X_AUDIO_WAV_TICKS ranges after the load are not affected).
++            const bool restartWav = m_wav.isOpen();
++            if (restartWav)
++            {
++                m_wav.open(m_config.wavPath);
++                m_wavFields = 0;
++                m_wavFirstPending = true;
++            }
++            std::fprintf(stderr, "[AUDIO:mix] tick discontinuity %llu -> %llu: device ring flushed%s\n",
++                         static_cast<unsigned long long>(from), static_cast<unsigned long long>(to),
++                         restartWav ? ", wav restarted" : "");
++        }
++
++        void renderField(uint64_t field, size_t frames)
++        {
++            std::fill_n(m_accWav.begin(), frames * 2u, 0);
++            std::fill_n(m_accDev.begin(), frames * 2u, 0);
++            bool anyDevice = false;
++            {
++                std::lock_guard<std::mutex> lock(m_sourceMutex);
++                for (Entry &e : m_sources)
++                {
++                    const size_t got = e.source->render(m_scratch.data(), frames);
++                    const bool toDevice = mode(e.group) == DeviceMode::Guest;
++                    for (size_t i = 0; i < got * 2u; ++i)
++                    {
++                        m_accWav[i] += m_scratch[i];
++                        if (toDevice)
++                            m_accDev[i] += m_scratch[i];
++                    }
++                    anyDevice = anyDevice || toDevice;
++                }
++                // Sources that ended are dropped here (their owners' removeSource then finds nothing).
++                for (auto it = m_sources.begin(); it != m_sources.end();)
++                {
++                    if (it->source->finished())
++                    {
++                        it = m_sources.erase(it);
++                        ++m_sourcesRemoved;
++                    }
++                    else
++                        ++it;
++                }
++            }
++            for (size_t i = 0; i < frames * 2u; ++i)
++                m_outWav[i] = saturate16(m_accWav[i]);
++            m_framesRendered += frames;
++            if (!m_config.wavPath.empty() && field >= m_config.wavFrom && field < m_config.wavTo)
++            {
++                if (!m_wav.isOpen() && !m_wavDone)
++                {
++                    if (m_wav.open(m_config.wavPath))
++                        std::fprintf(stderr, "[AUDIO:mix] wav open %s first_field=%llu frames_per_field=%zu\n",
++                                     m_config.wavPath.c_str(), static_cast<unsigned long long>(field), frames);
++                    else
++                        m_wavDone = true;
++                }
++                if (m_wav.isOpen())
++                {
++                    if (m_wavFirstPending)
++                    {
++                        m_wavFirstPending = false;
++                        std::fprintf(stderr, "[AUDIO:mix] wav first_field=%llu\n", static_cast<unsigned long long>(field));
++                    }
++                    m_wav.append(m_outWav.data(), frames);
++                    ++m_wavFields;
++                }
++            }
++            else if (m_wav.isOpen() && field >= m_config.wavTo)
++            {
++                m_wav.close();
++                m_wavDone = true;
++                std::fprintf(stderr, "[AUDIO:mix] wav closed at field %llu (%llu fields)\n",
++                             static_cast<unsigned long long>(field), static_cast<unsigned long long>(m_wavFields));
++            }
++            if (m_deviceAttached.load() && m_config.device)
++            {
++                (void)anyDevice;
++                for (size_t i = 0; i < frames * 2u; ++i)
++                    m_outDev[i] = saturate16(m_accDev[i]);
++                m_deviceRing.push(m_outDev.data(), frames);
++            }
++        }
++
++        MixerConfig m_config;
++        SpscFrameRing m_deviceRing;
++        std::array<std::unique_ptr<SpscFrameRing>, kFreeStreams> m_freeRings;
++        std::mutex m_sourceMutex;
++        std::vector<Entry> m_sources;
++        std::vector<int16_t> m_scratch, m_outWav, m_outDev;
++        std::vector<int32_t> m_accWav, m_accDev;
++        WavSink m_wav;
++        bool m_wavDone = false;
++        bool m_wavFirstPending = true;
++        bool m_haveTick = false;
++        std::atomic<bool> m_shutdown{false};
++        uint64_t m_lastTick = 0, m_fields = 0, m_wavFields = 0, m_framesRendered = 0, m_discontinuities = 0;
++        uint64_t m_renderNs = 0, m_renderMaxNs = 0, m_nextId = 0, m_sourcesAdded = 0, m_sourcesRemoved = 0;
++        uint32_t m_remainder = 0;
++        std::thread::id m_executor{};
++        std::atomic<bool> m_deviceAttached{false};
++        std::atomic<uint64_t> m_freeWaits{0}, m_deviceFrames{0}, m_offThread{0};
++    };
++}
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 3a5b579..dd17013 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -8,6 +8,7 @@
+ #include "ps2_host_backend.h"
+ #include "Kernel/Stubs/MemoryCard.h"
+ #include "Kernel/Syscalls/Common.h"
++#include "audio/audio_mixer.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -83,10 +84,30 @@ void PS2IopHostAdapter::CallScope::release()
+ PS2IopHostAdapter::PS2IopHostAdapter(PS2Runtime &runtime)
+     : m_runtime(runtime)
+ {
++    // AUDIO_002-1/2 (patch 37): PS2X_AUDIO_MIXER=0 keeps the previous streamPcm path (no mixer object at all).
++    const char *mixer = std::getenv("PS2X_AUDIO_MIXER");
++    if (!mixer || std::string(mixer) != "0")
++    {
++        ps2audio::MixerConfig config = ps2audio::MixerConfig::fromEnv();
++        static const char *kModes[] = {"guest", "free", "off"};
++        std::fprintf(stderr,
++                     "[AUDIO:mix] mixer on: device=%d xag=%s pss/se/bgm=%s field_hz=%u frames_per_field=%u wav=%s "
++                     "wav_ticks=%llu:%llu\n",
++                     config.device ? 1 : 0, kModes[static_cast<int>(config.modes[0])],
++                     kModes[static_cast<int>(config.modes[1])], config.fieldHz, ps2audio::kMixRate / config.fieldHz,
++                     config.wavPath.empty() ? "-" : config.wavPath.c_str(),
++                     static_cast<unsigned long long>(config.wavFrom), static_cast<unsigned long long>(config.wavTo));
++        m_mixer = std::make_unique<ps2audio::AudioMixer>(std::move(config));
++    }
++    else
++    {
++        std::fprintf(stderr, "[AUDIO:mix] mixer off (PS2X_AUDIO_MIXER=0): previous streamPcm path\n");
++    }
+ }
+ 
+ PS2IopHostAdapter::~PS2IopHostAdapter()
+ {
++    shutdownAudio();
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     for (auto &[handle, file] : m_hostFiles)
+     {
+@@ -597,3 +618,96 @@ void PS2IopHostAdapter::stopPcmStream(uint32_t streamId)
+     std::lock_guard<std::mutex> lock(slot.mutex);
+     slot.samples.clear();
+ }
++
++// ---------------------------------------------------------------------------
++// AUDIO_002-1/2 (patch 37): guest-timed mixer glue. One 48 kHz s16 stereo raylib stream; its callback reaches the
++// mixer only through the DeviceGate (no lock, no allocation, no wait on the guest). Opened lazily on the first
++// VBlank (the adapter is built before InitAudioDevice).
++namespace
++{
++    ps2audio::DeviceGate<ps2audio::AudioMixer> g_audioGate;
++    AudioStream g_mixStream{};
++
++    void mixerDeviceCallback(void *buffer, unsigned int frames)
++    {
++        auto *out = static_cast<int16_t *>(buffer);
++        g_audioGate.with([&](ps2audio::AudioMixer &mixer) { mixer.deviceRender(out, frames); },
++                         [&] { std::memset(out, 0, static_cast<size_t>(frames) * 4u); });
++    }
++}
++
++bool PS2IopHostAdapter::audioMixerEnabled() const
++{
++    return m_mixer != nullptr;
++}
++
++ps2x::iop::audio::DeviceMode PS2IopHostAdapter::audioDeviceMode(ps2x::iop::audio::AudioGroup group) const
++{
++    return m_mixer ? m_mixer->mode(group) : ps2x::iop::audio::DeviceMode::Off;
++}
++
++uint64_t PS2IopHostAdapter::addGuestAudioSource(ps2x::iop::audio::AudioGroup group,
++                                                std::unique_ptr<ps2x::iop::audio::AudioRenderSource> source)
++{
++    return m_mixer ? m_mixer->addSource(group, std::move(source)) : 0u;
++}
++
++void PS2IopHostAdapter::removeGuestAudioSource(uint64_t id)
++{
++    if (m_mixer)
++        m_mixer->removeSource(id);
++}
++
++bool PS2IopHostAdapter::pushFreeRunningPcm(uint32_t streamId, const int16_t *stereo48k, size_t frames,
++                                           const std::atomic<bool> *cancel)
++{
++    return m_mixer && m_mixer->pushFree(streamId, stereo48k, frames, cancel);
++}
++
++void PS2IopHostAdapter::flushFreeRunningPcm(uint32_t streamId)
++{
++    if (m_mixer)
++        m_mixer->flushFree(streamId);
++}
++
++void PS2IopHostAdapter::hostVBlankObserver(void *self, uint64_t tick)
++{
++    auto *adapter = static_cast<PS2IopHostAdapter *>(self);
++    if (!adapter || !adapter->m_mixer)
++        return;
++    if (!adapter->m_audioDeviceTried && adapter->m_mixer->config().device)
++    {
++        adapter->m_audioDeviceTried = true;
++        if (IsAudioDeviceReady())
++        {
++            g_mixStream = LoadAudioStream(ps2audio::kMixRate, 16, 2);
++            SetAudioStreamCallback(g_mixStream, mixerDeviceCallback);
++            g_audioGate.attach(adapter->m_mixer.get());
++            adapter->m_mixer->setDeviceAttached(true);
++            PlayAudioStream(g_mixStream);
++            adapter->m_audioDeviceOpen = true;
++            std::fprintf(stderr, "[AUDIO:mix] device stream open: 48000 Hz s16 stereo (first tick %llu)\n",
++                         static_cast<unsigned long long>(tick));
++        }
++        else
++        {
++            std::fprintf(stderr, "[AUDIO:mix] no audio device: WAV only\n");
++        }
++    }
++    adapter->m_mixer->onVBlank(tick);
++}
++
++void PS2IopHostAdapter::shutdownAudio()
++{
++    if (!m_mixer)
++        return;
++    if (m_audioDeviceOpen)
++    {
++        m_mixer->setDeviceAttached(false); // free-stream producers stop waiting
++        g_audioGate.detach();              // after this the callback can no longer reach the mixer
++        StopAudioStream(g_mixStream);
++        UnloadAudioStream(g_mixStream);
++        m_audioDeviceOpen = false;
++    }
++    m_mixer->shutdown(); // destroys the sources (they close their host files) and closes the WAV
++}
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 99c70f5..d37589e 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -4,10 +4,15 @@
+ 
+ #include <cstdint>
+ #include <cstdio>
++#include <memory>
+ #include <mutex>
+ #include <unordered_map>
+ 
+ class PS2Runtime;
++namespace ps2audio
++{
++    class AudioMixer;
++}
+ struct R5900Context;
+ 
+ class PS2IopHostAdapter final : public ps2x::iop::IopHost
+@@ -85,6 +90,20 @@ public:
+                    size_t frameCount) override;
+     void stopPcmStream(uint32_t streamId) override;
+ 
++    // AUDIO_002-1/2 (patch 37): guest-timed mixer (PS2X_AUDIO_MIXER, default 1; 0 keeps the streamPcm path).
++    [[nodiscard]] bool audioMixerEnabled() const override;
++    [[nodiscard]] ps2x::iop::audio::DeviceMode audioDeviceMode(ps2x::iop::audio::AudioGroup group) const override;
++    uint64_t addGuestAudioSource(ps2x::iop::audio::AudioGroup group,
++                                 std::unique_ptr<ps2x::iop::audio::AudioRenderSource> source) override;
++    void removeGuestAudioSource(uint64_t id) override;
++    bool pushFreeRunningPcm(uint32_t streamId, const int16_t *stereo48k, size_t frames,
++                            const std::atomic<bool> *cancel) override;
++    void flushFreeRunningPcm(uint32_t streamId) override;
++
++    // EeScheduler host VBlank observer (executor thread, after the tick is incremented).
++    static void hostVBlankObserver(void *self, uint64_t tick);
++    void shutdownAudio();
++
+ private:
+     friend class CallScope;
+ 
+@@ -104,4 +123,8 @@ private:
+     mutable std::mutex m_hostFileMutex;
+     std::unordered_map<uint64_t, HostFile> m_hostFiles;
+     uint64_t m_nextHostFileHandle = 1u;
++    // Declared last: destroyed first (its sources close host files through this adapter).
++    std::unique_ptr<ps2audio::AudioMixer> m_mixer;
++    bool m_audioDeviceOpen = false;
++    bool m_audioDeviceTried = false;
+ };
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 301b9c5..3c80e7c 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -523,6 +523,7 @@ PS2Runtime::PS2Runtime()
+     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
+     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
+     m_eeScheduler = std::make_unique<EeScheduler>(*this);
++    m_eeScheduler->setHostVBlankObserver(&PS2IopHostAdapter::hostVBlankObserver, m_iopHost.get()); // AUDIO_002-1/2
+ #if defined(PS2X_IOP_ENABLE_PLUGINS) && PS2X_IOP_ENABLE_PLUGINS && \
+     !defined(PLATFORM_VITA) && (defined(_WIN32) || defined(__linux__))
+     if (const char *applicationDirectory = GetApplicationDirectory();
+@@ -585,6 +586,8 @@ PS2Runtime::~PS2Runtime()
+     {
+         requestStop();
+         m_iopSubsystem.reset();
++        if (m_eeScheduler)
++            m_eeScheduler->setHostVBlankObserver(nullptr, nullptr); // AUDIO_002-1/2
+         m_iopHost.reset();
+ #if defined(PLATFORM_VITA)
+         m_audioBackend.stopAll();
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index d4a4a96..c2204b8 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -60,6 +60,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_sif_dma_tests.cpp
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
++    src/audio_mixer_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/audio_mixer_tests.cpp b/ps2xTest/src/audio_mixer_tests.cpp
+new file mode 100644
+index 0000000..82e72d3
+--- /dev/null
++++ b/ps2xTest/src/audio_mixer_tests.cpp
+@@ -0,0 +1,590 @@
++// AUDIO_002-1/2 (patch 37): guest-timed mixer, SPSC device ring, device gate, WAV sink, resampler, XAG reader.
++#include "MiniTest.h"
++#include "audio/audio_mixer.h"
++
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <random>
++#include <string>
++#include <thread>
++#include <vector>
++
++using namespace ps2audio;
++using ps2x::iop::audio::CubicResampler;
++using ps2x::iop::audio::XagClipLayout;
++using ps2x::iop::audio::XagClipReader;
++
++namespace
++{
++    struct ConstSource final : AudioRenderSource
++    {
++        int16_t l, r;
++        size_t remaining;
++        ConstSource(int16_t left, int16_t right, size_t frames = SIZE_MAX) : l(left), r(right), remaining(frames) {}
++        size_t render(int16_t *out, size_t frames) override
++        {
++            const size_t n = frames < remaining ? frames : remaining;
++            for (size_t i = 0; i < n; ++i)
++            {
++                out[i * 2] = l;
++                out[i * 2 + 1] = r;
++            }
++            remaining -= n;
++            return n;
++        }
++        bool finished() const override { return remaining == 0; }
++    };
++
++    struct RampSource final : AudioRenderSource
++    {
++        uint32_t n = 0;
++        size_t render(int16_t *out, size_t frames) override
++        {
++            for (size_t i = 0; i < frames; ++i, ++n)
++            {
++                out[i * 2] = int16_t(n * 7);
++                out[i * 2 + 1] = int16_t(n * 13);
++            }
++            return frames;
++        }
++        bool finished() const override { return false; }
++    };
++
++    std::vector<int16_t> resampleAll(const std::vector<int16_t> &in, uint32_t ch, uint32_t inRate, size_t block)
++    {
++        CubicResampler rs(inRate, 48000u, ch);
++        size_t pos = 0;
++        auto pull = [&](int16_t *dst, size_t max) -> size_t {
++            const size_t frames = in.size() / ch;
++            const size_t n = std::min(max, frames - pos);
++            std::memcpy(dst, in.data() + pos * ch, n * ch * sizeof(int16_t));
++            pos += n;
++            return n;
++        };
++        std::vector<int16_t> out;
++        std::vector<int16_t> buf(block * 2);
++        for (;;)
++        {
++            const size_t got = rs.produce(buf.data(), block, pull);
++            out.insert(out.end(), buf.begin(), buf.begin() + got * 2);
++            if (got < block)
++                break;
++        }
++        return out;
++    }
++
++    MixerConfig quietConfig()
++    {
++        MixerConfig c;
++        c.statsEveryFields = 0;
++        return c;
++    }
++
++    std::vector<uint8_t> readFile(const std::string &path)
++    {
++        std::vector<uint8_t> data;
++        if (std::FILE *f = std::fopen(path.c_str(), "rb"))
++        {
++            std::fseek(f, 0, SEEK_END);
++            data.resize(static_cast<size_t>(std::ftell(f)));
++            std::fseek(f, 0, SEEK_SET);
++            if (!data.empty())
++                (void)std::fread(data.data(), 1, data.size(), f);
++            std::fclose(f);
++        }
++        return data;
++    }
++
++    uint32_t le32(const std::vector<uint8_t> &d, size_t at)
++    {
++        return d[at] | (d[at + 1] << 8) | (d[at + 2] << 16) | (uint32_t(d[at + 3]) << 24);
++    }
++
++    std::string tempPath(const char *name)
++    {
++        return (std::filesystem::temp_directory_path() / name).string();
++    }
++}
++
++void register_audio_mixer_tests()
++{
++    MiniTest::Case("AudioResampler", [](TestCase &tc) {
++        tc.Run("48k to 48k is the identity", [](TestCase &t) {
++            std::vector<int16_t> in(2 * 5000);
++            for (size_t i = 0; i < in.size(); ++i)
++                in[i] = int16_t((i * 2654435761u) >> 16);
++            const auto out = resampleAll(in, 2, 48000, 960);
++            t.Equals(out.size(), in.size(), "same length");
++            t.IsTrue(out == in, "same samples");
++        });
++        tc.Run("output length is ceil(N * 2^32 / step) and independent of block size", [](TestCase &t) {
++            std::vector<int16_t> in(2 * 100000);
++            for (size_t i = 0; i < in.size(); ++i)
++                in[i] = int16_t(int(10000 * std::sin(i * 0.01)));
++            const uint64_t step = (uint64_t(44098) << 32) / 48000u;
++            const uint64_t expect = ((uint64_t(100000) << 32) + step - 1) / step;
++            const auto a = resampleAll(in, 2, 44098, 1);
++            const auto b = resampleAll(in, 2, 44098, 7);
++            const auto c = resampleAll(in, 2, 44098, 960);
++            const auto d = resampleAll(in, 2, 44098, 4096);
++            t.Equals(uint64_t(c.size() / 2), expect, "length formula");
++            t.IsTrue(a == c && b == c && d == c, "block size does not change the output");
++        });
++        tc.Run("1 kHz sine 44098 -> 48000 keeps SNR above 60 dB", [](TestCase &t) {
++            const double pi = 3.14159265358979323846;
++            std::vector<int16_t> in(44098);
++            for (size_t i = 0; i < in.size(); ++i)
++                in[i] = int16_t(std::lround(16000.0 * std::sin(2 * pi * 1000.0 * double(i) / 44098.0)));
++            const auto out = resampleAll(in, 1, 44098, 960);
++            double sig = 0, err = 0;
++            for (size_t k = 100; k + 100 < out.size() / 2; ++k)
++            {
++                const double ideal = 16000.0 * std::sin(2 * pi * 1000.0 * double(k) / 48000.0);
++                const double y = out[k * 2];
++                sig += ideal * ideal;
++                err += (y - ideal) * (y - ideal);
++                t.IsTrue(out[k * 2] == out[k * 2 + 1], "mono is duplicated to both channels");
++                if (out[k * 2] != out[k * 2 + 1])
++                    break;
++            }
++            const double snr = 10 * std::log10(sig / err);
++            std::printf("    (snr %.1f dB)\n", snr);
++            t.IsTrue(snr > 60.0, "SNR > 60 dB");
++        });
++        tc.Run("interpolation saturates instead of wrapping", [](TestCase &t) {
++            t.Equals(int(CubicResampler::interpolate(-32768, 32767, 32767, -32768, 32768)), 32767, "overshoot clamps");
++            t.Equals(int(CubicResampler::interpolate(32767, -32768, -32768, 32767, 32768)), -32768, "undershoot clamps");
++        });
++    });
++
++    MiniTest::Case("AudioXagReader", [](TestCase &tc) {
++        tc.Run("chunked clip decodes like direct per-block decoding", [](TestCase &t) {
++            const uint32_t blockBytes = 0x40, channels = 2, chunks = 5;
++            std::vector<uint8_t> file(100 + blockBytes * channels * chunks);
++            std::mt19937 rng(7);
++            for (auto &b : file)
++                b = uint8_t(rng());
++            for (size_t f = 100; f < file.size(); f += 16)
++                file[f] = uint8_t((file[f] & 0x3F) % 0x4D); // filter 0-4, shift 0-12
++            XagClipLayout layout{100, uint64_t(blockBytes) * channels * chunks, blockBytes, channels, 44098};
++            XagClipReader reader(layout);
++            auto readAt = [&](uint64_t off, void *dst, size_t size, size_t &got) {
++                got = std::min<size_t>(size, file.size() - off);
++                std::memcpy(dst, file.data() + off, got);
++                return true;
++            };
++            std::vector<int16_t> pcm;
++            int16_t frame[2];
++            while (reader.read(frame, 1, readAt) == 1)
++                pcm.insert(pcm.end(), frame, frame + 2);
++            const size_t perChunk = blockBytes / 16 * 28;
++            t.Equals(pcm.size(), size_t(perChunk * chunks * channels), "frames = chunks * blockBytes/16 * 28");
++            std::vector<int16_t> ref(perChunk * chunks * channels);
++            ps2x::iop::audio::AdpcmChannelState st[2];
++            for (uint32_t c = 0; c < chunks; ++c)
++                for (uint32_t ch = 0; ch < channels; ++ch)
++                    ps2x::iop::audio::decodeSpuAdpcm(file.data() + 100 + (c * channels + ch) * blockBytes, blockBytes,
++                                                     st[ch], ref.data() + c * perChunk * channels + ch, channels);
++            t.IsTrue(pcm == ref, "identical samples");
++        });
++    });
++
++    MiniTest::Case("AudioFieldClock", [](TestCase &tc) {
++        tc.Run("50 Hz gives exactly 960 frames per field", [](TestCase &t) {
++            AudioMixer m(quietConfig());
++            bool all = true;
++            for (int i = 0; i < 1000; ++i)
++                all = all && m.framesForNextField() == 960;
++            t.IsTrue(all, "960 every field");
++        });
++        tc.Run("a rate that does not divide 48000 carries the remainder without drift", [](TestCase &t) {
++            MixerConfig c = quietConfig();
++            c.fieldHz = 47;
++            AudioMixer m(c);
++            uint64_t total = 0;
++            for (uint64_t i = 1; i <= 1000000; ++i)
++            {
++                total += m.framesForNextField();
++                if (i % 47 == 0 && total != i / 47 * 48000)
++                {
++                    t.Fail("drift at field " + std::to_string(i));
++                    return;
++                }
++            }
++            t.IsTrue(true, "no drift over 10^6 fields");
++        });
++    });
++
++    MiniTest::Case("AudioMixer", [](TestCase &tc) {
++        tc.Run("sum and saturation", [](TestCase &t) {
++            MixerConfig c = quietConfig();
++            c.modes = {DeviceMode::Guest, DeviceMode::Guest, DeviceMode::Guest, DeviceMode::Guest};
++            AudioMixer m(c);
++            m.setDeviceAttached(true);
++            m.addSource(AudioGroup::Xag, std::make_unique<ConstSource>(int16_t(30000), int16_t(-30000)));
++            m.addSource(AudioGroup::Pss, std::make_unique<ConstSource>(int16_t(30000), int16_t(-30000)));
++            m.addSource(AudioGroup::Se, std::make_unique<ConstSource>(int16_t(-100), int16_t(100)));
++            m.onVBlank(1);
++            m.onVBlank(2);
++            std::vector<int16_t> out(960 * 2);
++            t.Equals(m.deviceRing().pop(out.data(), 960), size_t(960), "one field in the device ring");
++            t.IsTrue(out[0] == 32767 && out[1] == -32768, "saturated to s16");
++        });
++        tc.Run("sources start in the next field, stop on removal, finished sources are dropped", [](TestCase &t) {
++            const std::string path = tempPath("ps2x_audio_test_events.wav");
++            MixerConfig c = quietConfig();
++            c.wavPath = path;
++            AudioMixer m(c);
++            m.onVBlank(10); // field 9: empty
++            const uint64_t a = m.addSource(AudioGroup::Xag, std::make_unique<ConstSource>(int16_t(1000), int16_t(1000)));
++            m.onVBlank(11); // field 10: a
++            m.addSource(AudioGroup::Se, std::make_unique<ConstSource>(int16_t(1), int16_t(1), 1500));
++            m.onVBlank(12); // field 11: a + b(960)
++            m.removeSource(a);
++            m.onVBlank(13); // field 12: b(540) then silence; b finished -> dropped
++            t.Equals(m.sourceCount(), size_t(0), "finished source dropped");
++            m.onVBlank(14); // field 13: silence
++            m.shutdown();
++            const auto d = readFile(path);
++            t.Equals(d.size(), size_t(44 + 5 * 3840), "5 fields written");
++            auto sample = [&](size_t field, size_t frame) {
++                int16_t v;
++                std::memcpy(&v, d.data() + 44 + field * 3840 + frame * 4, 2);
++                return int(v);
++            };
++            t.IsTrue(sample(0, 0) == 0 && sample(0, 959) == 0, "field 9 silent");
++            t.IsTrue(sample(1, 0) == 1000 && sample(1, 959) == 1000, "field 10 = a");
++            t.IsTrue(sample(2, 0) == 1001, "field 11 = a + b");
++            t.IsTrue(sample(3, 539) == 1 && sample(3, 540) == 0, "field 12 = rest of b, then silence");
++            t.IsTrue(sample(4, 0) == 0, "explicit silence when no source");
++            std::filesystem::remove(path);
++        });
++        tc.Run("device modes: Free and Off groups stay out of the device ring, Guest goes in", [](TestCase &t) {
++            MixerConfig c = quietConfig();
++            c.modes = {DeviceMode::Free, DeviceMode::Guest, DeviceMode::Off, DeviceMode::Guest};
++            AudioMixer m(c);
++            m.setDeviceAttached(true);
++            m.addSource(AudioGroup::Xag, std::make_unique<ConstSource>(int16_t(100), int16_t(100)));
++            m.addSource(AudioGroup::Se, std::make_unique<ConstSource>(int16_t(10), int16_t(10)));
++            m.addSource(AudioGroup::Pss, std::make_unique<ConstSource>(int16_t(1), int16_t(1)));
++            m.onVBlank(1);
++            m.onVBlank(2);
++            std::vector<int16_t> out(960 * 2);
++            m.deviceRing().pop(out.data(), 960);
++            t.Equals(int(out[0]), 1, "only the Guest group reaches the device");
++            MixerConfig off = c;
++            off.device = false;
++            AudioMixer m2(off);
++            m2.setDeviceAttached(true);
++            m2.addSource(AudioGroup::Pss, std::make_unique<ConstSource>(int16_t(1), int16_t(1)));
++            m2.onVBlank(1);
++            m2.onVBlank(2);
++            t.Equals(m2.deviceRing().stats().pushed, uint64_t(0), "device off: nothing pushed");
++            t.IsTrue(m2.mode(AudioGroup::Pss) == DeviceMode::Off, "device off overrides every group");
++        });
++        tc.Run("two equivalent runs give byte-identical WAVs; device attachment does not change the WAV", [](TestCase &t) {
++            auto run = [](const std::string &path, bool device) {
++                MixerConfig c = quietConfig();
++                c.wavPath = path;
++                c.modes = {DeviceMode::Guest, DeviceMode::Guest, DeviceMode::Guest, DeviceMode::Guest};
++                AudioMixer m(c);
++                m.setDeviceAttached(device);
++                m.addSource(AudioGroup::Xag, std::make_unique<RampSource>());
++                for (uint64_t tick = 100; tick < 400; ++tick)
++                {
++                    if (tick == 200)
++                        m.addSource(AudioGroup::Se, std::make_unique<ConstSource>(int16_t(-5), int16_t(5), 5000));
++                    m.onVBlank(tick);
++                }
++                m.shutdown();
++            };
++            const std::string a = tempPath("ps2x_audio_det_a.wav"), b = tempPath("ps2x_audio_det_b.wav");
++            run(a, true);
++            run(b, false);
++            const auto da = readFile(a), db = readFile(b);
++            t.Equals(da.size(), size_t(44 + 300 * 3840), "300 fields");
++            t.IsTrue(da == db, "identical bytes");
++            std::filesystem::remove(a);
++            std::filesystem::remove(b);
++        });
++        tc.Run("WAV header after close, after an abrupt stop, and tick range", [](TestCase &t) {
++            const std::string p = tempPath("ps2x_audio_hdr.wav");
++            {
++                MixerConfig c = quietConfig();
++                c.wavPath = p;
++                auto *m = new AudioMixer(c);
++                m->addSource(AudioGroup::Xag, std::make_unique<RampSource>());
++                for (uint64_t tick = 1; tick <= 120; ++tick)
++                    m->onVBlank(tick); // 120 fields, header rewritten every 50
++                const auto d = readFile(p); // writer still open: simulated termination
++                t.IsTrue(d.size() >= 44 + 100 * 3840, "flushed up to the last header rewrite");
++                t.Equals(le32(d, 40), uint32_t(100 * 3840), "data size of the last rewrite");
++                t.Equals(le32(d, 4), uint32_t(36 + 100 * 3840), "RIFF size of the last rewrite");
++                delete m; // close
++                const auto e = readFile(p);
++                t.Equals(e.size(), size_t(44 + 120 * 3840), "complete after close");
++                t.Equals(le32(e, 40), uint32_t(120 * 3840), "final data size");
++                t.IsTrue(std::memcmp(e.data(), "RIFF", 4) == 0 && std::memcmp(e.data() + 8, "WAVEfmt ", 8) == 0 &&
++                             le32(e, 24) == 48000 && le32(e, 28) == 192000 && e[22] == 2 && e[34] == 16,
++                         "PCM s16 stereo 48 kHz header");
++            }
++            {
++                MixerConfig c = quietConfig();
++                c.wavPath = p;
++                c.wavFrom = 50;
++                c.wavTo = 60;
++                AudioMixer m(c);
++                for (uint64_t tick = 1; tick <= 100; ++tick)
++                    m.onVBlank(tick);
++                t.Equals(m.wavFields(), uint64_t(10), "fields [50, 60) only");
++                t.Equals(readFile(p).size(), size_t(44 + 10 * 3840), "closed at the end of the range");
++            }
++            std::filesystem::remove(p);
++        });
++        tc.Run("a tick discontinuity flushes the device ring and restarts the WAV", [](TestCase &t) {
++            const std::string p = tempPath("ps2x_audio_disc.wav");
++            MixerConfig c = quietConfig();
++            c.wavPath = p;
++            c.modes = {DeviceMode::Guest, DeviceMode::Guest, DeviceMode::Guest, DeviceMode::Guest};
++            AudioMixer m(c);
++            m.setDeviceAttached(true);
++            m.addSource(AudioGroup::Xag, std::make_unique<ConstSource>(int16_t(7), int16_t(7)));
++            for (uint64_t tick = 1; tick <= 5; ++tick)
++                m.onVBlank(tick);
++            m.onVBlank(26640); // checkpoint load
++            m.onVBlank(26641);
++            t.Equals(m.discontinuities(), uint64_t(1), "one discontinuity");
++            std::vector<int16_t> out(960 * 2);
++            m.deviceRing().pop(out.data(), 960);
++            t.Equals(m.deviceRing().stats().flushed, uint64_t(5 * 960), "pre-load audio flushed");
++            m.shutdown();
++            t.Equals(readFile(p).size(), size_t(44 + 2 * 3840), "WAV restarted at the load");
++            std::filesystem::remove(p);
++        });
++    });
++
++    MiniTest::Case("AudioDeviceRing", [](TestCase &tc) {
++        tc.Run("drop newest when full, silence on underrun, consumer-side trim, flush", [](TestCase &t) {
++            SpscFrameRing r(1000, 0, 0); // capacity 1024, no trim
++            std::vector<int16_t> in(2 * 2000, 1), out(2 * 2000, 9);
++            t.Equals(r.push(in.data(), 2000), size_t(1024), "only capacity accepted");
++            t.Equals(r.stats().dropped, uint64_t(976), "newest dropped");
++            t.Equals(r.pop(out.data(), 2000), size_t(1024), "reads what is there");
++            t.Equals(r.stats().underrun, uint64_t(976), "underrun counted");
++            SpscFrameRing trim(4096, 1000, 100);
++            for (int i = 0; i < 2000; ++i)
++            {
++                int16_t f[2] = {int16_t(i), int16_t(i)};
++                trim.push(f, 1);
++            }
++            int16_t f[2];
++            trim.pop(f, 1);
++            t.Equals(int(f[0]), 1900, "consumer drops the oldest down to the target fill");
++            t.Equals(trim.stats().trimmed, uint64_t(1900), "trim counted");
++            trim.requestFlush();
++            t.Equals(trim.pop(f, 1), size_t(0), "flushed");
++        });
++        tc.Run("SPSC stress: no duplicate, reordered or torn frame; exact accounting", [](TestCase &t) {
++            constexpr uint64_t kFrames = 10000000;
++            SpscFrameRing ring(4096, 3000, 500);
++            std::atomic<bool> producerDone{false};
++            std::atomic<uint64_t> accepted{0};
++            std::atomic<uint64_t> offered{0};
++            std::thread producer([&] {
++                std::mt19937 rng(1);
++                std::vector<int16_t> buf(2 * 1024);
++                uint64_t seq = 0, sent = 0, pushes = 0;
++                while (seq < kFrames)
++                {
++                    const size_t n = 1 + rng() % 1024;
++                    for (size_t i = 0; i < n; ++i)
++                    {
++                        const uint64_t s = seq + i;
++                        buf[i * 2] = int16_t(s & 0xFFFF);
++                        buf[i * 2 + 1] = int16_t((s >> 16) & 0xFFFF);
++                    }
++                    const size_t k = ring.push(buf.data(), n);
++                    seq += k; // only accepted frames get sequence numbers
++                    sent += n;
++                    ++pushes;
++                    if (seq / 1000000 != (seq - k) / 1000000)
++                        ring.requestFlush(); // ~10 flushes over the run
++                    if (k < n)
++                        std::this_thread::yield(); // full: let the consumer run (the rest was dropped and counted)
++                }
++                accepted = seq;
++                offered = sent;
++                producerDone = true;
++            });
++            uint64_t consumed = 0, last = UINT64_MAX, errors = 0;
++            std::vector<int16_t> buf(2 * 777);
++            std::mt19937 rng(2);
++            auto drain = [&](size_t n) {
++                const size_t got = ring.pop(buf.data(), n);
++                for (size_t i = 0; i < got; ++i)
++                {
++                    const uint64_t s = uint64_t(uint16_t(buf[i * 2])) | (uint64_t(uint16_t(buf[i * 2 + 1])) << 16);
++                    const uint64_t expectHigh = last == UINT64_MAX ? 0 : (last & ~0xFFFFFFFFull);
++                    uint64_t full = expectHigh | s;
++                    if (last != UINT64_MAX && full <= last)
++                        full += 1ull << 32;
++                    if (last != UINT64_MAX && full <= last)
++                        ++errors;
++                    last = full;
++                }
++                consumed += got;
++                return got;
++            };
++            while (!producerDone.load())
++            {
++                drain(1 + rng() % 777);
++                if (rng() % 16 == 0)
++                    std::this_thread::sleep_for(std::chrono::microseconds(50));
++            }
++            producer.join();
++            while (drain(777) != 0)
++            {
++            }
++            const auto s = ring.stats();
++            t.Equals(errors, uint64_t(0), "strictly increasing sequence");
++            t.IsTrue(last == UINT64_MAX || last < accepted.load(), "never beyond what was accepted");
++            t.Equals(consumed + s.trimmed + s.flushed, accepted.load(), "consumed + trimmed + flushed = accepted");
++            t.Equals(s.pushed + s.dropped, offered.load(), "accepted + dropped = offered");
++            t.IsTrue(consumed > 100000 && s.trimmed > 0 && s.flushed > 0 && s.dropped > 0, "every path (read, trim, flush, drop) exercised");
++            std::printf("    (accepted %llu consumed %llu trimmed %llu flushed %llu dropped %llu)\n",
++                        (unsigned long long)accepted.load(), (unsigned long long)consumed,
++                        (unsigned long long)s.trimmed, (unsigned long long)s.flushed, (unsigned long long)s.dropped);
++        });
++        tc.Run("SPSC stress, lossless (waiting producer, no trim): contiguous sequence of 10^7 frames", [](TestCase &t) {
++            constexpr uint64_t kFrames = 10000000;
++            SpscFrameRing ring(4096);
++            std::thread producer([&] {
++                std::mt19937 rng(3);
++                std::vector<int16_t> buf(2 * 1024);
++                uint64_t seq = 0;
++                while (seq < kFrames)
++                {
++                    const size_t n = static_cast<size_t>(std::min<uint64_t>(1 + rng() % 1024, kFrames - seq));
++                    for (size_t i = 0; i < n; ++i)
++                    {
++                        buf[i * 2] = int16_t((seq + i) & 0xFFFF);
++                        buf[i * 2 + 1] = int16_t(((seq + i) >> 16) & 0xFFFF);
++                    }
++                    size_t done = 0;
++                    while (done < n)
++                    {
++                        const size_t space = ring.freeSpace();
++                        if (space == 0)
++                        {
++                            std::this_thread::yield();
++                            continue;
++                        }
++                        const size_t k = std::min(space, n - done);
++                        done += ring.push(buf.data() + done * 2, k);
++                    }
++                    seq += n;
++                }
++            });
++            uint64_t expect = 0, errors = 0;
++            std::vector<int16_t> buf(2 * 513);
++            std::mt19937 rng(4);
++            while (expect < kFrames)
++            {
++                const size_t got = ring.pop(buf.data(), 1 + rng() % 513);
++                for (size_t i = 0; i < got; ++i, ++expect)
++                {
++                    const uint64_t s = uint64_t(uint16_t(buf[i * 2])) | (uint64_t(uint16_t(buf[i * 2 + 1])) << 16);
++                    if (s != expect)
++                        ++errors;
++                }
++                if (got == 0)
++                    std::this_thread::yield();
++            }
++            producer.join();
++            const auto st = ring.stats();
++            t.Equals(errors, uint64_t(0), "every frame exactly once, in order");
++            t.Equals(st.dropped + st.trimmed + st.flushed, uint64_t(0), "nothing lost");
++        });
++    });
++
++    MiniTest::Case("AudioDeviceGate", [](TestCase &tc) {
++        tc.Run("no access to the target after detach (2000 attach/detach cycles under a busy callback)", [](TestCase &t) {
++            struct Target
++            {
++                std::atomic<uint64_t> uses{0};
++                std::atomic<bool> alive{true};
++            };
++            DeviceGate<Target> gate;
++            std::atomic<bool> stop{false};
++            std::atomic<uint64_t> deadTouches{0}, silent{0};
++            std::thread callback([&] {
++                while (!stop.load())
++                    gate.with([&](Target &tg) {
++                        if (!tg.alive.load())
++                            deadTouches.fetch_add(1);
++                        tg.uses.fetch_add(1);
++                    },
++                              [&] { silent.fetch_add(1); });
++            });
++            uint64_t lateUses = 0;
++            for (int i = 0; i < 2000; ++i)
++            {
++                auto *tg = new Target();
++                gate.attach(tg);
++                std::this_thread::yield();
++                gate.detach();
++                const uint64_t after = tg->uses.load();
++                tg->alive = false;
++                std::this_thread::sleep_for(std::chrono::microseconds(20));
++                lateUses += tg->uses.load() - after;
++                delete tg;
++            }
++            stop = true;
++            callback.join();
++            t.Equals(lateUses, uint64_t(0), "no use after detach returned");
++            t.Equals(deadTouches.load(), uint64_t(0), "never saw a dead target");
++            t.IsTrue(silent.load() > 0, "callback ran detached (silence path)");
++        });
++    });
++
++    MiniTest::Case("AudioFreeStream", [](TestCase &tc) {
++        tc.Run("no device: pushFree refuses; full ring: cancel returns promptly; consumer drains", [](TestCase &t) {
++            MixerConfig c = quietConfig();
++            c.freeRingFrames = 1024;
++            AudioMixer m(c);
++            std::vector<int16_t> in(2 * 4096, 3);
++            std::atomic<bool> cancel{false};
++            t.IsFalse(m.pushFree(0, in.data(), 10, &cancel), "refused without a device");
++            m.setDeviceAttached(true);
++            std::atomic<bool> result{true};
++            const auto t0 = std::chrono::steady_clock::now();
++            std::thread worker([&] { result = m.pushFree(0, in.data(), 4096, &cancel); });
++            std::this_thread::sleep_for(std::chrono::milliseconds(30));
++            cancel = true;
++            worker.join();
++            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++            t.IsFalse(result.load(), "cancelled while full");
++            t.IsTrue(ms < 200.0, "cancel is prompt");
++            cancel = false;
++            std::thread worker2([&] { result = m.pushFree(1, in.data(), 4096, &cancel); });
++            std::vector<int16_t> out(2 * 256);
++            size_t got = 0;
++            for (int i = 0; i < 2000 && got < 4096; ++i)
++            {
++                m.deviceRender(out.data(), 256);
++                got += 256;
++                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            }
++            worker2.join();
++            t.IsTrue(result.load(), "completes when the device consumes");
++            t.Equals(m.freeRing(1).stats().pushed, uint64_t(4096), "all frames delivered");
++            m.flushFree(1);
++            m.deviceRender(out.data(), 256);
++            t.Equals(m.freeRing(1).stats().fill, uint64_t(0), "flush empties the stream");
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index a1eddff..bf7ca18 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -19,6 +19,7 @@ void register_ps2_sif_rpc_tests();
+ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
++void register_audio_mixer_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -42,6 +43,7 @@ int main()
+     register_ps2_sif_dma_tests();
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
++    register_audio_mixer_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
