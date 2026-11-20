@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los treinta y siete patches actualmente activos:
+arriba). Los treinta y ocho patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -855,3 +855,34 @@ arriba). Los treinta y siete patches actualmente activos:
       quedar hasta 1 s por detrás de los datos; no se midió PCSX2 en vivo; no implementa PSS, SE, BGM ni SPU2.
       Documentación: `AUDIO_002_1_mixer_clock.md` (este directorio) y
       `analysis/notes/AUDIO_002_1_2_MIXER_CLOCK.md`.
+38. `AUDIO_002_3_xag_volume.patch` (convención A — companion `AUDIO_002_3_xag_volume.md`). Audio: volumen,
+    volumen maestro y fundidos de las voces XAG, reconstruidos del IRX `TSNDDRVM.IRX`.
+    - `ps2xIOP/include/ps2x/iop/audio_dsp.h`:
+      - registro del canal y funciones del IRX: `XagSetVol` (0x38), `XagSetFade` (0x36), `XagSetFadeout` (0x37),
+        `XagSetMVol` (0x72), `xag_default` (0x70) y `xag_atick`;
+      - nivel `((vol × entry) >> 14) × MVol >> 14`, ley de paneo de seno, VOLL/VOLR de 15 bits;
+      - `XagVoiceControl` (dos colas acotadas de 64 comandos) y `XagGainRenderer` (`x × VOL >> 14`, rampa de
+        200 frames).
+    - `ps2xIOP/src/modules/tsnddrvm_xag.cpp`:
+      - comandos nuevos y volúmenes de `XagStandby`/`XagStandby2` y `TsndInitXag`;
+      - aticks a 240 Hz de tiempo emulado (200 frames a 48 kHz, fase de 100 frames);
+      - un fundido de salida que llega a 0 deja el canal en el estado 0 (`xag_stop`, visible en `XagChkPlay`);
+      - la fuente de guest y el flujo `free` aplican el mismo modelo;
+      - payload v2 compatible, con `XagMVol` = 0x3FFF al cargar un driver inicializado.
+    - `ps2xIOP/src/{module_factories.h,builtin_profiles.cpp}`: tablas de paneo de las entradas y `xag_pan_tbl`.
+    - `ps2xTest`: `audio_xag_volume_tests.cpp`, 11 tests.
+    - No cambia `ps2xRuntime` ni ninguna cabecera incluida por el EE generado (no se recompila `generated`).
+    - Validación:
+      - 29/29 tests de audio y 85/85 de GS;
+      - WAV del castillo con fundido idéntico a una referencia independiente del modelo IRX;
+      - WAV idéntico con GS síncrono y asíncrono;
+      - lógica igual en la ruta anterior;
+      - rendimiento +0,4 % en la oficina.
+    - Limitaciones:
+      - 240 Hz inferido y fase sin medir;
+      - rampa anti-clic distinta del hardware;
+      - ganancia por defecto −2 LSB frente al parche 37;
+      - la ruta anterior no aplica ganancia;
+      - opcodes por canal, pausa y pitch no modelados.
+      Documentación: `AUDIO_002_3_xag_volume.md` (este directorio) y
+      `analysis/notes/AUDIO_002_3_XAG_VOLUME.md`.

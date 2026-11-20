@@ -1,0 +1,1298 @@
+diff --git a/ps2xIOP/include/ps2x/iop/audio_dsp.h b/ps2xIOP/include/ps2x/iop/audio_dsp.h
+index 6274305..8b0934d 100644
+--- a/ps2xIOP/include/ps2x/iop/audio_dsp.h
++++ b/ps2xIOP/include/ps2x/iop/audio_dsp.h
+@@ -8,8 +8,10 @@
+ //   * AudioRenderSource: a source the mixer pulls at the mix rate (48 kHz, interleaved stereo s16).
+ 
+ #include <algorithm>
++#include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <mutex>
+ #include <vector>
+ 
+ namespace ps2x::iop::audio
+@@ -273,4 +275,420 @@ namespace ps2x::iop::audio
+         uint64_t m_done = 0, m_chunksRead = 0;
+         bool m_failed = false;
+     };
++
++    // ---------------------------------------------------------------------------------------------------------------
++    // AUDIO_002-3 (patch 38): TSNDDRVM XAG voice volume, reconstructed from TSNDDRVM.IRX (SHA-256 c00b17f0...):
++    //   channel record +0x02 flags (0x1/0x2 volume dirty, 0x10 fade active, 0x20 fade-out = stop at the end),
++    //   +0x04 entry volume (Tsnd_xag_tbl word 2 low half), +0x06 volume, +0x08 fade target, +0x0A fade step,
++    //   +0x0C channel volume[i] (0x80 = unity), +0x54 pan[i] (copied from the entry's pan table); global XagMVol.
++    //   XagSetVol@0x74CC, XagSetFade@0x77A8, XagSetFadeout@0x7868, XagSetMVol@0x7C5C, xag_default@0x6B10,
++    //   xag_atick@0x7028 (fade step + level), xag_setvol@0x9844 / calc_pan_vol_r@0x97E4 (SPU VOLL/VOLR).
++    //   xag_atick runs from the ATick thread, woken by a hardware timer (TsndInitTimer@0x2238: source 1, compare
++    //   0x25800 = 153600 IOP cycles -> 240 Hz at 36.864 MHz), i.e. once per 200 output frames at 48 kHz.
++    // Everything is integer and depends only on the command sequence and its position in samples, so the guest
++    // service (logical state) and the audio source (gain) evolve identically.
++
++    inline constexpr uint32_t kXagATickRate = 240u;
++    inline constexpr uint32_t kXagATickFrames = kMixRate / kXagATickRate; // 200
++    // Phase of the 240 Hz timer relative to the start of a voice: not observable from the IRX (free-running timer).
++    // Half a period keeps every atick strictly inside a field (960 * k mod 200 is never 100), so a command applied
++    // at a field start never ties with an atick.
++    inline constexpr uint32_t kXagATickPhase = kXagATickFrames / 2u;
++    inline constexpr uint16_t kXagFlagDirty = 0x0003u;
++    inline constexpr uint16_t kXagFlagFade = 0x0010u;
++    inline constexpr uint16_t kXagFlagFadeout = 0x0020u;
++    inline constexpr size_t kXagPanLawSize = 0x81u; // xag_pan_tbl: 129 halfwords, 0x1000 = unity
++
++    // Position (frames since the voice started) of atick number n (1-based).
++    inline constexpr uint64_t xagATickPosition(uint64_t n)
++    {
++        return n * kXagATickFrames - kXagATickPhase;
++    }
++
++    struct XagVoiceParams
++    {
++        int16_t entryVolume = 0x3FFF;      // record +0x04
++        uint32_t channels = 2u;            // 1 or 2
++        std::array<uint8_t, 2> pan{0x00u, 0x80u};
++        const int16_t *panLaw = nullptr;   // kXagPanLawSize entries; null -> silent
++        bool mono = false;                 // calc_pan_vol_r global mono flag (forces pan 0x40)
++    };
++
++    // Guest-deterministic state of one XAG channel's volume (IRX record subset) plus the SPU voice volumes it wrote.
++    struct XagVolumeState
++    {
++        int16_t vol = 0x4000;
++        int16_t target = 0;
++        int16_t step = 0;
++        uint16_t flags = 0u;
++        std::array<uint8_t, 2> chVol{0x80u, 0x80u};
++        int32_t masterVol = 0;              // XagMVol (global in the IRX; mirrored in each channel)
++        std::array<int16_t, 4> regs{};      // VOLL/VOLR of channel 0, VOLL/VOLR of channel 1 (15-bit, 0x3FFF max)
++        std::array<int16_t, 4> prevRegs{};  // values before the last change (start of the anti-click ramp)
++        uint64_t rampStart = 0u;            // position of the last change
++        bool ramping = false;
++        uint64_t aticks = 0u;               // aticks executed since the voice started playing
++
++        bool operator==(const XagVolumeState &) const = default;
++    };
++
++    inline int32_t xagLevel(int32_t vol, int32_t entryVolume, int32_t masterVol)
++    {
++        int32_t p = vol * entryVolume;
++        if (p < 0)
++            p += 0x3FFF;
++        p >>= 14;
++        const uint32_t t = static_cast<uint32_t>(p * masterVol);
++        return static_cast<int32_t>((t >> 14) & 0xFFFFu);
++    }
++
++    inline int32_t xagPanVolume(int32_t level, uint32_t pan, const XagVoiceParams &params)
++    {
++        if (!params.panLaw)
++            return 0;
++        pan &= 0xFFu;
++        if (params.mono)
++            pan = 0x40u;
++        else if (pan > 0x80u)
++            pan = 0x80u;
++        int32_t v = static_cast<int32_t>(static_cast<uint32_t>(level) & 0xFFFFu) * params.panLaw[pan];
++        if (v < 0)
++            v += 0xFFF;
++        return (v >> 12) & 0xFFFF;
++    }
++
++    // xag_setvol: per channel, VOLR from pan, VOLL from 0x80 - pan, scaled by the channel volume, clamped to 0x3FFF.
++    inline std::array<int16_t, 4> xagVoiceRegs(int32_t level, const XagVolumeState &s, const XagVoiceParams &params)
++    {
++        std::array<int16_t, 4> regs{};
++        for (uint32_t i = 0; i < params.channels && i < 2u; ++i)
++        {
++            const uint32_t pan = params.pan[i];
++            int32_t r = xagPanVolume(level, pan, params) * s.chVol[i];
++            if (r < 0)
++                r += 0x7F;
++            r >>= 7;
++            int32_t l = xagPanVolume(level, (0x80u - pan) & 0xFFu, params) * s.chVol[i];
++            if (l < 0)
++                l += 0x7F;
++            l >>= 7;
++            if (static_cast<uint32_t>(r) >= 0x4000u)
++                r = 0x3FFF;
++            if (static_cast<uint32_t>(l) >= 0x4000u)
++                l = 0x3FFF;
++            regs[2u * i] = static_cast<int16_t>(l);
++            regs[2u * i + 1u] = static_cast<int16_t>(r);
++        }
++        return regs;
++    }
++
++    inline void xagWriteRegs(XagVolumeState &s, const XagVoiceParams &params, uint64_t position)
++    {
++        const std::array<int16_t, 4> regs =
++            xagVoiceRegs(xagLevel(s.vol, params.entryVolume, s.masterVol), s, params);
++        if (regs == s.regs)
++            return;
++        s.prevRegs = s.regs;
++        s.regs = regs;
++        s.rampStart = position;
++        s.ramping = true;
++    }
++
++    // xag_default (volume part; the service also clears its loop/skip fields).
++    inline void xagDefault(XagVolumeState &s)
++    {
++        s.vol = 0x4000;
++        s.chVol = {0x80u, 0x80u};
++    }
++
++    inline void xagSetVol(XagVolumeState &s, int16_t vol)
++    {
++        s.vol = vol;
++        s.flags |= 0x0001u;
++    }
++
++    // XagSetFade: ignored while a fade-out runs; step = (target - vol) / time truncated, at least +-1.
++    inline void xagSetFade(XagVolumeState &s, int16_t target, uint16_t time)
++    {
++        if (s.flags & kXagFlagFadeout)
++            return;
++        const int32_t diff = static_cast<int32_t>(target) - s.vol;
++        int32_t step = time == 0u ? diff : diff / static_cast<int32_t>(time);
++        if (step == 0)
++            step = target == 0 ? -1 : (diff >= 0 ? 1 : -1);
++        s.step = static_cast<int16_t>(step);
++        s.target = target;
++        s.flags |= kXagFlagFade;
++    }
++
++    inline void xagSetFadeout(XagVolumeState &s, uint16_t time)
++    {
++        xagSetFade(s, 0, time);
++        s.flags |= kXagFlagFade | kXagFlagFadeout;
++    }
++
++    // XagSetMVol: global value clamped to [0, 0x4000]; only the current core's record is marked dirty.
++    inline void xagSetMasterVol(XagVolumeState &s, int32_t value, bool currentCore)
++    {
++        s.masterVol = std::clamp(value, 0, 0x4000);
++        if (currentCore)
++            s.flags |= 0x0001u;
++    }
++
++    // XagControl@0x90A0: SPU volumes written when the stream is prepared (no ramp: the voice is not sounding yet).
++    inline void xagPrepare(XagVolumeState &s, const XagVoiceParams &params)
++    {
++        s.regs = xagVoiceRegs(xagLevel(s.vol, params.entryVolume, s.masterVol), s, params);
++        s.prevRegs = s.regs;
++        s.ramping = false;
++        s.rampStart = 0u;
++        s.aticks = 0u;
++    }
++
++    // One xag_atick (states 3/5). Returns true when a fade-out reached its target: the IRX calls xag_stop and
++    // writes no new volume. Per-channel fades (0x40, XagSetChFade) and pitch are not sent by DMC: not modelled.
++    inline bool xagATick(XagVolumeState &s, const XagVoiceParams &params)
++    {
++        ++s.aticks;
++        const uint64_t position = xagATickPosition(s.aticks);
++        const uint16_t flags = s.flags;
++        if (flags == 0u)
++            return false;
++        if (flags & kXagFlagFade)
++        {
++            int32_t vol = s.vol + s.step;
++            if (s.step < 0)
++            {
++                if (vol < s.target)
++                    vol = s.target;
++            }
++            else if (s.target < vol)
++                vol = s.target;
++            if (vol == s.target)
++            {
++                s.flags &= static_cast<uint16_t>(~kXagFlagFade);
++                if (s.flags & kXagFlagFadeout)
++                {
++                    s.flags &= static_cast<uint16_t>(~kXagFlagFadeout);
++                    return true;
++                }
++            }
++            s.vol = static_cast<int16_t>(vol);
++            xagWriteRegs(s, params, position);
++            s.flags &= static_cast<uint16_t>(~kXagFlagDirty);
++            return false;
++        }
++        if (flags & kXagFlagDirty)
++        {
++            xagWriteRegs(s, params, position);
++            s.flags &= static_cast<uint16_t>(~kXagFlagDirty);
++        }
++        return false;
++    }
++
++    // A volume command that can reach a sounding voice.
++    struct XagVolumeCommand
++    {
++        enum class Op : uint8_t
++        {
++            SetVol,     // 0x38: a = volume
++            SetFade,    // 0x36: a = target, b = time (aticks)
++            Fadeout,    // 0x37: b = time (aticks)
++            MasterVol,  // 0x72: a = value, current = record of the current core
++            Default,    // 0x70: XagDefault
++        };
++        Op op = Op::SetVol;
++        int32_t a = 0;
++        uint32_t b = 0u;
++        bool current = false;
++        uint64_t position = 0u; // frames since the voice started (guest timeline)
++    };
++
++    inline void xagApply(XagVolumeState &s, const XagVolumeCommand &c)
++    {
++        switch (c.op)
++        {
++        case XagVolumeCommand::Op::SetVol: xagSetVol(s, static_cast<int16_t>(c.a)); break;
++        case XagVolumeCommand::Op::SetFade:
++            xagSetFade(s, static_cast<int16_t>(c.a), static_cast<uint16_t>(c.b));
++            break;
++        case XagVolumeCommand::Op::Fadeout: xagSetFadeout(s, static_cast<uint16_t>(c.b)); break;
++        case XagVolumeCommand::Op::MasterVol: xagSetMasterVol(s, c.a, c.current); break;
++        case XagVolumeCommand::Op::Default:
++            if (!(s.flags & kXagFlagFadeout))
++                xagDefault(s);
++            break;
++        }
++    }
++
++    // Commands posted by the service to a sounding voice: one bounded FIFO for the guest-timed source (applied at
++    // their sample position) and one for the free-running copy (applied on arrival). A full FIFO drops the command
++    // and counts it (the EE sends a handful per voice; 64 is never reached in practice).
++    class XagVoiceControl
++    {
++    public:
++        static constexpr size_t kCapacity = 64u;
++
++        void post(const XagVolumeCommand &command)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            const bool guestKept = push(m_guest, command);
++            const bool freeKept = push(m_free, command);
++            if (!guestKept || !freeKept)
++                ++m_dropped;
++        }
++
++        // Pops, in order, the guest commands positioned before `end`.
++        template <typename F>
++        void takeGuest(uint64_t end, F &&apply)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            while (m_guest.count != 0u && m_guest.items[m_guest.head].position < end)
++            {
++                apply(m_guest.items[m_guest.head]);
++                pop(m_guest);
++            }
++        }
++
++        template <typename F>
++        void takeFree(F &&apply)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            while (m_free.count != 0u)
++            {
++                apply(m_free.items[m_free.head]);
++                pop(m_free);
++            }
++        }
++
++        [[nodiscard]] uint64_t dropped() const
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            return m_dropped;
++        }
++
++    private:
++        struct Fifo
++        {
++            std::array<XagVolumeCommand, kCapacity> items{};
++            size_t head = 0u, count = 0u;
++        };
++
++        static bool push(Fifo &fifo, const XagVolumeCommand &command)
++        {
++            if (fifo.count == kCapacity)
++                return false;
++            fifo.items[(fifo.head + fifo.count) % kCapacity] = command;
++            ++fifo.count;
++            return true;
++        }
++
++        static void pop(Fifo &fifo)
++        {
++            fifo.head = (fifo.head + 1u) % kCapacity;
++            --fifo.count;
++        }
++
++        mutable std::mutex m_mutex;
++        Fifo m_guest, m_free;
++        uint64_t m_dropped = 0u;
++    };
++
++    // Applies an XAG voice's SPU volumes to resampled frames (interleaved stereo at kMixRate; channel 0 left and
++    // channel 1 right of a 2-channel clip, channel 0 duplicated for a mono clip), running the 240 Hz aticks and the
++    // commands at their positions. Volume changes are ramped linearly over one atick period (200 frames) to avoid
++    // the clicks of the SPU's immediate register writes. A fade-out that reaches 0 ramps to silence and stops.
++    // Output = sum over channels of sample * VOL >> 14 per side (SPU fixed volume: register * 2 / 2^15), saturated.
++    class XagGainRenderer
++    {
++    public:
++        XagGainRenderer() = default;
++        XagGainRenderer(const XagVoiceParams &params, const XagVolumeState &state, uint64_t position)
++            : m_params(params), m_state(state), m_position(position)
++        {
++        }
++
++        [[nodiscard]] uint64_t position() const { return m_position; }
++        [[nodiscard]] bool stopped() const { return m_stopped; }
++        [[nodiscard]] const XagVolumeState &state() const { return m_state; }
++
++        // nextCommand(uint64_t position, XagVolumeCommand &out) -> bool: the earliest pending command at or
++        // before `position`, if any (the caller pops it).
++        template <typename NextCommand>
++        size_t process(int16_t *stereo, size_t frames, NextCommand &&nextCommand)
++        {
++            size_t done = 0;
++            for (; done < frames; ++done)
++            {
++                const uint64_t k = m_position;
++                while (!m_stopping && xagATickPosition(m_state.aticks + 1u) <= k)
++                {
++                    if (xagATick(m_state, m_params))
++                        beginStop(xagATickPosition(m_state.aticks));
++                }
++                XagVolumeCommand command;
++                while (!m_stopping && nextCommand(k, command))
++                    xagApply(m_state, command);
++                if (m_stopping && k >= m_stopAt)
++                {
++                    m_stopped = true;
++                    break;
++                }
++                const int32_t x0 = stereo[done * 2u];
++                const int32_t x1 = stereo[done * 2u + 1u];
++                int32_t left, right;
++                if (m_params.channels == 1u)
++                {
++                    left = (x0 * gain(0, k)) >> 14;
++                    right = (x0 * gain(1, k)) >> 14;
++                }
++                else
++                {
++                    left = ((x0 * gain(0, k)) >> 14) + ((x1 * gain(2, k)) >> 14);
++                    right = ((x0 * gain(1, k)) >> 14) + ((x1 * gain(3, k)) >> 14);
++                }
++                stereo[done * 2u] = static_cast<int16_t>(std::clamp(left, -32768, 32767));
++                stereo[done * 2u + 1u] = static_cast<int16_t>(std::clamp(right, -32768, 32767));
++                ++m_position;
++            }
++            return done;
++        }
++
++    private:
++        void beginStop(uint64_t position)
++        {
++            m_stopping = true;
++            m_state.prevRegs = currentRegs(position);
++            m_state.regs = {};
++            m_state.rampStart = position;
++            m_state.ramping = true;
++            m_stopAt = position + kXagATickFrames;
++        }
++
++        std::array<int16_t, 4> currentRegs(uint64_t k) const
++        {
++            std::array<int16_t, 4> regs{};
++            for (size_t i = 0; i < 4u; ++i)
++                regs[i] = static_cast<int16_t>(gain(i, k));
++            return regs;
++        }
++
++        int32_t gain(size_t reg, uint64_t k) const
++        {
++            const int32_t to = m_state.regs[reg];
++            if (!m_state.ramping || k >= m_state.rampStart + kXagATickFrames)
++                return to;
++            const int32_t from = m_state.prevRegs[reg];
++            const int64_t j = static_cast<int64_t>(k - m_state.rampStart) + 1;
++            return from + static_cast<int32_t>((static_cast<int64_t>(to - from) * j) /
++                                               static_cast<int64_t>(kXagATickFrames));
++        }
++
++        XagVoiceParams m_params{};
++        XagVolumeState m_state{};
++        uint64_t m_position = 0u;
++        uint64_t m_stopAt = 0u;
++        bool m_stopping = false;
++        bool m_stopped = false;
++    };
+ }
+diff --git a/ps2xIOP/src/builtin_profiles.cpp b/ps2xIOP/src/builtin_profiles.cpp
+index 8175a56..7a88f14 100644
+--- a/ps2xIOP/src/builtin_profiles.cpp
++++ b/ps2xIOP/src/builtin_profiles.cpp
+@@ -166,6 +166,22 @@ namespace ps2x::iop::detail
+                                      0x157F00u, 0x181740u, 0x20000u, 0x30000u, 0x800u, 0x800u, 0x800u, 0x800u},
+                 .initialCore = 1u,
+                 .vsyncPerSecond = 50u,
++                // AUDIO_002-3: Tsnd_xagpan_0 (.data 0xA928) and Tsnd_xagpan_1 (0xA92C); xag_pan_tbl (.data 0xC510),
++                // equal to round(4096 * sin(p * pi / 256)) for p = 0..128.
++                .xagPanTables = {{0xA928u, {0x00u, 0x80u}}, {0xA92Cu, {0x40u, 0x40u}}},
++                .xagPanLaw = {
++                    0x0000, 0x0032, 0x0065, 0x0097, 0x00C9, 0x00FB, 0x012D, 0x015F, 0x0191, 0x01C3, 0x01F5, 0x0227,
++                    0x0259, 0x028B, 0x02BC, 0x02EE, 0x031F, 0x0350, 0x0381, 0x03B2, 0x03E3, 0x0414, 0x0444, 0x0475,
++                    0x04A5, 0x04D5, 0x0505, 0x0534, 0x0564, 0x0593, 0x05C2, 0x05F1, 0x061F, 0x064E, 0x067C, 0x06AA,
++                    0x06D7, 0x0705, 0x0732, 0x075E, 0x078B, 0x07B7, 0x07E3, 0x080E, 0x083A, 0x0865, 0x088F, 0x08BA,
++                    0x08E4, 0x090D, 0x0937, 0x095F, 0x0988, 0x09B0, 0x09D8, 0x09FF, 0x0A26, 0x0A4D, 0x0A73, 0x0A99,
++                    0x0ABF, 0x0AE4, 0x0B08, 0x0B2D, 0x0B50, 0x0B74, 0x0B97, 0x0BB9, 0x0BDB, 0x0BFC, 0x0C1E, 0x0C3E,
++                    0x0C5E, 0x0C7E, 0x0C9D, 0x0CBC, 0x0CDA, 0x0CF8, 0x0D15, 0x0D32, 0x0D4E, 0x0D69, 0x0D85, 0x0D9F,
++                    0x0DB9, 0x0DD3, 0x0DEC, 0x0E04, 0x0E1C, 0x0E34, 0x0E4B, 0x0E61, 0x0E77, 0x0E8C, 0x0EA1, 0x0EB5,
++                    0x0EC8, 0x0EDB, 0x0EEE, 0x0EFF, 0x0F11, 0x0F21, 0x0F31, 0x0F41, 0x0F50, 0x0F5E, 0x0F6C, 0x0F79,
++                    0x0F85, 0x0F91, 0x0F9C, 0x0FA7, 0x0FB1, 0x0FBB, 0x0FC4, 0x0FCC, 0x0FD4, 0x0FDB, 0x0FE1, 0x0FE7,
++                    0x0FEC, 0x0FF1, 0x0FF5, 0x0FF8, 0x0FFB, 0x0FFD, 0x0FFF, 0x1000, 0x1000,
++                },
+             };
+         }
+     }
+diff --git a/ps2xIOP/src/module_factories.h b/ps2xIOP/src/module_factories.h
+index 51d4bd2..e1e66a8 100644
+--- a/ps2xIOP/src/module_factories.h
++++ b/ps2xIOP/src/module_factories.h
+@@ -6,6 +6,7 @@
+ #include <cstdint>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -233,6 +234,10 @@ namespace ps2x::iop::detail
+         std::vector<uint32_t> spuSlotAddresses;
+         uint8_t initialCore = 1u;    // .sdata value of the current-core word
+         uint32_t vsyncPerSecond = 0; // emulated time base used for clip durations
++        // AUDIO_002-3: per-entry pan tables (IRX .data address referenced by the entry's word 1 -> pan of channel
++        // 0 and 1) and xag_pan_tbl (129 halfwords, sine law, 0x1000 = unity) used by xag_setvol.
++        std::vector<std::pair<uint32_t, std::array<uint8_t, 2>>> xagPanTables;
++        std::vector<int16_t> xagPanLaw;
+     };
+ 
+     std::unique_ptr<IopService> createTsnddrvmXagService(IopHost &host, TsnddrvmBindings bindings);
+diff --git a/ps2xIOP/src/modules/tsnddrvm_xag.cpp b/ps2xIOP/src/modules/tsnddrvm_xag.cpp
+index 6aa7397..aa01775 100644
+--- a/ps2xIOP/src/modules/tsnddrvm_xag.cpp
++++ b/ps2xIOP/src/modules/tsnddrvm_xag.cpp
+@@ -29,8 +29,13 @@
+ // (IopHost::streamPcm) at the entry's pitch rate. The host plays it in real time, so it is not synchronised with a
+ // slower-than-real-time guest (known limitation). DMC_TSND_AUDIO=0 disables it. XagStop/reset cancel and silence
+ // the stream.
+-// Not modelled yet: loop count (XagSetSkip), pause, fades, per-channel volume; the 4/5 end phases are folded
+-// into "playing" (XagChkPlay keeps answering >= 0 until the clip has elapsed).
++// Volume (AUDIO_002-3, patch 38): XagSetVol (0x38), XagSetFade (0x36), XagSetFadeout (0x37), XagSetMVol (0x72),
++// XagDefault (0x70) and the standby volumes follow the IRX record (audio_dsp.h, XagVolumeState); xag_atick runs at
++// 240 Hz of emulated time (200 frames of 48 kHz). A fade-out that reaches 0 calls xag_stop as in the IRX: the
++// channel goes to state 0 at that atick (guest-visible through XagChkPlay). The mixer source applies the same SPU
++// voice volumes to its samples; the legacy streamPcm path (PS2X_AUDIO_MIXER=0) keeps the logic but no gain.
++// Not modelled yet: loop count (XagSetSkip), pause, per-channel volume/pan/phase commands (not sent by DMC's EE),
++// pitch; the 4/5 end phases are folded into "playing" (XagChkPlay keeps answering >= 0 until the clip has elapsed).
+ #include "../module_factories.h"
+ #include "../checkpoint_bytes.h"
+ #include "ps2x/iop/audio_dsp.h"
+@@ -73,7 +78,7 @@ namespace ps2x::iop::detail
+         {
+             uint8_t state = kStateIdle;
+             uint8_t entry = 0xFFu;
+-            uint16_t volume = 0u;
++            audio::XagVolumeState vol{}; // AUDIO_002-3: record +0x02..+0x0C; vol.vol is the v2 "volume" word
+             uint16_t skipStart = 0u;  // record +0xA4 (XagSetSkip3 a0 / XagSetSkip2)
+             uint16_t skipCount = 0u;  // record +0xA6 (XagSetSkip3 a1; 0 = to the end of the file)
+             int16_t loopCount = 0;    // record +0x94 (XagSetSkip)
+@@ -146,12 +151,17 @@ namespace ps2x::iop::detail
+         // AUDIO_002-1/2 (patch 37): guest-timed XAG source for the mixer. Pulled once per emulated field on the
+         // executor thread: reads the clip from the CD image on demand (one chunk at a time), decodes it and
+         // resamples it to 48 kHz. Its content depends only on the clip, never on host timing. Owns its file handle.
++        // AUDIO_002-3: the voice's SPU volumes are applied after resampling (XagGainRenderer); volume commands posted
++        // by the service arrive through `control` tagged with their position in frames of this voice.
+         class XagGuestSource final : public audio::AudioRenderSource
+         {
+         public:
+-            XagGuestSource(IopHost &host, uint64_t handle, const audio::XagClipLayout &layout)
++            XagGuestSource(IopHost &host, uint64_t handle, const audio::XagClipLayout &layout,
++                           std::shared_ptr<audio::XagVoiceControl> control, const audio::XagVoiceParams &params,
++                           const audio::XagVolumeState &volume)
+                 : m_host(host), m_handle(handle), m_reader(layout),
+-                  m_resampler(layout.sampleRate, audio::kMixRate, layout.channels)
++                  m_resampler(layout.sampleRate, audio::kMixRate, layout.channels), m_control(std::move(control)),
++                  m_gain(params, volume, 0u)
+             {
+             }
+ 
+@@ -162,16 +172,32 @@ namespace ps2x::iop::detail
+ 
+             size_t render(int16_t *stereo, size_t frames) override
+             {
+-                return m_resampler.produce(stereo, frames, [this](int16_t *dst, size_t n) {
++                const size_t produced = m_resampler.produce(stereo, frames, [this](int16_t *dst, size_t n) {
+                     return m_reader.read(dst, n, [this](uint64_t offset, void *out, size_t size, size_t &got) {
+                         return m_host.readHostFile(m_handle, offset, out, size, got);
+                     });
+                 });
++                // Commands positioned inside this block (bounded by the control's FIFO capacity).
++                m_pendingCount = 0u;
++                m_pendingHead = 0u;
++                if (m_control)
++                {
++                    m_control->takeGuest(m_gain.position() + produced, [this](const audio::XagVolumeCommand &c) {
++                        if (m_pendingCount < m_pending.size())
++                            m_pending[m_pendingCount++] = c;
++                    });
++                }
++                return m_gain.process(stereo, produced, [this](uint64_t k, audio::XagVolumeCommand &out) {
++                    if (m_pendingHead == m_pendingCount || m_pending[m_pendingHead].position > k)
++                        return false;
++                    out = m_pending[m_pendingHead++];
++                    return true;
++                });
+             }
+ 
+             [[nodiscard]] bool finished() const override
+             {
+-                return m_resampler.finished();
++                return m_resampler.finished() || m_gain.stopped();
+             }
+ 
+         private:
+@@ -179,6 +205,10 @@ namespace ps2x::iop::detail
+             uint64_t m_handle;
+             audio::XagClipReader m_reader;
+             audio::CubicResampler m_resampler;
++            std::shared_ptr<audio::XagVoiceControl> m_control;
++            audio::XagGainRenderer m_gain;
++            std::array<audio::XagVolumeCommand, audio::XagVoiceControl::kCapacity> m_pending{};
++            size_t m_pendingCount = 0u, m_pendingHead = 0u;
+         };
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+@@ -309,7 +339,7 @@ namespace ps2x::iop::detail
+                 {
+                     appendU8(out, channel.state);
+                     appendU8(out, channel.entry);
+-                    appendU16(out, channel.volume);
++                    appendU16(out, static_cast<uint16_t>(channel.vol.vol));
+                     appendU16(out, channel.skipStart);
+                     appendU16(out, channel.skipCount);
+                     appendU16(out, static_cast<uint16_t>(channel.loopCount));
+@@ -347,8 +377,9 @@ namespace ps2x::iop::detail
+                 for (XagChannel &channel : channels)
+                 {
+                     uint16_t loop = 0;
++                    uint16_t volume = 0;
+                     ok = ok && readU8(data, size, pos, channel.state) && readU8(data, size, pos, channel.entry) &&
+-                         readU16(data, size, pos, channel.volume) && readU16(data, size, pos, channel.skipStart) &&
++                         readU16(data, size, pos, volume) && readU16(data, size, pos, channel.skipStart) &&
+                          readU16(data, size, pos, channel.skipCount) && readU16(data, size, pos, loop) &&
+                          readU8(data, size, pos, channel.standbyCount) &&
+                          readU8(data, size, pos, channel.hasSemaphores) &&
+@@ -356,6 +387,8 @@ namespace ps2x::iop::detail
+                          readU64(data, size, pos, channel.playStartTick) &&
+                          readU64(data, size, pos, channel.playEndTick);
+                     channel.loopCount = static_cast<int16_t>(loop);
++                    channel.vol = audio::XagVolumeState{};
++                    channel.vol.vol = static_cast<int16_t>(volume);
+                 }
+                 for (uint32_t &word : words)
+                     ok = ok && readU32(data, size, pos, word);
+@@ -371,6 +404,18 @@ namespace ps2x::iop::detail
+                 m_bufferBytes = bufferBytes;
+                 m_channels = channels;
+                 m_result = words;
++                // AUDIO_002-3: a v2 payload has no fade state and no XagMVol. XagMVol is demonstrable: its only
++                // writer in the ELF is SndInit -> SdrXagMasterVol(0x3FFF), queued before SdrXagInit (0x77), so an
++                // initialized driver has 0x3FFF (the IRX's .sdata value 0 otherwise). Fades are left inactive (the
++                // v2 writer never modelled them) and the SPU volumes are recomputed from the stored volume.
++                m_masterVolume = m_initialized ? 0x3FFF : 0;
++                for (XagChannel &channel : m_channels)
++                {
++                    channel.vol.masterVol = m_masterVolume;
++                    if (channel.state != kStateIdle)
++                        audio::xagPrepare(channel.vol, voiceParamsLocked(channel));
++                }
++                m_voiceControl = {};
+                 return true;
+             }
+ 
+@@ -384,6 +429,10 @@ namespace ps2x::iop::detail
+                 uint32_t blockBytes = 0u;
+                 uint32_t channels = 0u;
+                 uint32_t sampleRate = 0u;
++                // AUDIO_002-3: volume at XagStart, voice parameters and the command channel of the voice.
++                audio::XagVolumeState volume{};
++                audio::XagVoiceParams params{};
++                std::shared_ptr<audio::XagVoiceControl> control;
+             };
+ 
+             struct AudioWorker
+@@ -415,7 +464,65 @@ namespace ps2x::iop::detail
+                     clip.channels = ((*entry)[3] >> 8) & 0xFFu;
+                     const uint32_t pitch = ((*entry)[2] >> 16) & 0xFFFFu;
+                     clip.sampleRate = (48000u * pitch + 2048u) / 4096u;
++                    clip.volume = m_startVolume[core];
++                    clip.params = voiceParamsLocked(channel);
++                    clip.control = m_voiceControl[core];
++                }
++            }
++
++            // AUDIO_002-3: XAG voice parameters of a channel (entry volume, channel count, pan table, pan law).
++            audio::XagVoiceParams voiceParamsLocked(const XagChannel &channel) const
++            {
++                audio::XagVoiceParams params{};
++                const std::array<uint32_t, 9> *entry = entryLocked(channel.entry);
++                if (!entry)
++                {
++                    params.channels = 0u;
++                    return params;
+                 }
++                params.entryVolume = static_cast<int16_t>((*entry)[2] & 0xFFFFu);
++                params.channels = std::min<uint32_t>(((*entry)[3] >> 8) & 0xFFu, 2u);
++                params.pan = {0x40u, 0x40u};
++                for (const auto &[address, pans] : m_bindings.xagPanTables)
++                    if (address == (*entry)[1])
++                        params.pan = pans;
++                params.panLaw = m_bindings.xagPanLaw.size() >= audio::kXagPanLawSize ? m_bindings.xagPanLaw.data()
++                                                                                     : nullptr;
++                return params;
++            }
++
++            uint64_t framesPerTickLocked() const
++            {
++                return m_bindings.vsyncPerSecond != 0u ? audio::kMixRate / m_bindings.vsyncPerSecond : 0u;
++            }
++
++            // AUDIO_002-3: runs the 240 Hz aticks of a playing channel up to the start of the current field (all
++            // aticks strictly before frame (now - start) * framesPerTick). Returns true when a fade-out ended.
++            bool runATicksLocked(XagChannel &channel, uint64_t now) const
++            {
++                const uint64_t perTick = framesPerTickLocked();
++                if (channel.state != kStatePlaying || perTick == 0u || now < channel.playStartTick)
++                    return false;
++                const uint64_t position = (now - channel.playStartTick) * perTick;
++                const audio::XagVoiceParams params = voiceParamsLocked(channel);
++                while (audio::xagATickPosition(channel.vol.aticks + 1u) < position)
++                {
++                    if (audio::xagATick(channel.vol, params))
++                        return true;
++                }
++                return false;
++            }
++
++            // Posts a volume command to the sounding voice of `core` (position = frames since its start).
++            void postVolumeLocked(uint32_t core, audio::XagVolumeCommand command)
++            {
++                const XagChannel &channel = m_channels[core];
++                if (!m_voiceControl[core] || channel.state != kStatePlaying)
++                    return;
++                const uint64_t now = m_host.vsyncTick();
++                command.position = now > channel.playStartTick ? (now - channel.playStartTick) * framesPerTickLocked()
++                                                               : 0u;
++                m_voiceControl[core]->post(command);
+             }
+ 
+             void stopAudio(uint32_t core)
+@@ -454,7 +561,8 @@ namespace ps2x::iop::detail
+                     return;
+                 }
+                 m_guestSource[core] = m_host.addGuestAudioSource(
+-                    audio::AudioGroup::Xag, std::make_unique<XagGuestSource>(m_host, guestHandle, layout));
++                    audio::AudioGroup::Xag, std::make_unique<XagGuestSource>(m_host, guestHandle, layout, clip.control,
++                                                                             clip.params, clip.volume));
+                 if (m_host.audioDeviceMode(audio::AudioGroup::Xag) != audio::DeviceMode::Free)
+                     return;
+                 const uint64_t handle = m_host.openHostFile(imagePath);
+@@ -462,28 +570,46 @@ namespace ps2x::iop::detail
+                     return;
+                 AudioWorker &worker = m_audio[core];
+                 worker.cancel = false;
+-                worker.thread = std::thread([this, core, layout, handle, &worker]() {
++                worker.thread = std::thread([this, core, layout, handle, &worker, control = clip.control,
++                                             params = clip.params, volume = clip.volume]() {
+                     audio::XagClipReader reader(layout);
+                     audio::CubicResampler resampler(layout.sampleRate, audio::kMixRate, layout.channels);
++                    // AUDIO_002-3: same volume model in real time; commands apply when they arrive (block start).
++                    audio::XagGainRenderer gain(params, volume, 0u);
+                     std::vector<int16_t> out(2u * 1024u);
++                    std::vector<audio::XagVolumeCommand> arrived;
++                    arrived.reserve(audio::XagVoiceControl::kCapacity);
+                     auto pull = [&](int16_t *dst, size_t n) {
+                         return reader.read(dst, n, [&](uint64_t offset, void *buffer, size_t size, size_t &got) {
+                             return m_host.readHostFile(handle, offset, buffer, size, got);
+                         });
+                     };
+                     bool output = true;
+-                    while (!worker.cancel && output)
++                    while (!worker.cancel && output && !gain.stopped())
+                     {
+-                        const size_t n = resampler.produce(out.data(), 1024u, pull);
++                        size_t n = resampler.produce(out.data(), 1024u, pull);
+                         if (n == 0u)
+                             break;
+-                        output = m_host.pushFreeRunningPcm(core, out.data(), n, &worker.cancel);
++                        arrived.clear();
++                        if (control)
++                            control->takeFree([&](const audio::XagVolumeCommand &c) { arrived.push_back(c); });
++                        size_t next = 0u;
++                        n = gain.process(out.data(), n, [&](uint64_t, audio::XagVolumeCommand &c) {
++                            if (next == arrived.size())
++                                return false;
++                            c = arrived[next++];
++                            return true;
++                        });
++                        if (n != 0u)
++                            output = m_host.pushFreeRunningPcm(core, out.data(), n, &worker.cancel);
+                     }
+                     m_host.closeHostFile(handle);
+                     const uint64_t frames = reader.chunksRead() * (layout.blockBytes / 16u * 28u);
+                     logAudio(LogLevel::Info, "XAG audio core=%u: queued %llu frames at %u Hz (%s)", core,
+                              static_cast<unsigned long long>(frames), layout.sampleRate,
+-                             worker.cancel ? "cancelled" : (!output ? "host has no audio output" : "complete"));
++                             worker.cancel ? "cancelled"
++                                           : (!output ? "host has no audio output"
++                                                      : (gain.stopped() ? "faded out" : "complete")));
+                 });
+             }
+ 
+@@ -556,6 +682,9 @@ namespace ps2x::iop::detail
+                 m_result = {};
+                 m_lastQuery = {};
+                 m_loggedOpcodes = {};
++                m_masterVolume = 0;
++                m_voiceControl = {};
++                m_startVolume = {};
+             }
+ 
+             uint32_t selectChannelLocked(uint32_t argument) const
+@@ -565,12 +694,29 @@ namespace ps2x::iop::detail
+             }
+ 
+             // Ends clips whose duration has elapsed (XagControl -> XagControlExit -> state 0).
++            // AUDIO_002-3: first runs the aticks (up to the clip end); a fade-out reaching 0 is xag_stop -> state 0.
+             void advanceLocked()
+             {
+                 const uint64_t now = m_host.vsyncTick();
+                 for (int core = 0; core < 2; ++core)
+                 {
+                     XagChannel &channel = m_channels[core];
++                    const uint64_t until =
++                        channel.playEndTick != 0u && now > channel.playEndTick ? channel.playEndTick : now;
++                    if (runATicksLocked(channel, until))
++                    {
++                        channel.state = kStateIdle;
++                        channel.hasSemaphores = 0u;
++                        channel.standbyCount = 0u;
++                        m_pendingAudioStop[core] = true;
++                        logLocked(LogLevel::Info,
++                                  "XAG core=%d fade-out finished at atick %llu (started %llu, now %llu) -> xag_stop, "
++                                  "state 0",
++                                  core, static_cast<unsigned long long>(channel.vol.aticks),
++                                  static_cast<unsigned long long>(channel.playStartTick),
++                                  static_cast<unsigned long long>(now));
++                        continue;
++                    }
+                     if (channel.state == kStatePlaying && channel.playEndTick != 0u && now >= channel.playEndTick)
+                     {
+                         channel.state = kStateIdle;
+@@ -773,6 +919,11 @@ namespace ps2x::iop::detail
+                         each.hasSemaphores = 0u;
+                         each.standbyCount = 0u;
+                         each.loopCount = 0;
++                        // AUDIO_002-3: TsndInitXag clears the flags and runs xag_default on both records.
++                        each.vol.flags = 0u;
++                        audio::xagDefault(each.vol);
++                        each.skipStart = 0u;
++                        each.skipCount = 0u;
+                     }
+                     logLocked(LogLevel::Info, "TsndInitXag buffer=0x%X maxCh=%u/%u", bytes, command[3], command[4]);
+                     return;
+@@ -831,11 +982,21 @@ namespace ps2x::iop::detail
+                     if (opcode == 0x3Du)
+                     {
+                         const uint16_t raw = command[2] == 0x7Fu ? 0x80u : command[2];
+-                        channel.volume = static_cast<uint16_t>((raw << 7) & 0xFF80u);
++                        // XagStandby2: record +0x06 = volume, flags cleared (AUDIO_002-3).
++                        channel.vol.vol = static_cast<int16_t>((raw << 7) & 0xFF80u);
++                        channel.vol.flags = 0u;
+                     }
+                     else
+                     {
+                         channel.loopCount = 0; // XagDefault -> xag_default clears +0x94
++                        // AUDIO_002-3: XagStandby -> XagDefault (skipped during a fade-out), then flags cleared.
++                        if (!(channel.vol.flags & audio::kXagFlagFadeout))
++                        {
++                            audio::xagDefault(channel.vol);
++                            channel.skipStart = 0u;
++                            channel.skipCount = 0u;
++                        }
++                        channel.vol.flags = 0u;
+                     }
+                     channel.standbyCount = 0u;
+                     channel.hasSemaphores = 0u;
+@@ -847,6 +1008,16 @@ namespace ps2x::iop::detail
+                         logLocked(LogLevel::Info, "XAG core=%d entry=%u XagControlExitFin: %s -> state 0", core, entry,
+                                   reason);
+                     }
++                    else
++                    {
++                        // XagControl@0x90A0 writes the SPU volumes while preparing the stream.
++                        audio::xagPrepare(channel.vol, voiceParamsLocked(channel));
++                        logLocked(LogLevel::Info, "XAG core=%d volume 0x%04X entry 0x%04X master 0x%04X -> VOL %d/%d %d/%d",
++                                  core, static_cast<unsigned>(static_cast<uint16_t>(channel.vol.vol)),
++                                  static_cast<unsigned>(static_cast<uint16_t>(voiceParamsLocked(channel).entryVolume)),
++                                  static_cast<unsigned>(channel.vol.masterVol), channel.vol.regs[0],
++                                  channel.vol.regs[1], channel.vol.regs[2], channel.vol.regs[3]);
++                    }
+                     return;
+                 }
+                 case 0x32u: // XagStart
+@@ -864,12 +1035,78 @@ namespace ps2x::iop::detail
+                             if (channel.loopCount != 0)
+                                 channel.playEndTick = 0u; // looping not modelled: keep playing
+                             m_pendingAudioStart[core] = true;
++                            // AUDIO_002-3: the voice starts from the volume state at this point; later commands
++                            // (even in this same stream) reach it through a fresh control, at their position.
++                            channel.vol.aticks = 0u;
++                            m_startVolume[core] = channel.vol;
++                            m_voiceControl[core] = std::make_shared<audio::XagVoiceControl>();
+                         }
+                     }
+                     logLocked(LogLevel::Info, "XagStart core=%d state %u->%u start=%llu end=%llu", core, before,
+                               channel.state, static_cast<unsigned long long>(channel.playStartTick),
+                               static_cast<unsigned long long>(channel.playEndTick));
+                     return;
++                // AUDIO_002-3: volume commands (treq_XAG argument decoding; the EE sends 0x37/0x38/0x72).
++                case 0x38u: // XagSetVol(byte): 0x7F -> 0x80, << 7 & 0xFF80
++                {
++                    const uint16_t raw = command[1] == 0x7Fu ? 0x80u : command[1];
++                    const int16_t vol = static_cast<int16_t>((raw << 7) & 0xFF80u);
++                    audio::xagSetVol(channel.vol, vol);
++                    postVolumeLocked(static_cast<uint32_t>(core), {audio::XagVolumeCommand::Op::SetVol, vol});
++                    logLocked(LogLevel::Info, "XagSetVol core=%d vol=0x%04X state %u tick %llu", core,
++                              static_cast<unsigned>(static_cast<uint16_t>(vol)), before,
++                              static_cast<unsigned long long>(m_host.vsyncTick()));
++                    return;
++                }
++                case 0x36u: // XagSetFade(byte target, time16): target 0x7F -> 0x80, << 7
++                {
++                    const uint16_t raw = command[1] == 0x7Fu ? 0x80u : command[1];
++                    const int16_t target = static_cast<int16_t>((raw & 0xFFFFu) << 7);
++                    const uint16_t time = static_cast<uint16_t>((command[2] << 8) | command[3]);
++                    audio::xagSetFade(channel.vol, target, time);
++                    postVolumeLocked(static_cast<uint32_t>(core),
++                                     {audio::XagVolumeCommand::Op::SetFade, target, time});
++                    logLocked(LogLevel::Info, "XagSetFade core=%d target=0x%04X time=%u step=%d state %u tick %llu",
++                              core, static_cast<unsigned>(static_cast<uint16_t>(target)), time, channel.vol.step,
++                              before, static_cast<unsigned long long>(m_host.vsyncTick()));
++                    return;
++                }
++                case 0x37u: // XagSetFadeout(time16): XagSetFade(0, time) + stop at the end
++                {
++                    const uint16_t time = static_cast<uint16_t>((command[1] << 8) | command[2]);
++                    audio::xagSetFadeout(channel.vol, time);
++                    postVolumeLocked(static_cast<uint32_t>(core), {audio::XagVolumeCommand::Op::Fadeout, 0, time});
++                    logLocked(LogLevel::Info, "XagSetFadeout core=%d time=%u vol=0x%04X step=%d state %u tick %llu",
++                              core, time, static_cast<unsigned>(static_cast<uint16_t>(channel.vol.vol)),
++                              channel.vol.step, before, static_cast<unsigned long long>(m_host.vsyncTick()));
++                    return;
++                }
++                case 0x72u: // XagSetMVol(u16): global, clamped to [0, 0x4000]; dirty on the current core only
++                {
++                    const int32_t value = (command[1] << 8) | command[2];
++                    for (uint32_t c = 0; c < 2u; ++c)
++                    {
++                        const bool current = c == static_cast<uint32_t>(core);
++                        audio::xagSetMasterVol(m_channels[c].vol, value, current);
++                        postVolumeLocked(c, {audio::XagVolumeCommand::Op::MasterVol, value, 0u, current});
++                    }
++                    m_masterVolume = m_channels[0].vol.masterVol;
++                    logLocked(LogLevel::Info, "XagSetMVol 0x%04X (core %d dirty) tick %llu",
++                              static_cast<unsigned>(m_masterVolume), core,
++                              static_cast<unsigned long long>(m_host.vsyncTick()));
++                    return;
++                }
++                case 0x70u: // XagDefault: xag_default unless a fade-out runs
++                    if (!(channel.vol.flags & audio::kXagFlagFadeout))
++                    {
++                        audio::xagDefault(channel.vol);
++                        channel.loopCount = 0;
++                        channel.skipStart = 0u;
++                        channel.skipCount = 0u;
++                    }
++                    postVolumeLocked(static_cast<uint32_t>(core), {audio::XagVolumeCommand::Op::Default});
++                    logLocked(LogLevel::Info, "XagDefault core=%d", core);
++                    return;
+                 case 0x33u: // XagStop -> xag_stop: clear_sema + ReleaseWaitThread -> XagControlExit -> state 0
+                     m_pendingAudioStop[core] = true;
+                     channel.state = kStateIdle;
+@@ -938,6 +1175,10 @@ namespace ps2x::iop::detail
+             std::array<bool, 2> m_pendingAudioStop{};
+             std::array<AudioWorker, 2> m_audio{};
+             std::array<uint64_t, 2> m_guestSource{}; // AUDIO_002-1/2: mixer source ids
++            // AUDIO_002-3: XagMVol (IRX global), command channel of each sounding voice, volume at XagStart.
++            int32_t m_masterVolume = 0;
++            std::array<std::shared_ptr<audio::XagVoiceControl>, 2> m_voiceControl{};
++            std::array<audio::XagVolumeState, 2> m_startVolume{};
+             const std::array<uint32_t, 2> m_sids = {kCommandSid, kStateSid};
+         };
+     }
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index c2204b8..eb5074f 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -61,6 +61,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_recompiler_tests.cpp
+     src/ps2_runtime_expansion_tests.cpp
+     src/audio_mixer_tests.cpp
++    src/audio_xag_volume_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/audio_xag_volume_tests.cpp b/ps2xTest/src/audio_xag_volume_tests.cpp
+new file mode 100644
+index 0000000..b86913a
+--- /dev/null
++++ b/ps2xTest/src/audio_xag_volume_tests.cpp
+@@ -0,0 +1,310 @@
++// AUDIO_002-3 (patch 38): TSNDDRVM XAG voice volume model (audio_dsp.h) and its gain renderer.
++#include "MiniTest.h"
++#include "ps2x/iop/audio_dsp.h"
++
++#include <atomic>
++#include <cmath>
++#include <cstdlib>
++#include <thread>
++#include <vector>
++
++using namespace ps2x::iop::audio;
++
++namespace
++{
++    std::vector<int16_t> sinePanLaw()
++    {
++        std::vector<int16_t> law(kXagPanLawSize);
++        for (size_t p = 0; p < law.size(); ++p)
++            law[p] = static_cast<int16_t>(std::lround(4096.0 * std::sin(static_cast<double>(p) * 3.14159265358979323846 / 256.0)));
++        return law;
++    }
++
++    const std::vector<int16_t> &panLaw()
++    {
++        static const std::vector<int16_t> law = sinePanLaw();
++        return law;
++    }
++
++    XagVoiceParams stereoParams()
++    {
++        XagVoiceParams p{};
++        p.entryVolume = 0x3FFF;
++        p.channels = 2u;
++        p.pan = {0x00u, 0x80u};
++        p.panLaw = panLaw().data();
++        return p;
++    }
++
++    XagVolumeState startState(int16_t vol, int32_t mvol, const XagVoiceParams &params)
++    {
++        XagVolumeState s{};
++        s.vol = vol;
++        s.masterVol = mvol;
++        xagPrepare(s, params);
++        return s;
++    }
++
++    // Renders `frames` frames of a constant input through the renderer in blocks of `block`, with the given commands.
++    std::vector<int16_t> renderConst(const XagVoiceParams &params, const XagVolumeState &start,
++                                     const std::vector<XagVolumeCommand> &commands, size_t frames, size_t block,
++                                     int16_t x0 = 20000, int16_t x1 = -12000)
++    {
++        XagGainRenderer gain(params, start, 0u);
++        std::vector<int16_t> out;
++        size_t next = 0;
++        std::vector<int16_t> buf;
++        while (out.size() / 2u < frames && !gain.stopped())
++        {
++            const size_t n = std::min(block, frames - out.size() / 2u);
++            buf.assign(n * 2u, 0);
++            for (size_t i = 0; i < n; ++i)
++            {
++                buf[i * 2u] = x0;
++                buf[i * 2u + 1u] = x1;
++            }
++            const size_t got = gain.process(buf.data(), n, [&](uint64_t k, XagVolumeCommand &c) {
++                if (next == commands.size() || commands[next].position > k)
++                    return false;
++                c = commands[next++];
++                return true;
++            });
++            out.insert(out.end(), buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(got * 2u));
++            if (got < n)
++                break;
++        }
++        return out;
++    }
++}
++
++void register_audio_xag_volume_tests()
++{
++    MiniTest::Case("XagVolume", [](TestCase &tc) {
++        tc.Run("pan law is the IRX sine table (0x1000 at 0x80, 0xB50 at 0x40)", [](TestCase &t) {
++            t.Equals(int(panLaw()[0]), 0, "p=0");
++            t.Equals(int(panLaw()[0x40]), 0xB50, "p=0x40");
++            t.Equals(int(panLaw()[0x80]), 0x1000, "p=0x80");
++        });
++        tc.Run("default chain: vol 0x4000, entry 0x3FFF, master 0x3FFF -> VOL 0x3FFE, hard L/R", [](TestCase &t) {
++            const XagVoiceParams p = stereoParams();
++            const XagVolumeState s = startState(0x4000, 0x3FFF, p);
++            t.Equals(xagLevel(0x4000, 0x3FFF, 0x3FFF), 0x3FFE, "level");
++            t.Equals(int(s.regs[0]), 0x3FFE, "ch0 VOLL");
++            t.Equals(int(s.regs[1]), 0, "ch0 VOLR");
++            t.Equals(int(s.regs[2]), 0, "ch1 VOLL");
++            t.Equals(int(s.regs[3]), 0x3FFE, "ch1 VOLR");
++        });
++        tc.Run("level is linear in volume and master volume (toward-zero shifts)", [](TestCase &t) {
++            t.Equals(xagLevel(0x2000, 0x3FFF, 0x4000), 0x1FFF, "half volume");
++            t.Equals(xagLevel(0x4000, 0x3FFF, 0x2000), 0x1FFF, "half master");
++            t.Equals(xagLevel(0x4000, 0x3FFF, 0), 0, "master 0 = silence (IRX .sdata value before SndInit)");
++            t.Equals(xagLevel(0, 0x3FFF, 0x3FFF), 0, "volume 0");
++            for (int v = 0; v <= 0x4000; v += 0x80)
++                t.IsTrue(xagLevel(v, 0x3FFF, 0x3FFF) <= xagLevel(v + 0x80, 0x3FFF, 0x3FFF), "monotonic");
++        });
++        tc.Run("centre pan (0x40) gives 0xB50/0x1000 on both sides; mono flag forces 0x40", [](TestCase &t) {
++            XagVoiceParams p = stereoParams();
++            p.pan = {0x40u, 0x40u};
++            const XagVolumeState s = startState(0x4000, 0x3FFF, p);
++            const int expected = (0x3FFE * 0xB50) >> 12;
++            t.Equals(int(s.regs[0]), expected, "L");
++            t.Equals(int(s.regs[1]), expected, "R");
++            XagVoiceParams m = stereoParams();
++            m.mono = true;
++            const XagVolumeState sm = startState(0x4000, 0x3FFF, m);
++            t.Equals(int(sm.regs[0]), expected, "mono flag L");
++            t.Equals(int(sm.regs[3]), expected, "mono flag R");
++        });
++        tc.Run("XagSetFade step: truncated quotient, time 0 = whole difference, at least +-1", [](TestCase &t) {
++            XagVolumeState s{};
++            s.vol = 0x4000;
++            xagSetFade(s, 0, 120);
++            t.Equals(int(s.step), -136, "0x4000 / 120");
++            s = XagVolumeState{};
++            s.vol = 0x1000;
++            xagSetFade(s, 0x4000, 0);
++            t.Equals(int(s.step), 0x3000, "time 0");
++            s = XagVolumeState{};
++            s.vol = 0x1000;
++            xagSetFade(s, 0x1010, 1000);
++            t.Equals(int(s.step), 1, "small up -> +1");
++            s = XagVolumeState{};
++            s.vol = 0x1010;
++            xagSetFade(s, 0x1000, 1000);
++            t.Equals(int(s.step), -1, "small down -> -1");
++            s = XagVolumeState{};
++            s.vol = 0;
++            xagSetFade(s, 0, 10);
++            t.Equals(int(s.step), -1, "target 0 and no difference -> -1");
++            t.IsTrue((s.flags & kXagFlagFade) != 0u, "fade flag");
++        });
++        tc.Run("a fade-out ignores later fades and stops after ceil(vol / |step|) aticks without writing 0", [](TestCase &t) {
++            const XagVoiceParams p = stereoParams();
++            XagVolumeState s = startState(0x4000, 0x3FFF, p);
++            xagSetFadeout(s, 120);
++            xagSetFade(s, 0x4000, 10); // ignored (0x20 set)
++            xagSetFadeout(s, 5);       // XagSetFade ignored, flags kept
++            t.Equals(int(s.step), -136, "first fade-out step kept");
++            int ticks = 0;
++            bool stopped = false;
++            while (!stopped && ticks < 1000)
++            {
++                ++ticks;
++                stopped = xagATick(s, p);
++            }
++            t.Equals(ticks, 121, "121 aticks for 0x4000 at -136");
++            t.IsTrue(s.vol > 0, "the last volume write is not 0 (xag_stop path writes nothing)");
++            t.Equals(int(s.flags & (kXagFlagFade | kXagFlagFadeout)), 0, "fade flags cleared");
++        });
++        tc.Run("XagSetVol applies at the next atick; master volume clamps and marks only the current core", [](TestCase &t) {
++            const XagVoiceParams p = stereoParams();
++            XagVolumeState s = startState(0x4000, 0x3FFF, p);
++            const auto before = s.regs;
++            xagSetVol(s, 0x2000);
++            t.IsTrue(s.regs == before, "no immediate register write");
++            xagATick(s, p);
++            t.Equals(int(s.regs[0]), xagLevel(0x2000, 0x3FFF, 0x3FFF), "written at the atick");
++            XagVolumeState other = startState(0x4000, 0x3FFF, p);
++            xagSetMasterVol(other, 0x7FFF, false);
++            t.Equals(other.masterVol, 0x4000, "clamped to 0x4000");
++            t.Equals(int(other.flags), 0, "not dirty on the other core");
++            xagSetMasterVol(other, -5, true);
++            t.Equals(other.masterVol, 0, "negative -> 0");
++            t.IsTrue((other.flags & 1u) != 0u, "dirty on the current core");
++        });
++        tc.Run("renderer output is independent of the block size", [](TestCase &t) {
++            const XagVoiceParams p = stereoParams();
++            const XagVolumeState s = startState(0x4000, 0x3FFF, p);
++            std::vector<XagVolumeCommand> cmds = {
++                {XagVolumeCommand::Op::SetVol, 0x1800, 0u, false, 960u * 3u},
++                {XagVolumeCommand::Op::Fadeout, 0, 60u, false, 960u * 20u},
++            };
++            const auto a = renderConst(p, s, cmds, 960u * 60u, 1u);
++            const auto b = renderConst(p, s, cmds, 960u * 60u, 7u);
++            const auto c = renderConst(p, s, cmds, 960u * 60u, 960u);
++            const auto d = renderConst(p, s, cmds, 960u * 60u, 4096u);
++            t.IsTrue(a == b && b == c && c == d, "same output for blocks 1, 7, 960, 4096");
++        });
++        tc.Run("ramps: per-frame change bounded, target reached after 200 frames, silence after a fade-out", [](TestCase &t) {
++            const XagVoiceParams p = stereoParams();
++            const XagVolumeState s = startState(0x4000, 0x3FFF, p);
++            std::vector<XagVolumeCommand> cmds = {{XagVolumeCommand::Op::SetVol, 0x0400, 0u, false, 960u}};
++            const auto out = renderConst(p, s, cmds, 960u * 4u, 960u, 32767, 32767);
++            int maxStep = 0;
++            for (size_t i = 2; i < out.size(); i += 2)
++                maxStep = std::max(maxStep, std::abs(out[i] - out[i - 2]));
++            const int jump = (32767 * 0x3FFE >> 14) - (32767 * xagLevel(0x0400, 0x3FFF, 0x3FFF) >> 14);
++            t.IsTrue(maxStep <= jump / 200 + 2, "no click: per-frame change <= jump / 200");
++            const int settled = (32767 * xagLevel(0x0400, 0x3FFF, 0x3FFF)) >> 14;
++            t.Equals(int(out[2u * (960u * 3u)]), settled, "settled level");
++            std::vector<XagVolumeCommand> fade = {{XagVolumeCommand::Op::Fadeout, 0, 24u, false, 0u}};
++            XagGainRenderer g(p, s, 0u);
++            std::vector<int16_t> buf(2u * 20000u, 1000);
++            size_t next = 0;
++            const size_t got = g.process(buf.data(), 20000u, [&](uint64_t k, XagVolumeCommand &c) {
++                if (next == fade.size() || fade[next].position > k)
++                    return false;
++                c = fade[next++];
++                return true;
++            });
++            t.IsTrue(g.stopped(), "stopped");
++            // 0x4000 / 24 = 682 -> 25 aticks (the 25th ends the fade-out at 25*200-100), then a 200-frame ramp.
++            t.Equals(uint64_t(got), uint64_t(25u * 200u - 100u + 200u), "ends 200 frames after the stopping atick");
++            t.Equals(int(buf[2u * (got - 1u)]), 0, "last frame silent");
++        });
++        tc.Run("renderer and guest-side aticks agree at every field boundary (service vs source)", [](TestCase &t) {
++            const XagVoiceParams p = stereoParams();
++            const XagVolumeState s0 = startState(0x4000, 0x3FFF, p);
++            // Commands at field starts (as the service posts them): fade down, set volume, master volume, fade-out.
++            const std::vector<std::pair<uint64_t, XagVolumeCommand>> byTick = {
++                {5u, {XagVolumeCommand::Op::SetFade, 0x1000, 50u}},
++                {30u, {XagVolumeCommand::Op::SetVol, 0x3000}},
++                {31u, {XagVolumeCommand::Op::MasterVol, 0x2000, 0u, true}},
++                {60u, {XagVolumeCommand::Op::Fadeout, 0, 120u}},
++            };
++            std::vector<XagVolumeCommand> cmds;
++            for (auto [tick, c] : byTick)
++            {
++                c.position = tick * 960u;
++                cmds.push_back(c);
++            }
++            // Guest side: per tick, aticks strictly before the field start, then the tick's commands.
++            XagVolumeState g = s0;
++            uint64_t stopTick = 0;
++            for (uint64_t tick = 1; tick < 200u && stopTick == 0u; ++tick)
++            {
++                const uint64_t pos = tick * 960u;
++                while (xagATickPosition(g.aticks + 1u) < pos)
++                    if (xagATick(g, p))
++                    {
++                        stopTick = tick;
++                        break;
++                    }
++                for (const auto &[ct, c] : byTick)
++                    if (ct == tick && stopTick == 0u)
++                        xagApply(g, c);
++            }
++            XagGainRenderer r(p, s0, 0u);
++            std::vector<int16_t> buf(2u * 960u, 1000);
++            size_t next = 0;
++            uint64_t rendered = 0;
++            while (!r.stopped() && rendered < 300u * 960u)
++            {
++                std::fill(buf.begin(), buf.end(), int16_t(1000));
++                rendered += r.process(buf.data(), 960u, [&](uint64_t k, XagVolumeCommand &c) {
++                    if (next == cmds.size() || cmds[next].position > k)
++                        return false;
++                    c = cmds[next++];
++                    return true;
++                });
++            }
++            t.IsTrue(stopTick != 0u, "the guest side stopped");
++            const uint64_t stopAtick = xagATickPosition(g.aticks);
++            t.Equals(rendered, stopAtick + kXagATickFrames, "source stops 200 frames after the same atick");
++            t.Equals(stopTick, stopAtick / 960u + 1u, "guest sees state 0 at the first field after the atick");
++            t.Equals(int(r.state().vol), int(g.vol), "same last volume");
++            t.Equals(r.state().aticks, g.aticks, "same atick count");
++        });
++        tc.Run("command FIFO is bounded, ordered and safe across threads", [](TestCase &t) {
++            XagVoiceControl full;
++            for (uint32_t i = 0; i < 100u; ++i)
++                full.post({XagVolumeCommand::Op::SetVol, int32_t(i), 0u, false, i});
++            t.Equals(full.dropped(), uint64_t(36u), "64 kept, 36 dropped");
++            std::vector<int32_t> seen;
++            full.takeGuest(10u, [&](const XagVolumeCommand &c) { seen.push_back(c.a); });
++            t.Equals(seen.size(), size_t(10u), "positions < 10");
++            t.IsTrue(seen.front() == 0 && seen.back() == 9, "in order");
++            XagVoiceControl c;
++            std::atomic<bool> done{false};
++            std::atomic<int> consumed{0};
++            int expect = 0;
++            std::thread consumer([&]() {
++                while (consumed.load() < 20000)
++                {
++                    c.takeFree([&](const XagVolumeCommand &cmd) {
++                        if (cmd.a == expect)
++                            ++expect;
++                        consumed.fetch_add(1);
++                    });
++                    std::this_thread::yield();
++                }
++            });
++            for (int i = 0; i < 20000; ++i)
++            {
++                while (true)
++                {
++                    // keep at most 32 in flight so nothing is dropped
++                    if (i - consumed.load() < 32)
++                        break;
++                    std::this_thread::yield();
++                }
++                c.post({XagVolumeCommand::Op::SetVol, i});
++                c.takeGuest(UINT64_MAX, [](const XagVolumeCommand &) {});
++            }
++            done = true;
++            consumer.join();
++            t.Equals(expect, 20000, "every command once, in order");
++            t.Equals(c.dropped(), uint64_t(0u), "no drops");
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index bf7ca18..ddb6956 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -20,6 +20,7 @@ void register_ps2_sif_dma_tests();
+ void register_ps2_recompiler_tests();
+ void register_ps2_runtime_expansion_tests();
+ void register_audio_mixer_tests();
++void register_audio_xag_volume_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -44,6 +45,7 @@ int main()
+     register_ps2_recompiler_tests();
+     register_ps2_runtime_expansion_tests();
+     register_audio_mixer_tests();
++    register_audio_xag_volume_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
