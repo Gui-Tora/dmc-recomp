@@ -155,6 +155,10 @@
     {
       "path": "patches/AUDIO_002_3_xag_volume.patch",
       "sha256": "142ab95e31f421e6792f840602ee809117d7143e8c9c66ae4b616b318911d156"
+    },
+    {
+      "path": "patches/AUDIO_002_4_xag_checkpoint_v4.patch",
+      "sha256": "15ad478b8027bd365b54ccb8cb15486733a89e8baf0e10a5d021b36db2afa72d"
     }
   ],
   "patch_identity": {
@@ -163,5 +167,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "b911ca6ef8afcba2cc5d297ef8e31904167f244b"
+  "patched_commit": "a46af4f5781dae74194cc09203fefa27071c7cec"
 }
