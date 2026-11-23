@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los treinta y ocho patches actualmente activos:
+arriba). Los treinta y nueve patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -886,3 +886,36 @@ arriba). Los treinta y ocho patches actualmente activos:
       - opcodes por canal, pausa y pitch no modelados.
       Documentación: `AUDIO_002_3_xag_volume.md` (este directorio) y
       `analysis/notes/AUDIO_002_3_XAG_VOLUME.md`.
+
+39. `AUDIO_002_4_xag_checkpoint_v4.patch` (convención A — companion `AUDIO_002_4_xag_checkpoint_v4.md`). Audio:
+    restauración de las voces XAG desde checkpoints (payload TSNDDRVM v4).
+    - `ps2xIOP/include/ps2x/iop/audio_dsp.h`:
+      - hash FNV-1a del estado del decodificador ADPCM y del remuestreador;
+      - la fuente viva publica su posición y su hash;
+      - `XagGainRenderer::resumeStopping`, para reanudar dentro de la rampa final.
+    - `ps2xIOP/src/modules/tsnddrvm_xag.cpp`:
+      - payload v4 = cuerpo v2 + `XagMVol` + por canal: rango del clip, estado de volumen completo, tipo de voz
+        (sonando o rampa final), posición, identidad del clip y hash;
+      - carga de v2, v3 y v4. La voz se relanza en el primer RPC tras la carga, reproduciendo de forma determinista
+        el decodificador y el remuestreador hasta la posición y comprobando el hash; ante una discrepancia, silencio y
+        log;
+      - v2 se reconstruye desde `playStartTick`, la entrada y el skip;
+      - la parada por fundido solo cancela la copia `free`, y la fuente de guest termina su rampa de 200 frames;
+      - el worker `free` reintenta el primer bloque durante un máximo de 2 s si el dispositivo aún no está abierto.
+    - `ps2xTest`: `audio_xag_checkpoint_tests.cpp`, 2 tests.
+    - No cambia `ps2xRuntime` ni ninguna cabecera incluida por el EE generado (no se recompila `generated`). No
+      cambian las versiones de sección del checkpoint.
+    - Validación (exe construido desde `a46af4f5`):
+      - restauraciones v4, v3 y v2 y durante un fundido con WAV idéntico a la ejecución continua (o a un
+        decodificador independiente en el v2 de la oficina);
+      - prueba aislada del final de la voz y de la cola del fundido: todo idéntico;
+      - 31/31 tests de audio;
+      - rendimiento igual al del parche 38.
+    - Compatibilidad: los exes con este parche cargan v2, v3 y v4; los de 37 y 38 parches rechazan v4 con un error
+      explícito.
+    - Limitaciones:
+      - final de voz probado solo de forma aislada (el GS rechaza el guardado en esa zona del juego);
+      - coste de relanzamiento lineal con la posición (122,7 ms cerca del final de la voz más larga, ISO en caché);
+      - la cancelación de un worker `free` activo no se ha ejercitado en el juego.
+      Documentación: `AUDIO_002_4_xag_checkpoint_v4.md` (este directorio) y
+      `analysis/notes/AUDIO_002_4_XAG_CHECKPOINTS.md`.
