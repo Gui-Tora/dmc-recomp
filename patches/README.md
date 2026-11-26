@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los treinta y nueve patches actualmente activos:
+arriba). Los cuarenta patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -919,3 +919,34 @@ arriba). Los treinta y nueve patches actualmente activos:
       - la cancelación de un worker `free` activo no se ha ejercitado en el juego.
       Documentación: `AUDIO_002_4_xag_checkpoint_v4.md` (este directorio) y
       `analysis/notes/AUDIO_002_4_XAG_CHECKPOINTS.md`.
+
+40. `AUDIO_002_5_pss_adma.patch` (convención A — companion `AUDIO_002_5_pss_adma.md`). Audio: PCM de las
+    películas PSS por ADMA. **Experimental y opt-in.** Contenido = revisión r2 del candidato (no c3).
+    - Activación: `PS2X_IOP_HEAP_ALIAS=0x00020000:0x00080000` y `PS2X_SD_ADMA=1`. Hacen falta las dos; con
+      `PS2X_SD_ADMA=1` sin alias válido, ADMA se ignora con un aviso. Sin variables, igual que con 39 parches.
+    - `ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp`: alias de 24 bits del principio del heap SIF; almacén, claves y
+      checkpoint canónicos; parser estricto (rechaza base 0, desalineación y caracteres sobrantes).
+    - `ps2xRuntime/src/lib/audio/pss_audio.h` (nuevo, privado del runtime): reloj ADMA (960 frames por field PAL, un
+      bloque de 1024 bytes cada 256 frames), fuente `Pss` del mezclador con BVOL con signo, `sdAdmaEnabled()`.
+    - `ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp`: `BlockTrans` por tiempo del guest, fuente `Pss`, `SD_P_BVOLL/R`,
+      aviso si el búfer no es una dirección de 24 bits, instantánea `sdAdmaDebugState`.
+    - `ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp`: retención del PES de audio hasta que el callback lo acepta.
+    - `ps2xRuntime/src/lib/ps2_iop_host.cpp`: puente con el mezclador del host.
+    - `ps2xTest`: `audio_pss_tests.cpp` (11 tests) y `pss_sif_libsd_tests.cpp` (20 tests); 551 en total.
+    - No cambia ninguna cabecera incluida por el EE generado (no se recompila `generated`) ni el formato de
+      checkpoint.
+    - Validación (exe `d497a9a0`, construido desde `d21ad507`):
+      - PCM idéntico a una referencia extraída de la ISO en los tramos comparados; WAV determinista;
+      - sin variables, solo alias y solo ADMA: WAV idéntico al exe de 39 parches;
+      - suite completa: sin variables y con solo ADMA, mismos veredictos que con 39 parches.
+    - Fallos conocidos de upstream con el modo experimental: 21 tests de SIF con el alias de DMC (20 usan la ventana
+      como memoria del EE; 1 exige el heap IOP fuera de la RDRAM) y 2 de `sceSdRemote` con ADMA (cursor antiguo).
+      La suite estándar de upstream se ejecuta sin el alias.
+    - Limitaciones:
+      - salida audible con saltos por la cadencia de 60 Hz frente al contenido PAL;
+      - ganancia SPU2 sin contraste con hardware;
+      - cola de ~0,25 s perdida al terminar; la segunda película arranca 2 ticks más tarde;
+      - cinemáticas dentro del juego sin probar;
+      - el alias se solapa numéricamente con la RDRAM del EE; un checkpoint guardado con él necesita la misma
+        configuración al cargar. Alternativa futura: espacio de memoria IOP propio.
+      Documentación: `AUDIO_002_5_pss_adma.md` (este directorio) y `analysis/notes/AUDIO_002_5_PSS_ADMA.md`.

@@ -1,0 +1,1776 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+index 2fbe960..8813480 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Audio.cpp
+@@ -1,6 +1,9 @@
+ #include "Common.h"
+ #include "Audio.h"
++#include "SIF.h"
+ #include "runtime/checkpoint/checkpoint.h"
++#include "runtime/ee_scheduler.h"
++#include "../../audio/pss_audio.h"
+ 
+ namespace ps2_stubs
+ {
+@@ -28,6 +31,8 @@ namespace ps2_stubs
+             bool completed = true;
+         };
+ 
++        constexpr uint64_t kAdmaTickUnset = UINT64_MAX;
++
+         struct BlockTransferState
+         {
+             uint32_t base = 0u;
+@@ -38,6 +43,12 @@ namespace ps2_stubs
+             uint16_t mode = 0u;
+             bool active = false;
+             bool loop = false;
++            // AUDIO_002-5 (patch 40): the transfer position follows the emulated time (48 kHz, one 1024-byte block
++            // per 256 frames) from startTick/startOffset; sourceId is the mixer source playing it.
++            uint64_t startTick = kAdmaTickUnset;
++            uint32_t startOffset = 0u;
++            uint64_t sourceId = 0u;
++            bool base24Mismatch = false; // the guest's base (arg4) does not fit libsd's 24-bit status
+         };
+ 
+         struct AudioStubState
+@@ -49,17 +60,82 @@ namespace ps2_stubs
+ 
+         std::mutex g_audio_stub_mutex;
+         AudioStubState g_audio_stub_state;
++        // AUDIO_002-5: SPU2 core input volume of the ADMA data (SD_P_BVOLL/R), shared with the mixer sources.
++        std::array<std::shared_ptr<ps2audio::AdmaVolume>, kLibSdCoreCount> g_admaVolume{
++            std::make_shared<ps2audio::AdmaVolume>(), std::make_shared<ps2audio::AdmaVolume>()};
++        constexpr uint32_t kLibSdParamBvolL = 0x0F80u;
++        constexpr uint32_t kLibSdParamBvolR = 0x1080u;
++
++        void stopAdmaSourcesUnlocked()
++        {
++            for (BlockTransferState &transfer : g_audio_stub_state.blockTransfers)
++            {
++                if (transfer.sourceId != 0u)
++                {
++                    ps2audio::bridge::removeSource(transfer.sourceId);
++                    transfer.sourceId = 0u;
++                }
++            }
++        }
+ 
+         void resetAudioStubStateUnlocked()
+         {
++            stopAdmaSourcesUnlocked();
+             g_audio_stub_state = {};
++            for (auto &volume : g_admaVolume)
++            {
++                volume->left.store(0);
++                volume->right.store(0);
++            }
++        }
++
++        // AUDIO_002-5: block-aligned offset of the block being played at `tick`.
++        uint32_t admaOffsetAt(const BlockTransferState &transfer, uint64_t tick)
++        {
++            if (!ps2audio::sdAdmaEnabled() || !transfer.active || transfer.startTick == kAdmaTickUnset || tick < transfer.startTick)
++                return transfer.offset;
++            const uint64_t frames =
++                ps2audio::admaFramesAfterFields(tick - transfer.startTick, ps2audio::bridge::fieldHz());
++            return ps2audio::admaOffset(transfer.startOffset, frames, transfer.size, transfer.loop);
++        }
++
++        // AUDIO_002-5: start the clock (and, with the mixer, the Pss source) of an active transfer at `tick`.
++        void startAdmaUnlocked(uint32_t core, BlockTransferState &transfer, uint64_t tick)
++        {
++            if (!ps2audio::sdAdmaEnabled())
++                return;
++            if (transfer.sourceId != 0u)
++            {
++                ps2audio::bridge::removeSource(transfer.sourceId);
++                transfer.sourceId = 0u;
++            }
++            transfer.startTick = tick;
++            transfer.startOffset = transfer.offset - transfer.offset % ps2audio::kAdmaBlockBytes;
++            if (transfer.base24Mismatch)
++            {
++                static std::array<bool, kLibSdCoreCount> s_warned{};
++                if (!s_warned[core])
++                {
++                    s_warned[core] = true;
++                    std::fprintf(stderr, "[AUDIO:adma] core %u BlockTrans area is not a 24-bit IOP address; a guest that "
++                                         "subtracts its base from the transfer status will not refill it "
++                                         "(check PS2X_IOP_HEAP_ALIAS)\n", core);
++                }
++            }
++            if (!ps2audio::bridge::mixerEnabled())
++                return;
++            auto source = std::make_unique<ps2audio::AdmaBlockSource>(
++                transfer.base, transfer.size, transfer.startOffset, transfer.loop, g_admaVolume[core],
++                [](uint32_t address, void *dst, size_t size) { return readSifIopHeap(address, dst, size); });
++            transfer.sourceId = ps2audio::bridge::addSource(ps2x::iop::audio::AudioGroup::Pss, std::move(source));
+         }
+ 
+-        uint32_t currentBlockStatus(const BlockTransferState &transfer)
++        uint32_t currentBlockStatus(const BlockTransferState &transfer, uint64_t tick)
+         {
+-            const uint32_t position = (transfer.base + transfer.offset) & kAudioPositionMask;
++            const uint32_t offset = admaOffsetAt(transfer, tick);
++            const uint32_t position = (transfer.base + offset) & kAudioPositionMask;
+             const uint32_t halfSize = transfer.size / 2u;
+-            const uint32_t bank = (transfer.loop && halfSize != 0u && transfer.offset >= halfSize) ? 1u : 0u;
++            const uint32_t bank = (transfer.loop && halfSize != 0u && offset >= halfSize) ? 1u : 0u;
+             return (bank << 24u) | position;
+         }
+     }
+@@ -118,6 +194,7 @@ namespace ps2_stubs
+     bool checkpointDeserializeAudioHle(ps2x::checkpoint::ByteReader &r, std::string &error)
+     {
+         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
++        stopAdmaSourcesUnlocked(); // AUDIO_002-5: no PSS audio of the previous state survives a load
+         for (auto &vt : g_audio_stub_state.voiceTransfers)
+         {
+             uint8_t completed = 0;
+@@ -140,6 +217,11 @@ namespace ps2_stubs
+             }
+             bt.active = active != 0u;
+             bt.loop = loop != 0u;
++            // AUDIO_002-5: the clock restarts at the first libsd call after the load (the codec has no start tick;
++            // saving is refused while a transfer is active, see checkpointProbeAudioMask).
++            bt.startTick = kAdmaTickUnset;
++            bt.startOffset = bt.offset;
++            bt.sourceId = 0u;
+         }
+         return true;
+     }
+@@ -169,10 +251,17 @@ namespace ps2_stubs
+ 
+         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
+         g_audio_stub_state.initialized = true;
++        const uint64_t tick = runtime ? runtime->eeScheduler().currentVSyncTick() : 0u; // AUDIO_002-5
+         const uint32_t core = cmdArg0 & (kLibSdCoreCount - 1u);
+         VoiceTransferState &voiceTransfer = g_audio_stub_state.voiceTransfers[core];
+         BlockTransferState &blockTransfer = g_audio_stub_state.blockTransfers[core];
+         uint32_t returnValue = 0u;
++        for (uint32_t c = 0; c < kLibSdCoreCount; ++c) // AUDIO_002-5: transfers restored by a checkpoint load
++        {
++            BlockTransferState &transfer = g_audio_stub_state.blockTransfers[c];
++            if (ps2audio::sdAdmaEnabled() && transfer.active && transfer.startTick == kAdmaTickUnset)
++                startAdmaUnlocked(c, transfer, tick);
++        }
+ 
+         // BLOCKER_004 diag (temporary, not for commit): command/args + blockTransfer.active before/after.
+         static uint32_t s_diagCount = 0u;
+@@ -210,7 +299,9 @@ namespace ps2_stubs
+             const uint32_t direction = cmdArg1 & kLibSdTransDirectionMask;
+             if (direction == kLibSdTransStop)
+             {
+-                returnValue = currentBlockStatus(blockTransfer);
++                returnValue = currentBlockStatus(blockTransfer, tick);
++                if (blockTransfer.sourceId != 0u)
++                    ps2audio::bridge::removeSource(blockTransfer.sourceId);
+                 blockTransfer = {};
+             }
+             else if (arg4 != 0u && arg5 != 0u)
+@@ -227,6 +318,9 @@ namespace ps2_stubs
+                 blockTransfer.offset = (pauseOffset < blockTransfer.size) ? pauseOffset : 0u;
+                 blockTransfer.statusTraceCount = 0u;
+                 blockTransfer.active = true;
++                blockTransfer.base24Mismatch = (arg4 & ~kAudioPositionMask) != 0u ||
++                                               blockTransfer.base + blockTransfer.size > kAudioPositionMask + 1u;
++                startAdmaUnlocked(core, blockTransfer, tick); // AUDIO_002-5
+                 returnValue = 0u;
+             }
+             else
+@@ -252,12 +346,16 @@ namespace ps2_stubs
+         {
+             if (blockTransfer.active && blockTransfer.size != 0u)
+             {
+-                blockTransfer.offset = (blockTransfer.offset + kAudioTransferUnit) % blockTransfer.size;
++                // AUDIO_002-5: with PS2X_SD_ADMA=1 the position follows the emulated time; otherwise the previous
++                // +1024 bytes per status call.
++                blockTransfer.offset = ps2audio::sdAdmaEnabled()
++                                           ? admaOffsetAt(blockTransfer, tick)
++                                           : (blockTransfer.offset + kAudioTransferUnit) % blockTransfer.size;
+                 if (blockTransfer.statusTraceCount < 32u)
+                 {
+                     PS2_IF_AGRESSIVE_LOGS({
+                         std::cerr << "[Audio:BlockStatus] core=" << core
+-                                  << " status=0x" << std::hex << currentBlockStatus(blockTransfer)
++                                  << " status=0x" << std::hex << currentBlockStatus(blockTransfer, tick)
+                                   << " offset=0x" << blockTransfer.offset
+                                   << " size=0x" << blockTransfer.size
+                                   << std::dec << std::endl;
+@@ -265,12 +363,16 @@ namespace ps2_stubs
+                     ++blockTransfer.statusTraceCount;
+                 }
+             }
+-            returnValue = currentBlockStatus(blockTransfer);
++            returnValue = currentBlockStatus(blockTransfer, tick);
+         }
+         else if (cmd == kLibSdCmdSetParam)
+         {
+-            (void)cmdArg0;
+-            (void)cmdArg1;
++            // AUDIO_002-5: SD_P_BVOLL/R (core input volume of the ADMA data); other parameters are not modelled.
++            const uint32_t param = cmdArg0 & ~(kLibSdCoreCount - 1u);
++            if (param == kLibSdParamBvolL)
++                g_admaVolume[core]->left.store(static_cast<int16_t>(cmdArg1));
++            else if (param == kLibSdParamBvolR)
++                g_admaVolume[core]->right.store(static_cast<int16_t>(cmdArg1));
+             returnValue = 0u;
+         }
+ 
+@@ -286,6 +388,22 @@ namespace ps2_stubs
+         setReturnU32(ctx, returnValue);
+     }
+ 
++    SdAdmaDebugState sdAdmaDebugState(uint32_t core)
++    {
++        std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
++        const BlockTransferState &transfer = g_audio_stub_state.blockTransfers[core & (kLibSdCoreCount - 1u)];
++        SdAdmaDebugState s;
++        s.active = transfer.active;
++        s.loop = transfer.loop;
++        s.hasSource = transfer.sourceId != 0u;
++        s.clockStarted = transfer.startTick != kAdmaTickUnset;
++        s.base = transfer.base;
++        s.size = transfer.size;
++        s.bvolLeft = g_admaVolume[core & (kLibSdCoreCount - 1u)]->left.load();
++        s.bvolRight = g_admaVolume[core & (kLibSdCoreCount - 1u)]->right.load();
++        return s;
++    }
++
+     void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         (void)rdram;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 52d6660..0f2faa8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1,6 +1,7 @@
+ #include "Common.h"
+ #include "MPEG.h"
+ #include "runtime/ee_scheduler.h"
++#include "../../audio/pss_audio.h"
+ #include "runtime/checkpoint/checkpoint.h"
+ 
+ #if !defined(PS2X_HAS_FFMPEG)
+@@ -506,6 +507,8 @@ namespace ps2_stubs
+             size_t packetEnd = 0u;
+             size_t payloadStart = 0u;
+             bool video = false;
++            // AUDIO_002-5: the PES stays in the host buffer until its callbacks return (video and audio packets).
++            bool retained = false;
+             std::vector<MpegRegisteredCallback> callbacks;
+         };
+ 
+@@ -1621,6 +1624,7 @@ namespace ps2_stubs
+                                 callbackEvents[i].packetEnd = packetEnd;
+                                 callbackEvents[i].payloadStart = payloadStart;
+                                 callbackEvents[i].video = true;
++                                callbackEvents[i].retained = true;
+                             }
+                             // P4.2.3: retain the complete PES until the guest
+                             // callback has returned. The continuation performs
+@@ -1701,11 +1705,20 @@ namespace ps2_stubs
+                                 callbackEvents[i].packetEnd = packetEnd;
+                                 callbackEvents[i].payloadStart = payloadStart;
+                                 callbackEvents[i].video = false;
++                                callbackEvents[i].retained = ps2audio::sdAdmaEnabled();
++                            }
++                            // AUDIO_002-5 (PS2X_SD_ADMA=1): retain the audio PES
++                            // like a video PES (P4.2.3). libmpeg stops the demux
++                            // when any stream callback returns 0 and the caller
++                            // resubmits the packet later; dropping it loses PCM
++                            // that is not a multiple of the 1024-byte SPU2 block,
++                            // so all later audio would be misaligned. Otherwise the
++                            // previous policy: audio callbacks are carried in the
++                            // next video's continuation and their result ignored.
++                            if (ps2audio::sdAdmaEnabled())
++                            {
++                                return;
+                             }
+-                            // Preserve the existing audio return policy while
+-                            // retaining callback order. Audio callbacks already
+-                            // parsed before the next video PES are carried in
+-                            // that video's continuation sequence.
+                             erasePssPrefix(playback, packetEnd);
+                             continue;
+                         }
+@@ -1821,7 +1834,7 @@ namespace ps2_stubs
+                 playback.pssGuestAddrs.push_back(guestAddr + static_cast<uint32_t>(i));
+             }
+             if (std::none_of(callbackEvents.begin(), callbackEvents.end(), [](const MpegStreamCallbackEvent &event)
+-                             { return event.video; }))
++                             { return event.retained; }))
+             {
+                 processPssBuffer(mpegAddr, playback, callbackEvents);
+             }
+@@ -2124,8 +2137,9 @@ namespace ps2_stubs
+ 
+         bool p423HasVideoEvent(const std::vector<MpegStreamCallbackEvent> &events)
+         {
++            // AUDIO_002-5: any retained PES (video or audio) starts a callback transaction.
+             return std::any_of(events.begin(), events.end(), [](const MpegStreamCallbackEvent &event)
+-                               { return event.video; });
++                               { return event.retained; });
+         }
+ 
+         bool p423CallbackAt(const std::vector<MpegStreamCallbackEvent> &events,
+@@ -2209,7 +2223,7 @@ namespace ps2_stubs
+             transaction.events = std::move(events);
+             const auto videoIt = std::find_if(
+                 transaction.events.begin(), transaction.events.end(), [](const MpegStreamCallbackEvent &event)
+-                { return event.video; });
++                { return event.retained; });
+             if (videoIt == transaction.events.end())
+             {
+                 transaction.packetEnd = 0u;
+@@ -2273,7 +2287,7 @@ namespace ps2_stubs
+                         transaction.acceptedCallbacks,
+                         completedEvent,
+                         completedCallback);
+-                    const bool completedWasVideo = completedWasMapped && completedEvent.video;
++                    const bool completedWasVideo = completedWasMapped && completedEvent.retained; // AUDIO_002-5
+                     if (completedWasVideo && callbackV0 == 0u)
+                     {
+                         const size_t confirmedPhysical = transaction.totalBufferBytes >= playback.pssBuffer.size()
+@@ -2287,7 +2301,7 @@ namespace ps2_stubs
+                         size_t callbacksBeforeVideoPacket = 0u;
+                         for (const MpegStreamCallbackEvent &event : transaction.events)
+                         {
+-                            if (event.video)
++                            if (event.retained)
+                             {
+                                 break;
+                             }
+@@ -2333,7 +2347,7 @@ namespace ps2_stubs
+ 
+                     const auto committedVideoIt = std::find_if(
+                         transaction.events.begin(), transaction.events.end(), [](const MpegStreamCallbackEvent &event)
+-                        { return event.video; });
++                        { return event.retained; });
+                     if (committedVideoIt == transaction.events.end())
+                     {
+                         returnedConsumed = 0u;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index 5221e0e..aaa9b5d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -64,6 +64,65 @@ namespace ps2_stubs
+         std::unordered_map<uint32_t, uint32_t> g_sifCmdHandlers;
+         std::map<uint32_t, uint32_t> g_sifHeapAllocations;
+         std::array<uint8_t, kIopHeapLimit - kIopHeapBase> g_sifHeapStorage{};
++
++        // AUDIO_002-5 (patch 40): 24-bit alias of the start of the SIF heap. libsd reports SPU2 transfer positions
++        // as 24-bit IOP addresses (sceSdBlockTransStatus), and games subtract the address returned by
++        // sceSifAllocIopHeap from them (SLES_503.58 iopGetArea@0x47A320). Real IOP heap addresses are below 2 MiB;
++        // 0x04xxxxxx is not representable, so the subtraction is always negative. Blocks whose storage offset fits
++        // in the alias are handed out at kIopHeapAliasBase + offset instead (the storage, the allocation map keys and
++        // the checkpoint codec stay canonical, 0x04xxxxxx). The alias lies in EE kernel memory (0x00000000-0x0007FFFF):
++        // games cannot allocate there, and the runtime only uses 0x2F0-0x2F8 and the syscall mirror at 0x11F80 +/- 4n.
++        //
++        // Opt-in: PS2X_IOP_HEAP_ALIAS=base:limit (hex or decimal), e.g. 0x00020000:0x00080000 for SLES_503.58. The
++        // window must be 64-byte aligned and below 16 MiB; it aliases EE RDRAM numerically, so it must be a range the
++        // game never uses as an EE address (that is why it is not on by default: the upstream invariant is that IOP
++        // heap addresses lie outside EE RDRAM). Unset or invalid: no alias, previous behaviour.
++        struct IopHeapAliasWindow
++        {
++            uint32_t base = 0u;
++            uint32_t limit = 0u;
++        };
++
++        const IopHeapAliasWindow &iopHeapAliasWindow()
++        {
++            static const IopHeapAliasWindow window = [] {
++                IopHeapAliasWindow w{};
++                const char *v = std::getenv("PS2X_IOP_HEAP_ALIAS");
++                if (!v)
++                    return w;
++                char *end = nullptr;
++                const unsigned long long base = std::strtoull(v, &end, 0);
++                if (!end || *end != ':')
++                    return w;
++                char *limitEnd = nullptr;
++                const unsigned long long limit = std::strtoull(end + 1, &limitEnd, 0);
++                // base 0 would hand out the first block as address 0, which the guest reads as a failed allocation.
++                if (!limitEnd || *limitEnd != '\0' || base == 0u || base >= limit || limit > 0x01000000ull ||
++                    (base % kIopHeapAlign) != 0u ||
++                    (limit % kIopHeapAlign) != 0u || limit - base > static_cast<unsigned long long>(kIopHeapLimit - kIopHeapBase))
++                {
++                    std::fprintf(stderr, "[SIF:heap] PS2X_IOP_HEAP_ALIAS=%s ignored (need base:limit, 64-byte aligned, "
++                                         "0<base<limit<=0x1000000, at most the heap size)\n", v);
++                    return w;
++                }
++                w.base = static_cast<uint32_t>(base);
++                w.limit = static_cast<uint32_t>(limit);
++                std::fprintf(stderr, "[SIF:heap] 24-bit alias 0x%08X-0x%08X -> 0x%08X\n", w.base, w.limit, kIopHeapBase);
++                return w;
++            }();
++            return window;
++        }
++
++        bool isIopHeapAliasAddress(uint32_t address)
++        {
++            const IopHeapAliasWindow &w = iopHeapAliasWindow();
++            return address >= w.base && address < w.limit;
++        }
++
++        uint32_t canonicalIopHeapAddress(uint32_t address)
++        {
++            return isIopHeapAliasAddress(address) ? kIopHeapBase + (address - iopHeapAliasWindow().base) : address;
++        }
+         uint32_t g_sifCmdBuffer = 0u;
+         uint32_t g_sifSysCmdBuffer = 0u;
+         bool g_sifCmdInitialized = false;
+@@ -167,11 +226,18 @@ namespace ps2_stubs
+                         alignedSize,
+                         uint8_t{0});
+             g_iopHeapNext = candidate + alignedSize;
++            // AUDIO_002-5: hand out the 24-bit alias when the whole block fits in it.
++            const IopHeapAliasWindow &alias = iopHeapAliasWindow();
++            if (alias.limit != 0u && candidate + alignedSize - kIopHeapBase <= alias.limit - alias.base)
++            {
++                return alias.base + (candidate - kIopHeapBase);
++            }
+             return candidate;
+         }
+ 
+         bool freeSifHeapBlock(uint32_t addr)
+         {
++            addr = canonicalIopHeapAddress(addr); // AUDIO_002-5
+             std::lock_guard<std::mutex> lock(g_sifHeapMutex);
+             const auto it = g_sifHeapAllocations.find(addr);
+             if (it == g_sifHeapAllocations.end())
+@@ -197,6 +263,7 @@ namespace ps2_stubs
+ 
+         bool isAllocatedSifHeapRangeLocked(uint32_t address, size_t size)
+         {
++            address = canonicalIopHeapAddress(address); // AUDIO_002-5
+             if (address < kIopHeapBase || address >= kIopHeapLimit || size > static_cast<size_t>(kIopHeapLimit - address))
+             {
+                 return false;
+@@ -464,9 +531,14 @@ namespace ps2_stubs
+         return true;
+     }
+ 
++    bool sifIopHeapAliasActive()
++    {
++        return iopHeapAliasWindow().limit != 0u; // AUDIO_002-5
++    }
++
+     bool isSifIopHeapAddress(uint32_t address)
+     {
+-        return address >= kIopHeapBase && address < kIopHeapLimit;
++        return (address >= kIopHeapBase && address < kIopHeapLimit) || isIopHeapAliasAddress(address);
+     }
+ 
+     bool isSifIopHeapRange(uint32_t address, size_t size)
+@@ -477,6 +549,7 @@ namespace ps2_stubs
+ 
+     bool readSifIopHeap(uint32_t address, void *destination, size_t size)
+     {
++        address = canonicalIopHeapAddress(address); // AUDIO_002-5
+         if (!destination && size != 0u)
+         {
+             return false;
+@@ -497,6 +570,7 @@ namespace ps2_stubs
+ 
+     bool writeSifIopHeap(uint32_t address, const void *source, size_t size)
+     {
++        address = canonicalIopHeapAddress(address); // AUDIO_002-5
+         if (!source && size != 0u)
+         {
+             return false;
+@@ -517,6 +591,7 @@ namespace ps2_stubs
+ 
+     bool zeroSifIopHeap(uint32_t address, size_t size)
+     {
++        address = canonicalIopHeapAddress(address); // AUDIO_002-5
+         std::lock_guard<std::mutex> lock(g_sifHeapMutex);
+         if (!isAllocatedSifHeapRangeLocked(address, size))
+         {
+diff --git a/ps2xRuntime/src/lib/audio/pss_audio.h b/ps2xRuntime/src/lib/audio/pss_audio.h
+new file mode 100644
+index 0000000..1821d48
+--- /dev/null
++++ b/ps2xRuntime/src/lib/audio/pss_audio.h
+@@ -0,0 +1,206 @@
++#pragma once
++// AUDIO_002-5 (patch 40, experimental): PSS movie PCM through the SPU2 ADMA block transfer of libsd (header-only,
++// private to the runtime; not included by recompiled EE code).
++//
++// Guest contract (SLES_503.58, Sony ezmpeg audiodec): the EE copies 16-bit little-endian PCM to an IOP buffer in blocks
++// of 1024 bytes = 512 bytes of left (256 samples) followed by 512 bytes of right, starts sceSdBlockTrans (loop) on the
++// buffer and refills the part behind sceSdBlockTransStatus. The SPU2 consumes one block per 256 frames at 48 kHz.
++//
++// Two clocks:
++//   guest clock  : the transfer position is a function of the emulated time only -- frames = fields * 48000 / fieldHz
++//                  since the BlockTrans call, the same rate as the patch-37 mixer -- so what the guest sees, what it
++//                  refills and what the WAV contains do not depend on host speed.
++//   device clock : the mixer forwards the guest-timed mix to the device (group Pss, DeviceMode::Guest); there is no
++//                  free-running copy: the PCM only exists once the guest has sent it.
++
++#include "ps2x/iop/audio_dsp.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <string>
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <cstring>
++#include <cstdio>
++#include <functional>
++#include <memory>
++
++namespace ps2_stubs
++{
++    // Kernel/Stubs/SIF.cpp: true when PS2X_IOP_HEAP_ALIAS holds a valid 24-bit window.
++    bool sifIopHeapAliasActive();
++
++    // Kernel/Stubs/Audio.cpp: read-only snapshot of the libsd block transfer of `core` (tests and diagnostics).
++    struct SdAdmaDebugState
++    {
++        bool active = false;
++        bool loop = false;
++        bool hasSource = false;
++        bool clockStarted = false;
++        uint32_t base = 0u;
++        uint32_t size = 0u;
++        int32_t bvolLeft = 0;
++        int32_t bvolRight = 0;
++    };
++    SdAdmaDebugState sdAdmaDebugState(uint32_t core);
++}
++
++namespace ps2audio
++{
++    // PS2X_SD_ADMA=1 enables the guest-clocked BlockTrans, the Pss mixer source and the retention of audio PES
++    // packets until their callback returns. Off by default: the libsd stub keeps its previous behaviour (+1024 bytes
++    // per status call) and the demux keeps dropping audio callbacks that return 0. It needs IOP buffer addresses that
++    // fit in 24 bits (PS2X_IOP_HEAP_ALIAS); without them the guest never refills the buffer, and with retention the
++    // movie would wait forever for its audio ring to drain.
++    //
++    // Effective only together with an active PS2X_IOP_HEAP_ALIAS: PS2X_SD_ADMA=1 alone is ignored with a notice
++    // (AUDIO_002-5 final gate), so that configuration behaves exactly like the default one.
++    inline bool sdAdmaEnabled()
++    {
++        static const bool enabled = [] {
++            const char *v = std::getenv("PS2X_SD_ADMA");
++            if (!v || std::string(v) != "1")
++                return false;
++            if (!ps2_stubs::sifIopHeapAliasActive())
++            {
++                std::fprintf(stderr, "[AUDIO:adma] PS2X_SD_ADMA=1 ignored: it needs a valid PS2X_IOP_HEAP_ALIAS "
++                                     "(IOP buffers must be 24-bit addresses for libsd's transfer status)\n");
++                return false;
++            }
++            return true;
++        }();
++        return enabled;
++    }
++
++    inline constexpr uint32_t kAdmaBlockBytes = 1024u;  // 512 B left + 512 B right
++    inline constexpr uint32_t kAdmaHalfBytes = 512u;
++    inline constexpr uint32_t kAdmaBlockFrames = 256u;
++
++    // Frames the ADMA has consumed after `fields` complete fields (floor, like the mixer's per-field split).
++    inline uint64_t admaFramesAfterFields(uint64_t fields, uint32_t fieldHz)
++    {
++        return fieldHz == 0u ? 0u : fields * ps2x::iop::audio::kMixRate / fieldHz;
++    }
++
++    // Block-aligned byte offset of the block being played after `frames` frames, inside an area of `areaBytes`
++    // (multiple of 1024) entered at block-aligned `startOffset`. A non-loop transfer stops at the end of the area.
++    inline uint32_t admaOffset(uint32_t startOffset, uint64_t frames, uint32_t areaBytes, bool loop)
++    {
++        if (areaBytes < kAdmaBlockBytes)
++            return 0u;
++        const uint64_t bytes = static_cast<uint64_t>(startOffset) + (frames / kAdmaBlockFrames) * kAdmaBlockBytes;
++        if (loop)
++            return static_cast<uint32_t>(bytes % areaBytes);
++        return static_cast<uint32_t>(std::min<uint64_t>(bytes, areaBytes));
++    }
++
++    // SPU2 core input volume of the ADMA data (libsd SD_P_BVOLL / SD_P_BVOLR), as written by the guest.
++    struct AdmaVolume
++    {
++        std::atomic<int32_t> left{0};
++        std::atomic<int32_t> right{0};
++    };
++
++    // Signed 16-bit volume, 0x7FFF ~ unity: (x * v) >> 15 (arithmetic), saturated.
++    inline int16_t applyAdmaVolume(int16_t sample, int16_t volume)
++    {
++        const int32_t v = (static_cast<int32_t>(sample) * static_cast<int32_t>(volume)) >> 15;
++        return static_cast<int16_t>(std::clamp(v, -32768, 32767));
++    }
++
++    // Mixer source for one SPU2 core's ADMA block transfer. Frame k of the source is frame k of the transfer, so the
++    // mixer's render of field T-1 at VBlank T reads exactly the blocks the guest saw being played during tick T-1.
++    // The block being played is never refilled by the guest (it writes up to status - 0x400), and the source reads
++    // each block when it renders it (no caching across fields). read(address, dst, size) reads the IOP buffer.
++    class AdmaBlockSource final : public ps2x::iop::audio::AudioRenderSource
++    {
++    public:
++        using ReadFn = std::function<bool(uint32_t address, void *dst, size_t size)>;
++
++        AdmaBlockSource(uint32_t base, uint32_t areaBytes, uint32_t startOffset, bool loop,
++                        std::shared_ptr<const AdmaVolume> volume, ReadFn read)
++            : m_base(base),
++              m_area(areaBytes - areaBytes % kAdmaBlockBytes),
++              m_start(startOffset - startOffset % kAdmaBlockBytes),
++              m_loop(loop),
++              m_volume(std::move(volume)),
++              m_read(std::move(read))
++        {
++            if (m_area != 0u)
++                m_start %= m_area;
++        }
++
++        size_t render(int16_t *stereo, size_t frames) override
++        {
++            const int16_t volL = m_volume ? static_cast<int16_t>(m_volume->left.load(std::memory_order_relaxed)) : 0;
++            const int16_t volR = m_volume ? static_cast<int16_t>(m_volume->right.load(std::memory_order_relaxed)) : 0;
++            uint64_t cachedBlock = UINT64_MAX;
++            size_t done = 0;
++            while (done < frames && !m_finished)
++            {
++                if (m_area == 0u)
++                {
++                    m_finished = true;
++                    break;
++                }
++                const uint64_t block = m_frame / kAdmaBlockFrames;
++                const uint64_t byteInArea = static_cast<uint64_t>(m_start) + block * kAdmaBlockBytes;
++                if (!m_loop && byteInArea >= m_area)
++                {
++                    m_finished = true;
++                    break;
++                }
++                if (block != cachedBlock)
++                {
++                    const uint32_t offset = static_cast<uint32_t>(byteInArea % m_area);
++                    if (!m_read || !m_read(m_base + offset, m_block.data(), m_block.size()))
++                    {
++                        m_block.fill(0u);
++                        ++m_readFailures;
++                    }
++                    cachedBlock = block;
++                }
++                const uint32_t n = static_cast<uint32_t>(m_frame % kAdmaBlockFrames);
++                const size_t take = std::min<size_t>(frames - done, kAdmaBlockFrames - n);
++                for (size_t i = 0; i < take; ++i)
++                {
++                    int16_t l, r;
++                    std::memcpy(&l, m_block.data() + 2u * (n + i), 2u);
++                    std::memcpy(&r, m_block.data() + kAdmaHalfBytes + 2u * (n + i), 2u);
++                    stereo[(done + i) * 2u] = applyAdmaVolume(l, volL);
++                    stereo[(done + i) * 2u + 1u] = applyAdmaVolume(r, volR);
++                }
++                done += take;
++                m_frame += take;
++            }
++            return done;
++        }
++
++        [[nodiscard]] bool finished() const override { return m_finished; }
++        [[nodiscard]] uint64_t framesRendered() const { return m_frame; }
++        [[nodiscard]] uint64_t readFailures() const { return m_readFailures; }
++
++    private:
++        uint32_t m_base;
++        uint32_t m_area;
++        uint32_t m_start;
++        bool m_loop;
++        std::shared_ptr<const AdmaVolume> m_volume;
++        ReadFn m_read;
++        std::array<uint8_t, kAdmaBlockBytes> m_block{};
++        uint64_t m_frame = 0u;
++        uint64_t m_readFailures = 0u;
++        bool m_finished = false;
++    };
++
++    // Bridge to the IOP host's mixer (defined in ps2_iop_host.cpp; the host registers itself on construction).
++    namespace bridge
++    {
++        [[nodiscard]] bool mixerEnabled();
++        [[nodiscard]] uint32_t fieldHz();
++        uint64_t addSource(ps2x::iop::audio::AudioGroup group,
++                           std::unique_ptr<ps2x::iop::audio::AudioRenderSource> source);
++        void removeSource(uint64_t id);
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index dd17013..6e23ec8 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -9,6 +9,7 @@
+ #include "Kernel/Stubs/MemoryCard.h"
+ #include "Kernel/Syscalls/Common.h"
+ #include "audio/audio_mixer.h"
++#include "audio/pss_audio.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -81,9 +82,44 @@ void PS2IopHostAdapter::CallScope::release()
+     }
+ }
+ 
++// AUDIO_002-5 (patch 40): the libsd stubs (Kernel/Stubs/Audio.cpp) reach the mixer through this bridge; the runtime
++// owns exactly one IOP host adapter.
++namespace
++{
++    std::atomic<PS2IopHostAdapter *> g_audioBridgeHost{nullptr};
++}
++
++namespace ps2audio::bridge
++{
++    bool mixerEnabled()
++    {
++        PS2IopHostAdapter *host = g_audioBridgeHost.load();
++        return host && host->audioMixerEnabled();
++    }
++
++    uint32_t fieldHz()
++    {
++        static const uint32_t envHz = MixerConfig::fromEnv().fieldHz; // also when the mixer is off
++        return envHz;
++    }
++
++    uint64_t addSource(ps2x::iop::audio::AudioGroup group, std::unique_ptr<ps2x::iop::audio::AudioRenderSource> source)
++    {
++        PS2IopHostAdapter *host = g_audioBridgeHost.load();
++        return host ? host->addGuestAudioSource(group, std::move(source)) : 0u;
++    }
++
++    void removeSource(uint64_t id)
++    {
++        if (PS2IopHostAdapter *host = g_audioBridgeHost.load())
++            host->removeGuestAudioSource(id);
++    }
++}
++
+ PS2IopHostAdapter::PS2IopHostAdapter(PS2Runtime &runtime)
+     : m_runtime(runtime)
+ {
++    g_audioBridgeHost.store(this); // AUDIO_002-5
+     // AUDIO_002-1/2 (patch 37): PS2X_AUDIO_MIXER=0 keeps the previous streamPcm path (no mixer object at all).
+     const char *mixer = std::getenv("PS2X_AUDIO_MIXER");
+     if (!mixer || std::string(mixer) != "0")
+@@ -107,6 +143,8 @@ PS2IopHostAdapter::PS2IopHostAdapter(PS2Runtime &runtime)
+ 
+ PS2IopHostAdapter::~PS2IopHostAdapter()
+ {
++    PS2IopHostAdapter *self = this; // AUDIO_002-5: no new bridge calls into a host being destroyed
++    g_audioBridgeHost.compare_exchange_strong(self, nullptr);
+     shutdownAudio();
+     std::lock_guard<std::mutex> lock(m_hostFileMutex);
+     for (auto &[handle, file] : m_hostFiles)
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index b5ae974..ac02713 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -63,6 +63,8 @@ add_library(ps2_test_lib STATIC
+     src/audio_mixer_tests.cpp
+     src/audio_xag_volume_tests.cpp
+     src/audio_xag_checkpoint_tests.cpp
++    src/audio_pss_tests.cpp
++    src/pss_sif_libsd_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/audio_pss_tests.cpp b/ps2xTest/src/audio_pss_tests.cpp
+new file mode 100644
+index 0000000..66d777a
+--- /dev/null
++++ b/ps2xTest/src/audio_pss_tests.cpp
+@@ -0,0 +1,271 @@
++// AUDIO_002-5 (patch 40): SPU2 ADMA block source for PSS movie PCM (libsd BlockTrans) and its guest clock.
++#include "MiniTest.h"
++#include "audio/audio_mixer.h"
++#include "audio/pss_audio.h"
++
++#include <cstring>
++#include <memory>
++#include <vector>
++
++using namespace ps2audio;
++
++namespace
++{
++    constexpr uint32_t kBase = 0x00020000u;  // IOP buffer address as the guest sees it
++    constexpr uint32_t kArea = 0x6000u;      // SLES_503.58 MoviePcmInit: 24 blocks
++    constexpr uint32_t kFieldHz = 50u;       // 960 frames per field
++
++    // Interleaved stereo s16 stream as the PSS stores it: blocks of 512 B left + 512 B right.
++    std::vector<uint8_t> makeBody(size_t blocks, uint32_t seed)
++    {
++        std::vector<uint8_t> body(blocks * kAdmaBlockBytes);
++        uint32_t x = seed;
++        for (size_t i = 0; i < body.size(); i += 2)
++        {
++            x = x * 1103515245u + 12345u;
++            const int16_t s = static_cast<int16_t>(x >> 16);
++            std::memcpy(body.data() + i, &s, 2);
++        }
++        return body;
++    }
++
++    int16_t bodySample(const std::vector<uint8_t> &body, uint64_t frame, int channel)
++    {
++        const size_t at = static_cast<size_t>(frame / kAdmaBlockFrames) * kAdmaBlockBytes +
++                          (channel ? kAdmaHalfBytes : 0u) + static_cast<size_t>(frame % kAdmaBlockFrames) * 2u;
++        int16_t s;
++        std::memcpy(&s, body.data() + at, 2);
++        return s;
++    }
++
++    struct FakeIop
++    {
++        std::vector<uint8_t> mem = std::vector<uint8_t>(kArea, 0u);
++        uint64_t reads = 0;
++        bool fail = false;
++        AdmaBlockSource::ReadFn reader()
++        {
++            return [this](uint32_t address, void *dst, size_t size) {
++                ++reads;
++                if (fail || address < kBase || address + size > kBase + mem.size())
++                    return false;
++                std::memcpy(dst, mem.data() + (address - kBase), size);
++                return true;
++            };
++        }
++    };
++
++    std::shared_ptr<AdmaVolume> unity()
++    {
++        auto v = std::make_shared<AdmaVolume>();
++        v->left = 0x7FFF;
++        v->right = 0x7FFF;
++        return v;
++    }
++
++    // Literal model of SLES_503.58 audiodec (audioDecSendToIOP + iopGetArea + sendToIOP2area) against the stub clock:
++    // preset fills the whole area, BlockTrans(loop) starts at tick t0, at VBlank T the mixer renders field T-1, then
++    // every second tick the guest reads the block status and refills [last, status - 0x400) from its stream.
++    // Returns the rendered PCM; `stopFeedingAt` (tick) simulates a guest that stops refilling.
++    std::vector<int16_t> simulateMovie(const std::vector<uint8_t> &body, uint64_t ticks, AdmaVolume *volOut = nullptr,
++                                       uint64_t stopFeedingAt = UINT64_MAX)
++    {
++        FakeIop iop;
++        size_t sent = 0;
++        std::memcpy(iop.mem.data(), body.data(), kArea); // preset
++        sent = kArea;
++        uint32_t last = 0;
++        auto vol = unity();
++        AdmaBlockSource src(kBase, kArea, 0u, true, vol, iop.reader());
++        std::vector<int16_t> out;
++        const uint64_t t0 = 1000;
++        std::vector<int16_t> field(960 * 2);
++        for (uint64_t t = t0 + 1; t <= t0 + ticks; ++t)
++        {
++            const size_t got = src.render(field.data(), 960);
++            out.insert(out.end(), field.begin(), field.begin() + static_cast<std::ptrdiff_t>(got) * 2);
++            if ((t - t0) % 2u == 0u && (t - t0) < stopFeedingAt)
++            {
++                const uint32_t pos = admaOffset(0u, admaFramesAfterFields(t - t0, kFieldHz), kArea, true);
++                const uint32_t area = (pos + kArea - last - kAdmaBlockBytes) % kArea; // iopGetArea, block aligned
++                const uint32_t want = area - area % kAdmaBlockBytes;
++                for (uint32_t i = 0; i < want && sent < body.size(); ++i, ++sent)
++                    iop.mem[(last + i) % kArea] = body[sent];
++                last = (last + want) % kArea;
++            }
++        }
++        if (volOut)
++        {
++            volOut->left = vol->left.load();
++            volOut->right = vol->right.load();
++        }
++        return out;
++    }
++}
++
++void register_audio_pss_tests()
++{
++    MiniTest::Case("AudioPssAdma", [](TestCase &tc) {
++        tc.Run("a block is 512 bytes of left then 512 bytes of right, little-endian s16", [](TestCase &t) {
++            FakeIop iop;
++            const auto body = makeBody(kArea / kAdmaBlockBytes, 7u);
++            std::memcpy(iop.mem.data(), body.data(), kArea);
++            AdmaBlockSource src(kBase, kArea, 0u, true, unity(), iop.reader());
++            std::vector<int16_t> out(2 * 600);
++            t.Equals(src.render(out.data(), 600), size_t(600), "renders all requested frames");
++            bool ok = true;
++            for (uint64_t f = 0; f < 600; ++f)
++                ok = ok && out[f * 2] == applyAdmaVolume(bodySample(body, f, 0), 0x7FFF) &&
++                     out[f * 2 + 1] == applyAdmaVolume(bodySample(body, f, 1), 0x7FFF);
++            t.IsTrue(ok, "frame f = (L[f % 256], R[f % 256]) of block f / 256");
++        });
++
++        tc.Run("clock: 960 frames per PAL field, one 1024-byte block per 256 frames, loop wraps the area", [](TestCase &t) {
++            t.Equals(admaFramesAfterFields(1, 50), uint64_t(960), "one field");
++            t.Equals(admaFramesAfterFields(50, 50), uint64_t(48000), "one second");
++            t.Equals(admaFramesAfterFields(7, 47), uint64_t(7 * 48000 / 47), "rates not dividing 48000 floor");
++            t.Equals(admaOffset(0, 960, kArea, true), uint32_t(3 * 1024), "3.75 blocks -> block 3");
++            t.Equals(admaOffset(0, 24 * 256, kArea, true), uint32_t(0), "24 blocks wrap to 0");
++            t.Equals(admaOffset(0x5C00, 256, kArea, true), uint32_t(0), "resume at the last block wraps");
++            t.Equals(admaOffset(0, 100 * 256, kArea, false), kArea, "a non-loop transfer stops at the end");
++            t.Equals(admaOffset(0, 256, 0x200, true), uint32_t(0), "area smaller than a block");
++        });
++
++        tc.Run("guest protocol model: the WAV is the PCM stream, in order, nothing lost or repeated", [](TestCase &t) {
++            const auto body = makeBody(600, 11u); // 600 blocks = 3.2 s
++            const auto out = simulateMovie(body, 150);
++            bool ok = out.size() == 150u * 960u * 2u;
++            for (uint64_t f = 0; ok && f < 150u * 960u; ++f)
++                ok = out[f * 2] == applyAdmaVolume(bodySample(body, f, 0), 0x7FFF) &&
++                     out[f * 2 + 1] == applyAdmaVolume(bodySample(body, f, 1), 0x7FFF);
++            t.IsTrue(ok, "150 fields equal the stream (the block being played is never refilled)");
++        });
++
++        tc.Run("deterministic replay of the same stream", [](TestCase &t) {
++            const auto body = makeBody(400, 3u);
++            t.IsTrue(simulateMovie(body, 100) == simulateMovie(body, 100), "identical PCM");
++        });
++
++        tc.Run("underflow: a guest that stops refilling replays the stale area (no block, no crash)", [](TestCase &t) {
++            const auto body = makeBody(600, 5u);
++            const auto out = simulateMovie(body, 120, nullptr, 60);
++            const uint64_t lastFed = admaFramesAfterFields(58, kFieldHz); // last refill at tick t0 + 58
++            t.Equals(out.size(), size_t(120 * 960 * 2), "the source keeps producing");
++            bool fresh = true;
++            for (uint64_t f = 0; f < lastFed; ++f)
++                fresh = fresh && out[f * 2] == applyAdmaVolume(bodySample(body, f, 0), 0x7FFF);
++            t.IsTrue(fresh, "everything up to the last refill is the stream");
++            // Once the refills stop the source keeps looping over the area: one loop (24 blocks) later the same
++            // slot, with the same stale content, is played again.
++            const uint64_t f = 110u * 960u, g = f - 24u * 256u;
++            t.IsTrue(out[f * 2] == out[g * 2] && out[f * 2 + 1] == out[g * 2 + 1], "stale area replayed one loop later");
++        });
++
++        tc.Run("volume: unity, mute, signed values below zero, latched per render call", [](TestCase &t) {
++            t.Equals(int(applyAdmaVolume(1000, 0x7FFF)), int((1000 * 0x7FFF) >> 15), "0x7FFF");
++            t.Equals(int(applyAdmaVolume(-32768, 0x7FFF)), -32767, "0x7FFF on -32768");
++            t.Equals(int(applyAdmaVolume(12345, 0)), 0, "mute");
++            t.Equals(int(applyAdmaVolume(1000, static_cast<int16_t>(0xF77F))), int((1000 * -0x881) >> 15),
++                     "0xF77F (u16 wrap of the game's fade) is negative");
++            t.Equals(int(applyAdmaVolume(-32768, -32768)), 32767, "saturates");
++            FakeIop iop;
++            const auto body = makeBody(24, 9u);
++            std::memcpy(iop.mem.data(), body.data(), kArea);
++            auto vol = std::make_shared<AdmaVolume>();
++            vol->left = 0x4000;
++            vol->right = 0;
++            AdmaBlockSource src(kBase, kArea, 0u, true, vol, iop.reader());
++            std::vector<int16_t> out(2 * 100);
++            src.render(out.data(), 50);
++            vol->left = 0;
++            src.render(out.data() + 100, 50);
++            t.Equals(out[0], applyAdmaVolume(bodySample(body, 0, 0), 0x4000), "left half volume");
++            t.Equals(int(out[1]), 0, "right muted");
++            t.Equals(int(out[100]), 0, "new volume from the next render call");
++        });
++
++        tc.Run("empty or unreadable buffer gives silence and is counted", [](TestCase &t) {
++            FakeIop iop;
++            iop.fail = true;
++            AdmaBlockSource src(kBase, kArea, 0u, true, unity(), iop.reader());
++            std::vector<int16_t> out(2 * 960, 7);
++            t.Equals(src.render(out.data(), 960), size_t(960), "keeps the clock");
++            bool silent = true;
++            for (int16_t s : out)
++                silent = silent && s == 0;
++            t.IsTrue(silent, "silence");
++            t.Equals(src.readFailures(), uint64_t(4), "one failure per block read (3.75 blocks)");
++            AdmaBlockSource none(kBase, 0x200u, 0u, true, unity(), iop.reader());
++            t.Equals(none.render(out.data(), 960), size_t(0), "an area smaller than a block produces nothing");
++            t.IsTrue(none.finished(), "and finishes");
++        });
++
++        tc.Run("block lengths: area and start offset are aligned down to blocks; non-loop transfer ends", [](TestCase &t) {
++            FakeIop iop;
++            const auto body = makeBody(24, 21u);
++            std::memcpy(iop.mem.data(), body.data(), kArea);
++            AdmaBlockSource src(kBase, kArea + 100u, 0x400u + 17u, false, unity(), iop.reader());
++            std::vector<int16_t> out(2 * 256 * 30);
++            const size_t got = src.render(out.data(), 256 * 30);
++            t.Equals(got, size_t(23 * 256), "23 blocks from block 1 to the end of a 24-block area");
++            t.IsTrue(src.finished(), "finished");
++            t.Equals(out[0], applyAdmaVolume(bodySample(body, 256, 0), 0x7FFF), "starts at block 1");
++        });
++
++        tc.Run("pause/resume: a transfer entered at the pause block continues the stream", [](TestCase &t) {
++            FakeIop iop;
++            const auto body = makeBody(24, 33u);
++            std::memcpy(iop.mem.data(), body.data(), kArea);
++            AdmaBlockSource a(kBase, kArea, 0u, true, unity(), iop.reader());
++            std::vector<int16_t> first(2 * 960 * 2), second(2 * 960);
++            a.render(first.data(), 960 * 2);
++            const uint32_t pause = admaOffset(0u, 960u * 2u, kArea, true); // STOP status: block 7
++            AdmaBlockSource b(kBase, kArea, pause, true, unity(), iop.reader());
++            b.render(second.data(), 960);
++            t.Equals(second[0], applyAdmaVolume(bodySample(body, 7 * 256, 0), 0x7FFF), "resumes at block 7");
++        });
++
++        tc.Run("mixer: movie change and interruption leave exactly one source; removal stops the PCM", [](TestCase &t) {
++            MixerConfig cfg;
++            cfg.device = false;
++            AudioMixer mixer(cfg);
++            FakeIop iopA, iopB;
++            const auto bodyA = makeBody(24, 41u), bodyB = makeBody(24, 42u);
++            std::memcpy(iopA.mem.data(), bodyA.data(), kArea);
++            std::memcpy(iopB.mem.data(), bodyB.data(), kArea);
++            const uint64_t a = mixer.addSource(AudioGroup::Pss,
++                                               std::make_unique<AdmaBlockSource>(kBase, kArea, 0u, true, unity(), iopA.reader()));
++            for (uint64_t tick = 1; tick <= 5; ++tick)
++                mixer.onVBlank(tick);
++            mixer.removeSource(a); // STOP of the first movie
++            const uint64_t b = mixer.addSource(AudioGroup::Pss,
++                                               std::make_unique<AdmaBlockSource>(kBase, kArea, 0u, true, unity(), iopB.reader()));
++            t.Equals(mixer.sourceCount(), size_t(1), "one source after the change");
++            const uint64_t readsA = iopA.reads;
++            for (uint64_t tick = 6; tick <= 8; ++tick)
++                mixer.onVBlank(tick);
++            t.Equals(iopA.reads, readsA, "the old movie's buffer is no longer read");
++            t.IsTrue(iopB.reads > 0, "the new one is");
++            mixer.removeSource(b);
++            mixer.removeSource(b); // idempotent (STOP after a reset)
++            t.Equals(mixer.sourceCount(), size_t(0), "no source left");
++        });
++
++        tc.Run("close with an active transfer: mixer shutdown destroys the source", [](TestCase &t) {
++            MixerConfig cfg;
++            cfg.device = false;
++            auto mixer = std::make_unique<AudioMixer>(cfg);
++            FakeIop iop;
++            mixer->addSource(AudioGroup::Pss, std::make_unique<AdmaBlockSource>(kBase, kArea, 0u, true, unity(), iop.reader()));
++            mixer->onVBlank(1);
++            mixer->onVBlank(2);
++            mixer->shutdown();
++            t.Equals(mixer->sourceCount(), size_t(0), "sources destroyed");
++            const uint64_t reads = iop.reads;
++            mixer->onVBlank(3);
++            t.Equals(iop.reads, reads, "nothing rendered after shutdown");
++            mixer.reset();
++            t.IsTrue(true, "destroyed cleanly");
++        });
++    });
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 00b658e..616b89f 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -22,6 +22,8 @@ void register_ps2_runtime_expansion_tests();
+ void register_audio_mixer_tests();
+ void register_audio_xag_volume_tests();
+ void register_audio_xag_checkpoint_tests();
++void register_audio_pss_tests();
++void register_pss_sif_libsd_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -48,6 +50,8 @@ int main()
+     register_audio_mixer_tests();
+     register_audio_xag_volume_tests();
+     register_audio_xag_checkpoint_tests();
++    register_audio_pss_tests();
++    register_pss_sif_libsd_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/pss_sif_libsd_tests.cpp b/ps2xTest/src/pss_sif_libsd_tests.cpp
+new file mode 100644
+index 0000000..b10d4cd
+--- /dev/null
++++ b/ps2xTest/src/pss_sif_libsd_tests.cpp
+@@ -0,0 +1,690 @@
++// AUDIO_002-5 (patch 40) final gate: the production SIF heap alias (PS2X_IOP_HEAP_ALIAS) and the guest-clocked libsd
++// BlockTrans (PS2X_SD_ADMA), exercised through the real stubs (sceSifAllocIopHeap/FreeIopHeap/SetDma, the IOP host
++// adapter, the SIF and AUDIO checkpoint codecs, sceSdRemote/sceSdRemoteInit).
++//
++// Both switches are read once per process, so these tests take their expectations from the environment the process
++// was started with; the whole suite is meant to be run four times (alias off/on x ADMA off/on). The oracle below is
++// written independently of the runtime: the alias is active for a well-formed window, and ADMA takes effect only
++// when the alias is active (PS2X_SD_ADMA=1 alone is ignored, see the runtime's [AUDIO:adma] notice).
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "ps2_iop_host.h"
++#include "ps2_stubs.h"
++#include "Kernel/Stubs/SIF.h"
++#include "runtime/ee_scheduler.h"
++#include "runtime/checkpoint/checkpoint.h"
++#include "runtime/checkpoint/checkpoint_probes.h"
++#include "audio/pss_audio.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace ps2_stubs
++{
++    void resetSifState();
++}
++
++namespace
++{
++    constexpr uint32_t kHeapBase = 0x04000000u; // canonical SIF heap (Support.h kIopHeapBase)
++    constexpr uint32_t kHeapLimit = 0x04500000u;
++    constexpr uint32_t kDescAddr = 0x00200000u; // EE user memory, outside any alias window
++    constexpr uint32_t kEeData = 0x00200100u;
++    constexpr uint32_t kEeBack = 0x00210000u;
++    constexpr uint32_t kStackAddr = 0x00300000u;
++
++    struct GateConfig
++    {
++        bool aliasActive = false;
++        uint32_t aliasBase = 0u;
++        uint32_t aliasLimit = 0u;
++        bool admaRequested = false;
++        bool admaExpected = false;
++    };
++
++    // Test-side oracle (not the runtime parser): "base:limit", both parsed completely, base != 0, 64-byte aligned,
++    // base < limit <= 16 MiB, window no larger than the heap.
++    const GateConfig &gateConfig()
++    {
++        static const GateConfig cfg = [] {
++            GateConfig c;
++            if (const char *v = std::getenv("PS2X_IOP_HEAP_ALIAS"))
++            {
++                char *end = nullptr;
++                const unsigned long long b = std::strtoull(v, &end, 0);
++                if (end && *end == ':')
++                {
++                    char *end2 = nullptr;
++                    const unsigned long long l = std::strtoull(end + 1, &end2, 0);
++                    if (end2 && *end2 == '\0' && b != 0u && b < l && l <= 0x01000000ull && b % 64u == 0u &&
++                        l % 64u == 0u && l - b <= kHeapLimit - kHeapBase)
++                    {
++                        c.aliasActive = true;
++                        c.aliasBase = static_cast<uint32_t>(b);
++                        c.aliasLimit = static_cast<uint32_t>(l);
++                    }
++                }
++            }
++            const char *a = std::getenv("PS2X_SD_ADMA");
++            c.admaRequested = a && std::string(a) == "1";
++            c.admaExpected = c.admaRequested && c.aliasActive;
++            std::fprintf(stderr, "[PssGate] alias=%d (0x%08X-0x%08X) adma_requested=%d adma_expected=%d\n",
++                         c.aliasActive ? 1 : 0, c.aliasBase, c.aliasLimit, c.admaRequested ? 1 : 0,
++                         c.admaExpected ? 1 : 0);
++            return c;
++        }();
++        return cfg;
++    }
++
++    std::string hx(uint64_t v)
++    {
++        char b[32];
++        std::snprintf(b, sizeof(b), "0x%llX", static_cast<unsigned long long>(v));
++        return b;
++    }
++
++    void setReg(R5900Context &ctx, int reg, uint32_t value)
++    {
++        ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
++    }
++
++    struct SifEnv
++    {
++        std::vector<uint8_t> rdram;
++        R5900Context ctx{};
++        PS2Runtime runtime;
++        SifEnv() : rdram(PS2_RAM_SIZE, 0u) { ps2_stubs::resetSifState(); }
++        ~SifEnv() { ps2_stubs::resetSifState(); }
++
++        uint32_t alloc(uint32_t size)
++        {
++            setReg(ctx, 4, size);
++            ps2_stubs::sceSifAllocIopHeap(rdram.data(), &ctx, &runtime);
++            return ::getRegU32(&ctx, 2);
++        }
++        bool release(uint32_t address)
++        {
++            setReg(ctx, 4, address);
++            ps2_stubs::sceSifFreeIopHeap(rdram.data(), &ctx, &runtime);
++            return static_cast<int32_t>(::getRegU32(&ctx, 2)) == 0;
++        }
++        // One-descriptor sceSifSetDma; returns the transfer id (0 = rejected).
++        int32_t dma(uint32_t src, uint32_t dst, uint32_t size)
++        {
++            const uint32_t desc[4] = {src, dst, size, 0u};
++            std::memcpy(rdram.data() + kDescAddr, desc, sizeof(desc));
++            setReg(ctx, 4, kDescAddr);
++            setReg(ctx, 5, 1u);
++            ps2_stubs::sceSifSetDma(rdram.data(), &ctx, &runtime);
++            return static_cast<int32_t>(::getRegU32(&ctx, 2));
++        }
++        std::vector<uint8_t> pattern(uint32_t at, uint32_t size, uint8_t seed)
++        {
++            std::vector<uint8_t> p(size);
++            for (uint32_t i = 0; i < size; ++i)
++                p[i] = static_cast<uint8_t>(seed + i * 7u);
++            std::memcpy(rdram.data() + at, p.data(), size);
++            return p;
++        }
++    };
++
++    uint32_t canonical(uint32_t address)
++    {
++        const GateConfig &c = gateConfig();
++        return (c.aliasActive && address >= c.aliasBase && address < c.aliasLimit) ? kHeapBase + (address - c.aliasBase)
++                                                                                    : address;
++    }
++
++    // Window where SIF heap addresses are expected to be handed out first.
++    std::pair<uint32_t, uint32_t> firstWindow()
++    {
++        const GateConfig &c = gateConfig();
++        return c.aliasActive ? std::make_pair(c.aliasBase, c.aliasLimit) : std::make_pair(kHeapBase, kHeapLimit);
++    }
++
++    bool contains(const std::vector<uint8_t> &blob, uint32_t a, uint32_t b)
++    {
++        uint8_t pat[8];
++        std::memcpy(pat, &a, 4);
++        std::memcpy(pat + 4, &b, 4);
++        return std::search(blob.begin(), blob.end(), pat, pat + 8) != blob.end();
++    }
++
++    // ---- libsd ----------------------------------------------------------------------------------------------------
++
++    constexpr uint32_t kSdBase = 0x00020000u; // 24-bit IOP address as the guest passes it
++    constexpr uint32_t kSdArea = 0x6000u;     // SLES_503.58 audiodec: 24 blocks of 1024 bytes
++    constexpr uint32_t kSdLoop = 0x10u;
++    constexpr uint32_t kSdStop = 0x02u;
++    constexpr uint32_t kBank = 1u << 24;
++
++    // Independent model of the guest-visible ADMA clock: one 1024-byte block per 256 frames at 48 kHz, 50 fields/s
++    // (the test process runs with the default PS2X_AUDIO_FIELD_HZ), block granularity, loop wraps, bank = upper half.
++    uint32_t modelStatus(uint32_t base, uint32_t area, uint32_t startOffset, uint64_t fields, bool loop)
++    {
++        const uint64_t blocks = fields * 960u / 256u;
++        uint64_t off = (startOffset & ~0x3FFu) + blocks * 0x400u;
++        off = loop ? off % area : std::min<uint64_t>(off, area);
++        const uint32_t bank = (loop && off >= area / 2u) ? kBank : 0u;
++        return bank | ((base + static_cast<uint32_t>(off)) & 0x00FFFFFFu);
++    }
++
++    struct SdEnv
++    {
++        std::vector<uint8_t> rdram;
++        PS2Runtime runtime;
++        R5900Context initCtx{};
++        SdEnv() : rdram(PS2_RAM_SIZE, 0u)
++        {
++            R5900Context mainContext{};
++            runtime.eeScheduler().reset(rdram.data(), mainContext);
++            ps2_stubs::sceSdRemoteInit(rdram.data(), &initCtx, &runtime);
++        }
++        ~SdEnv() { ps2_stubs::sceSdRemoteInit(rdram.data(), &initCtx, &runtime); } // drop sources while the host lives
++
++        // Sets the scheduler VSync tick through its own checkpoint codec (no test hook in the runtime).
++        bool setTick(uint64_t tick)
++        {
++            constexpr uint32_t kFlagMark = 0x001F7F00u;
++            constexpr uint32_t kTickMark = 0x001F7F40u;
++            EeScheduler &s = runtime.eeScheduler();
++            s.setVSyncFlag(kFlagMark, kTickMark);
++            ps2x::checkpoint::ByteWriter w;
++            std::string error;
++            if (!s.serializeCheckpointState(w, error))
++            {
++                std::fprintf(stderr, "[PssGate] SCHED serialize failed: %s\n", error.c_str());
++                return false;
++            }
++            std::vector<uint8_t> b = w.take();
++            uint8_t pat[8];
++            std::memcpy(pat, &kFlagMark, 4);
++            std::memcpy(pat + 4, &kTickMark, 4);
++            const auto it = std::search(b.begin(), b.end(), pat, pat + 8);
++            if (it == b.end() || it - b.begin() < 8)
++                return false;
++            std::memcpy(&*(it - 8), &tick, 8);
++            ps2x::checkpoint::ByteReader r(b.data(), b.size());
++            if (!s.deserializeCheckpointState(r, error))
++            {
++                std::fprintf(stderr, "[PssGate] SCHED deserialize failed: %s\n", error.c_str());
++                return false;
++            }
++            return s.currentVSyncTick() == tick;
++        }
++
++        uint32_t remote(uint32_t cmd, uint32_t core, uint32_t mode, uint32_t a4 = 0u, uint32_t a5 = 0u, uint32_t a6 = 0u)
++        {
++            R5900Context ctx{};
++            setReg(ctx, 29, kStackAddr);
++            setReg(ctx, 4, 1u);
++            setReg(ctx, 5, cmd);
++            setReg(ctx, 6, core);
++            setReg(ctx, 7, mode);
++            setReg(ctx, 8, a4);
++            setReg(ctx, 9, a5);
++            setReg(ctx, 10, a6);
++            ps2_stubs::sceSdRemote(rdram.data(), &ctx, &runtime);
++            return ::getRegU32(&ctx, 2);
++        }
++        uint32_t start(uint32_t core, uint32_t mode, uint32_t base, uint32_t size, uint32_t pause = 0u)
++        {
++            return remote(0x80E0u, core, mode, base, size, pause);
++        }
++        uint32_t stop(uint32_t core) { return remote(0x80E0u, core, kSdStop); }
++        uint32_t status(uint32_t core) { return remote(0x8100u, core, 0u); }
++    };
++
++    // Observed mode: the guest-clocked position does not move between two polls in the same field; the legacy stub
++    // advances 1024 bytes per poll.
++    bool admaObserved()
++    {
++        SdEnv e;
++        e.setTick(10u);
++        e.start(1u, kSdLoop, kSdBase, kSdArea);
++        const uint32_t a = e.status(1u);
++        const uint32_t b = e.status(1u);
++        e.stop(1u);
++        return a == b;
++    }
++}
++
++void register_pss_sif_libsd_tests()
++{
++    MiniTest::Case("PssGateSif", [](TestCase &tc) {
++        tc.Run("configuration: the alias is active exactly for a well-formed PS2X_IOP_HEAP_ALIAS", [](TestCase &t) {
++            const GateConfig &c = gateConfig();
++            SifEnv e;
++            const uint32_t a = e.alloc(0x40u);
++            if (c.aliasActive)
++            {
++                t.Equals(a, c.aliasBase, "the first block is handed out at the alias base");
++                t.IsTrue(ps2_stubs::isSifIopHeapAddress(c.aliasBase), "the alias base is classified as IOP heap");
++                t.IsFalse(ps2_stubs::isSifIopHeapAddress(c.aliasLimit), "the alias limit is exclusive");
++            }
++            else
++            {
++                t.Equals(a, kHeapBase, "without alias the first block is the canonical heap base");
++                t.IsTrue(a >= PS2_RAM_SIZE, "upstream invariant: IOP heap addresses lie outside EE RDRAM");
++                t.IsFalse(ps2_stubs::isSifIopHeapAddress(0x00020000u), "EE kernel addresses are not IOP heap");
++            }
++        });
++
++        tc.Run("allocations are 64-byte aligned, disjoint, ascending and inside the expected window", [](TestCase &t) {
++            SifEnv e;
++            const auto [lo, hi] = firstWindow();
++            const uint32_t sizes[] = {0x6000u, 0x880u, 0x100u, 0x41u, 0x40u, 0x800u};
++            std::vector<std::pair<uint32_t, uint32_t>> blocks;
++            for (uint32_t s : sizes)
++            {
++                const uint32_t a = e.alloc(s);
++                const uint32_t aligned = (s + 63u) & ~63u;
++                t.IsTrue(a != 0u, "allocation of " + hx(s) + " succeeds");
++                t.Equals(a % 64u, 0u, "address " + hx(a) + " is 64-byte aligned");
++                t.IsTrue(a >= lo && a + aligned <= hi, "block " + hx(a) + "+" + hx(aligned) + " lies in the window");
++                if (gateConfig().aliasActive)
++                    t.IsTrue(a + aligned <= 0x01000000u, "aliased blocks are 24-bit addresses");
++                for (const auto &[b, bs] : blocks)
++                    t.IsTrue(a >= b + bs || a + aligned <= b, "block " + hx(a) + " does not overlap " + hx(b));
++                if (!blocks.empty())
++                    t.IsTrue(a > blocks.back().first, "first-fit hands out ascending addresses on a fresh heap");
++                blocks.emplace_back(a, aligned);
++            }
++        });
++
++        tc.Run("free and reuse through the address the guest holds", [](TestCase &t) {
++            SifEnv e;
++            const uint32_t a = e.alloc(0x1000u), b = e.alloc(0x1000u), c = e.alloc(0x1000u);
++            t.IsTrue(e.release(b), "freeing the middle block succeeds");
++            t.IsFalse(e.release(b), "a second free of the same block fails");
++            t.Equals(e.alloc(0x1000u), b, "the hole is reused at the same guest address");
++            t.IsTrue(e.release(a) && e.release(b) && e.release(c), "all blocks free");
++            t.Equals(e.alloc(0x40u), firstWindow().first, "an empty heap starts again at the window base");
++            if (gateConfig().aliasActive)
++                t.IsFalse(e.release(gateConfig().aliasBase + 0x20000u), "freeing an unallocated alias address fails");
++        });
++
++        tc.Run("EE->IOP DMA through the guest address; alias and canonical name the same IOP bytes", [](TestCase &t) {
++            SifEnv e;
++            const uint32_t x = e.alloc(0x6000u);
++            const auto payload = e.pattern(kEeData, 0x400u, 0x31u);
++            t.IsTrue(e.dma(kEeData, x + 0x800u, 0x400u) > 0, "EE->IOP DMA into the block is accepted");
++            std::vector<uint8_t> back(0x400u);
++            t.IsTrue(ps2_stubs::readSifIopHeap(x + 0x800u, back.data(), back.size()) && back == payload,
++                     "the IOP heap read through the guest address returns the payload");
++            std::fill(back.begin(), back.end(), 0u);
++            t.IsTrue(ps2_stubs::readSifIopHeap(canonical(x) + 0x800u, back.data(), back.size()) && back == payload,
++                     "the canonical address " + hx(canonical(x)) + " names the same bytes");
++            t.IsTrue(e.dma(x + 0x800u, kEeBack, 0x400u) > 0, "IOP->EE DMA from the block is accepted");
++            t.IsTrue(std::memcmp(e.rdram.data() + kEeBack, payload.data(), payload.size()) == 0,
++                     "the payload round-trips to EE RDRAM");
++
++            PS2IopHostAdapter host(e.runtime);
++            auto scope = host.enterCall(&e.ctx, e.rdram.data());
++            uint32_t normalized = 0u;
++            t.IsTrue(host.normalizeGuestAddress(x, normalized) && normalized == x,
++                     "IOP modules keep the guest's heap address");
++            std::fill(back.begin(), back.end(), 0u);
++            t.IsTrue(host.readGuest(x + 0x800u, back.data(), back.size()) && back == payload,
++                     "IOP modules read the heap backing through the guest address");
++        });
++
++        tc.Run("no SIF/IOP-host path writes EE RDRAM in the alias window", [](TestCase &t) {
++            SifEnv e;
++            constexpr uint32_t kWinLo = 0x00020000u, kWinHi = 0x00080000u; // the SLES_503.58 window
++            std::memset(e.rdram.data() + kWinLo, 0xA5, kWinHi - kWinLo);
++            const uint32_t x = e.alloc(0x6000u);
++            const uint32_t y = e.alloc(0x880u);
++            e.pattern(kEeData, 0x800u, 0x11u);
++            e.dma(kEeData, x, 0x800u);
++            e.dma(kEeData, y + 0x80u, 0x400u);
++            e.dma(x, kEeBack, 0x800u);
++            {
++                PS2IopHostAdapter host(e.runtime);
++                auto scope = host.enterCall(&e.ctx, e.rdram.data());
++                const uint8_t junk[64] = {1, 2, 3};
++                host.writeGuest(y, junk, sizeof(junk));
++                host.zeroGuest(x + 0x1000u, 0x400u);
++            }
++            ps2_stubs::zeroSifIopHeap(x, 0x6000u);
++            e.release(x);
++            e.release(y);
++            const bool untouched = std::all_of(e.rdram.begin() + kWinLo, e.rdram.begin() + kWinHi,
++                                               [](uint8_t b) { return b == 0xA5u; });
++            t.IsTrue(untouched, "EE RDRAM 0x00020000-0x0007FFFF keeps its sentinel");
++        });
++
++        tc.Run("out-of-bounds ranges are rejected without partial writes", [](TestCase &t) {
++            SifEnv e;
++            const GateConfig &c = gateConfig();
++            const uint32_t x = e.alloc(0x100u);
++            e.pattern(kEeData, 0x200u, 0x55u);
++            t.Equals(e.dma(kEeData, x + 0xC0u, 0x80u), 0, "a transfer that runs past the block is rejected");
++            std::vector<uint8_t> back(0x100u, 0xEEu);
++            t.IsTrue(ps2_stubs::readSifIopHeap(x, back.data(), back.size()) &&
++                         std::all_of(back.begin(), back.end(), [](uint8_t b) { return b == 0u; }),
++                     "the rejected transfer wrote nothing");
++            if (c.aliasActive)
++            {
++                const uint32_t hole = c.aliasBase + 0x20000u;
++                std::memset(e.rdram.data() + hole, 0x3C, 0x40u);
++                t.Equals(e.dma(kEeData, hole, 0x40u), 0, "a transfer to an unallocated alias address is rejected");
++                t.IsTrue(e.rdram[hole] == 0x3Cu && e.rdram[hole + 0x3Fu] == 0x3Cu,
++                         "the EE bytes at that address are untouched");
++                // Fill the alias exactly, then place a canonical block right after it in storage.
++                SifEnv f;
++                const uint32_t span = c.aliasLimit - c.aliasBase;
++                const uint32_t big = f.alloc(span - 0x100u);
++                const uint32_t last = f.alloc(0x100u);
++                const uint32_t after = f.alloc(0x100u);
++                t.Equals(big, c.aliasBase, "the big block starts at the alias base");
++                t.Equals(last, c.aliasLimit - 0x100u, "the last aliased block ends at the alias limit");
++                t.Equals(after, kHeapBase + span, "the next block is canonical, contiguous in storage");
++                f.pattern(kEeData, 0x100u, 0x66u);
++                t.Equals(f.dma(kEeData, c.aliasLimit - 0x80u, 0x100u), 0,
++                         "a range that starts in the alias and crosses its limit is rejected");
++                t.IsTrue(f.dma(kEeData, after, 0x100u) > 0, "the canonical block after the alias is usable");
++            }
++        });
++
++        tc.Run("exhausting the alias falls back to canonical addresses that still work", [](TestCase &t) {
++            SifEnv e;
++            const GateConfig &c = gateConfig();
++            e.pattern(kEeData, 0x1800u, 0x77u);
++            std::vector<uint32_t> blocks;
++            if (c.aliasActive)
++            {
++                const uint32_t span = c.aliasLimit - c.aliasBase;
++                const uint32_t n = span / 0x1000u;
++                for (uint32_t i = 0; i + 1u < n; ++i)
++                    blocks.push_back(e.alloc(0x1000u));
++                t.IsTrue(std::all_of(blocks.begin(), blocks.end(),
++                                     [&](uint32_t a) { return a >= c.aliasBase && a + 0x1000u <= c.aliasLimit; }),
++                         hx(n - 1u) + " blocks of 4 KiB are aliased");
++                const uint32_t straddle = e.alloc(0x1800u);
++                t.Equals(straddle, kHeapBase + (n - 1u) * 0x1000u,
++                         "a block that would cross the alias limit is handed out canonical");
++                t.IsTrue(e.dma(kEeData, straddle, 0x1800u) > 0, "and accepts DMA over its whole size");
++                t.IsTrue(e.release(straddle), "free it");
++                const uint32_t last = e.alloc(0x1000u);
++                t.Equals(last, c.aliasLimit - 0x1000u, "the last 4 KiB of the alias are still handed out aliased");
++                const uint32_t next = e.alloc(0x1000u);
++                t.Equals(next, kHeapBase + span, "with the alias full the next block is canonical (outside EE RDRAM)");
++                t.IsTrue(next >= PS2_RAM_SIZE, "fallback address " + hx(next));
++                t.IsTrue(e.dma(kEeData, next, 0x1000u) > 0, "the fallback block accepts DMA");
++            }
++            else
++            {
++                for (uint32_t i = 0; i < 8u; ++i)
++                    blocks.push_back(e.alloc(0x1000u));
++                t.IsTrue(std::all_of(blocks.begin(), blocks.end(), [](uint32_t a) { return a >= kHeapBase; }),
++                         "without alias every block is canonical");
++            }
++            const uint32_t mid = blocks[blocks.size() / 2u];
++            t.IsTrue(e.release(mid), "freeing a block in the middle");
++            t.Equals(e.alloc(0x1000u), mid, "the freed slot is reused at the same guest address");
++            t.Equals(e.alloc(kHeapLimit - kHeapBase), 0u, "an allocation larger than the free heap fails (returns 0)");
++        });
++
++        tc.Run("disabled alias keeps EE addresses in EE RDRAM; enabled alias owns its window", [](TestCase &t) {
++            SifEnv e;
++            const GateConfig &c = gateConfig();
++            // An EE address inside the configured window (the SLES_503.58 one when the alias is off).
++            const uint32_t kLow = (c.aliasActive ? c.aliasBase : 0x00020000u) + 0x10100u, kLow2 = kLow + 0x100u;
++            e.pattern(kLow, 0x40u, 0x21u);
++            std::memset(e.rdram.data() + kLow2, 0, 0x40u);
++            const int32_t id = e.dma(kLow, kLow2, 0x40u);
++            if (!c.aliasActive)
++            {
++                t.IsTrue(id > 0 && std::memcmp(e.rdram.data() + kLow, e.rdram.data() + kLow2, 0x40u) == 0,
++                         "an EE->EE copy at " + hx(kLow) + " works as before");
++            }
++            else
++            {
++                t.Equals(id, 0, "inside the alias window an unallocated EE address is not reachable through SIF");
++                t.IsTrue(e.rdram[kLow2] == 0u, "and nothing is written there");
++            }
++        });
++
++        tc.Run("SIF checkpoint keeps canonical keys and restores the bytes behind the guest address", [](TestCase &t) {
++            SifEnv e;
++            const uint32_t x = e.alloc(0x6000u);
++            const auto payload = e.pattern(kEeData, 0x200u, 0x42u);
++            e.dma(kEeData, x + 0x400u, 0x200u);
++            ps2x::checkpoint::ByteWriter w;
++            ps2_stubs::checkpointSerializeSif(w);
++            const std::vector<uint8_t> blob = w.take();
++            t.IsTrue(contains(blob, kHeapBase, 0x6000u), "the allocation map is serialized with the canonical key");
++            if (gateConfig().aliasActive)
++                t.IsFalse(contains(blob, x, 0x6000u), "the alias address is not part of the codec");
++            ps2_stubs::resetSifState();
++            std::vector<uint8_t> back(0x200u);
++            t.IsFalse(ps2_stubs::readSifIopHeap(x + 0x400u, back.data(), back.size()), "reset drops the block");
++            ps2x::checkpoint::ByteReader r(blob.data(), blob.size());
++            std::string error;
++            t.IsTrue(ps2_stubs::checkpointDeserializeSif(r, error), "deserialize: " + error);
++            t.IsTrue(ps2_stubs::readSifIopHeap(x + 0x400u, back.data(), back.size()) && back == payload,
++                     "after the load the guest address reads the saved bytes");
++            t.IsTrue(e.release(x), "and the guest can free it with the address it holds");
++        });
++    });
++
++    MiniTest::Case("PssGateLibSd", [](TestCase &tc) {
++        tc.Run("configuration: PS2X_SD_ADMA takes effect only together with a valid alias", [](TestCase &t) {
++            const GateConfig &c = gateConfig();
++            {
++                SdEnv e;
++                t.IsTrue(e.setTick(5u), "the test can place the scheduler at a given VSync tick");
++            }
++            t.Equals(admaObserved(), c.admaExpected,
++                     std::string("guest-clocked BlockTrans ") + (c.admaExpected ? "on" : "off") +
++                         " (requested=" + (c.admaRequested ? "1" : "0") + ", alias=" + (c.aliasActive ? "1" : "0") +
++                         ")");
++        });
++
++        tc.Run("start, position from the guest clock, idempotent polls, loop wrap and bank bit", [](TestCase &t) {
++            SdEnv e;
++            e.setTick(100u);
++            t.Equals(e.start(1u, kSdLoop, kSdBase, kSdArea), 0u, "BlockTrans start returns 0");
++            if (!gateConfig().admaExpected)
++            {
++                const uint32_t a = e.status(1u);
++                e.setTick(150u);
++                t.Equals(e.status(1u), a + 0x400u, "legacy stub: +1024 bytes per poll, independent of the clock");
++                return;
++            }
++            t.Equals(e.status(1u), kSdBase, "at the start tick the position is the area base");
++            t.Equals(e.status(1u), kSdBase, "a second poll in the same field does not move it");
++            bool ok = true;
++            uint64_t firstBad = 0;
++            for (uint64_t f = 0; f <= 400u; ++f)
++            {
++                e.setTick(100u + f);
++                const uint32_t s = e.status(1u);
++                if (s != modelStatus(kSdBase, kSdArea, 0u, f, true) && ok)
++                {
++                    ok = false;
++                    firstBad = f;
++                }
++            }
++            t.IsTrue(ok, "400 fields follow the model (first mismatch at field " + hx(firstBad) + ")");
++            e.setTick(101u);
++            t.Equals(e.status(1u), kSdBase + 0xC00u, "field 1: 960 frames -> 3 whole blocks");
++            e.setTick(104u);
++            t.Equals(e.status(1u), kBank | (kSdBase + 0x3C00u), "field 4: block 15 is in the upper half (bank 1)");
++            e.setTick(107u);
++            t.Equals(e.status(1u), kSdBase + 0x800u, "field 7: 26 blocks wrap to block 2 (bank 0)");
++        });
++
++        tc.Run("non-loop transfer stops at the end of its area", [](TestCase &t) {
++            SdEnv e;
++            if (!gateConfig().admaExpected)
++                return t.IsTrue(true, "ADMA off: covered by the upstream sceSdRemote tests");
++            e.setTick(100u);
++            e.start(1u, 0x00u, kSdBase, kSdArea);
++            e.setTick(105u);
++            t.Equals(e.status(1u), kSdBase + 0x4800u, "field 5: block 18, no bank bit without loop");
++            e.setTick(107u);
++            t.Equals(e.status(1u), kSdBase + kSdArea, "past the end the position stays at the area end");
++            e.setTick(300u);
++            t.Equals(e.status(1u), kSdBase + kSdArea, "and does not wrap");
++        });
++
++        tc.Run("pause (STOP) returns the live position; resume continues from the paused block", [](TestCase &t) {
++            SdEnv e;
++            if (!gateConfig().admaExpected)
++                return t.IsTrue(true, "ADMA off: covered by the upstream sceSdRemote tests");
++            e.setTick(100u);
++            e.start(1u, 0x13u, kSdBase, kSdArea);
++            e.setTick(103u);
++            const uint32_t paused = e.stop(1u);
++            t.Equals(paused, kSdBase + 0x2C00u, "STOP at field 3 returns block 11 (2880 frames)");
++            t.Equals(e.status(1u), 0u, "a stopped core reports no live position");
++            e.setTick(110u);
++            t.Equals(e.status(1u), 0u, "and does not advance while paused");
++            t.Equals(e.start(1u, 0x13u, kSdBase, kSdArea, kSdBase + 0x2C00u), 0u, "resume at the paused address");
++            t.Equals(e.status(1u), kSdBase + 0x2C00u, "the resumed position is the paused block");
++            e.setTick(111u);
++            t.Equals(e.status(1u), kBank | (kSdBase + 0x3800u), "one field later: +3 blocks, upper half");
++            e.setTick(112u);
++            e.stop(1u);
++            t.Equals(e.start(1u, 0x13u, kSdBase, kSdArea, kSdBase + 0x2C10u), 0u, "resume at a non-aligned address");
++            t.Equals(e.status(1u), kSdBase + 0x2C00u, "the position is reported at block granularity");
++        });
++
++        tc.Run("a second BlockTrans replaces the first and restarts the clock", [](TestCase &t) {
++            SdEnv e;
++            if (!gateConfig().admaExpected)
++                return t.IsTrue(true, "ADMA off: covered by the upstream sceSdRemote tests");
++            constexpr uint32_t kBase2 = 0x00030000u, kArea2 = 0x3000u;
++            e.setTick(100u);
++            e.start(1u, kSdLoop, kSdBase, kSdArea);
++            e.setTick(103u);
++            e.start(1u, kSdLoop, kBase2, kArea2);
++            t.Equals(e.status(1u), kBase2, "the new transfer starts at its own base");
++            e.setTick(104u);
++            t.Equals(e.status(1u), kBase2 + 0xC00u, "its clock starts at the replacing call");
++            e.setTick(107u);
++            t.Equals(e.status(1u), kBase2 + 0xC00u, "and wraps its own area (15 blocks mod 12, lower half)");
++        });
++
++        tc.Run("cores keep independent transfers and clocks", [](TestCase &t) {
++            SdEnv e;
++            if (!gateConfig().admaExpected)
++                return t.IsTrue(true, "ADMA off: covered by the upstream sceSdRemote tests");
++            e.setTick(100u);
++            e.start(0u, kSdLoop, 0x00040000u, 0x2000u);
++            e.setTick(102u);
++            e.start(1u, kSdLoop, kSdBase, kSdArea);
++            e.setTick(103u);
++            t.Equals(e.status(0u), modelStatus(0x00040000u, 0x2000u, 0u, 3u, true), "core 0: three fields");
++            t.Equals(e.status(1u), modelStatus(kSdBase, kSdArea, 0u, 1u, true), "core 1: one field");
++            e.stop(0u);
++            e.setTick(104u);
++            t.Equals(e.status(0u), 0u, "core 0 stopped");
++            t.Equals(e.status(1u), modelStatus(kSdBase, kSdArea, 0u, 2u, true), "core 1 keeps running");
++        });
++
++        tc.Run("sceSdRemoteInit resets both cores; idle STOP and status return 0", [](TestCase &t) {
++            SdEnv e;
++            e.setTick(100u);
++            e.start(0u, kSdLoop, 0x00040000u, 0x2000u);
++            e.start(1u, kSdLoop, kSdBase, kSdArea);
++            ps2_stubs::sceSdRemoteInit(e.rdram.data(), &e.initCtx, &e.runtime);
++            t.Equals(e.status(0u), 0u, "core 0 idle after init");
++            t.Equals(e.status(1u), 0u, "core 1 idle after init");
++            t.Equals(e.stop(1u), 0u, "STOP of an idle core returns 0");
++            t.Equals(e.remote(0x80F0u, 1u, 0u), 1u, "voice transfer status is complete after init");
++        });
++
++        tc.Run("a buffer that is not IOP heap: the status still follows the clock, nothing crashes", [](TestCase &t) {
++            SdEnv e;
++            e.setTick(100u);
++            t.Equals(e.start(1u, kSdLoop, 0x00FF0000u, kSdArea), 0u, "BlockTrans on an unallocated 24-bit address");
++            e.setTick(102u);
++            const uint32_t s = e.status(1u);
++            if (gateConfig().admaExpected)
++                t.Equals(s, modelStatus(0x00FF0000u, kSdArea, 0u, 2u, true), "position from the clock");
++            else
++                t.IsTrue((s & 0x00FFFFFFu) >= 0x00FF0000u, "legacy position inside the area");
++            t.Equals(e.start(1u, kSdLoop, kHeapBase, kSdArea), 0u, "BlockTrans on a canonical (32-bit) heap address");
++            t.IsTrue((e.status(1u) & 0x00FFFFFFu) < kSdArea,
++                     "libsd reports 24 bits: the canonical base 0x04000000 is reported as 0x000000 + offset");
++        });
++
++        tc.Run("SetParam SD_P_BVOLL/R store the signed core input volume; other parameters and cores untouched", [](TestCase &t) {
++            SdEnv e;
++            auto vol = [](uint32_t core) { return ps2_stubs::sdAdmaDebugState(core); };
++            t.Equals(e.remote(0x8010u, 0x0F80u | 1u, 0x7FFFu), 0u, "SetParam returns 0");
++            e.remote(0x8010u, 0x1080u | 1u, 0x0000u);
++            t.Equals(vol(1u).bvolLeft, 0x7FFF, "core 1 BVOLL = 0x7FFF (unity)");
++            t.Equals(vol(1u).bvolRight, 0, "core 1 BVOLR = 0 (mute)");
++            e.remote(0x8010u, 0x0F80u | 1u, 0xF77Fu);
++            e.remote(0x8010u, 0x1080u | 1u, 0xEEF7u);
++            t.Equals(vol(1u).bvolLeft, -2177, "0xF77F (the SLES_503.58 fade wrap) is stored as signed -2177");
++            t.Equals(vol(1u).bvolRight, -4361, "0xEEF7 is stored as signed -4361");
++            t.Equals(vol(0u).bvolLeft, 0, "core 0 is untouched");
++            e.remote(0x8010u, 0x0980u | 1u, 0x1234u); // another parameter on core 1
++            t.Equals(vol(1u).bvolLeft, -2177, "a different parameter does not change BVOL");
++            ps2_stubs::sceSdRemoteInit(e.rdram.data(), &e.initCtx, &e.runtime);
++            t.IsTrue(vol(1u).bvolLeft == 0 && vol(1u).bvolRight == 0, "sceSdRemoteInit clears the volume");
++        });
++
++        tc.Run("the Pss mixer source follows the transfer: replaced, removed by STOP, init and checkpoint load", [](TestCase &t) {
++            const bool adma = gateConfig().admaExpected;
++            SdEnv e;
++            auto st = [] { return ps2_stubs::sdAdmaDebugState(1u); };
++            e.setTick(100u);
++            e.start(1u, kSdLoop, kSdBase, kSdArea);
++            t.Equals(st().hasSource, adma, std::string("a started transfer ") + (adma ? "has" : "has no") + " source");
++            t.Equals(st().clockStarted, adma, "the guest clock runs only with ADMA");
++            e.setTick(101u);
++            e.start(1u, kSdLoop, 0x00030000u, 0x3000u);
++            t.IsTrue(st().active && st().base == 0x00030000u && st().hasSource == adma, "a second start replaces it");
++            e.stop(1u);
++            t.IsFalse(st().hasSource || st().active, "STOP removes the transfer and its source");
++            e.start(1u, kSdLoop, kSdBase, kSdArea);
++            ps2_stubs::sceSdRemoteInit(e.rdram.data(), &e.initCtx, &e.runtime);
++            t.IsFalse(st().hasSource || st().active, "sceSdRemoteInit removes it");
++            e.start(1u, kSdLoop, kSdBase, kSdArea);
++            ps2x::checkpoint::ByteWriter w;
++            ps2_stubs::checkpointSerializeAudioHle(w);
++            const std::vector<uint8_t> blob = w.take();
++            ps2x::checkpoint::ByteReader r(blob.data(), blob.size());
++            std::string error;
++            t.IsTrue(ps2_stubs::checkpointDeserializeAudioHle(r, error), "deserialize: " + error);
++            t.IsTrue(st().active && !st().hasSource && !st().clockStarted,
++                     "a load keeps the transfer but no source and no clock until the next libsd call");
++            e.status(1u);
++            t.Equals(st().hasSource, adma, "the next libsd call restarts clock and source (ADMA only)");
++        });
++
++        tc.Run("AUDIO checkpoint load: the clock restarts at the first libsd call from the saved position", [](TestCase &t) {
++            SdEnv e;
++            if (!gateConfig().admaExpected)
++                return t.IsTrue(true, "ADMA off: legacy cursor, covered by the XAG checkpoint tests");
++            e.setTick(100u);
++            e.start(1u, kSdLoop, kSdBase, kSdArea);
++            e.setTick(102u);
++            const uint32_t saved = e.status(1u);
++            ps2x::checkpoint::ByteWriter w;
++            ps2_stubs::checkpointSerializeAudioHle(w);
++            const std::vector<uint8_t> blob = w.take();
++            ps2_stubs::sceSdRemoteInit(e.rdram.data(), &e.initCtx, &e.runtime);
++            ps2x::checkpoint::ByteReader r(blob.data(), blob.size());
++            std::string error;
++            t.IsTrue(ps2_stubs::checkpointDeserializeAudioHle(r, error), "deserialize: " + error);
++            e.setTick(102u);
++            t.Equals(e.status(1u), saved, "first call after the load reports the saved block");
++            e.setTick(103u);
++            t.Equals(e.status(1u), modelStatus(kSdBase, kSdArea, saved - kSdBase, 1u, true),
++                     "and the clock runs from there");
++        });
++    });
++}
