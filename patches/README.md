@@ -63,7 +63,7 @@ reproducibilidad, dos clones independientes desde GitHub) y migración:
 
 Orden de aplicación = orden declarado en `upstream.lock.json: patches[]`
 (cada uno se aplica sobre el resultado del anterior; ver mecanismo
-arriba). Los cuarenta patches actualmente activos:
+arriba). Los cuarenta y un patches actualmente activos:
 
 1. `BLOCKER_002_cdmodule_service.patch` (convención A — companion
    local): servicio HLE mínimo de lectura de CD para Devil May Cry
@@ -950,3 +950,25 @@ arriba). Los cuarenta patches actualmente activos:
       - el alias se solapa numéricamente con la RDRAM del EE; un checkpoint guardado con él necesita la misma
         configuración al cargar. Alternativa futura: espacio de memoria IOP propio.
       Documentación: `AUDIO_002_5_pss_adma.md` (este directorio) y `analysis/notes/AUDIO_002_5_PSS_ADMA.md`.
+
+41. `SCHED_DEBT_host_lag_bound.patch` (convención A — companion `SCHED_DEBT_host_lag_bound.md`). Planificador: límite
+    opcional de la deuda de reloj de pared de la cadena de VBlanks. **Experimental y opt-in.**
+    - Activación: `PS2X_SCHED_MAX_HOST_LAG_MS=L` (0–10 000). Sin la variable, deuda ilimitada: igual que con 40
+      parches. Valor recomendado para las pruebas actuales de DMC: 50; 100 como alternativa documentada.
+    - `ps2xRuntime/src/lib/Kernel/sched_host_debt.h` (nuevo, privado del runtime): `maxHostLag()` y
+      `boundHostDebt(anterior, ahora) = max(anterior, ahora − L)`.
+    - `ps2xRuntime/src/lib/Kernel/EeScheduler.cpp`: solo el plazo de pared del siguiente VBlankStart se rebasa; el
+      plazo en ciclos EE, el VBlankEnd, el número y el orden de los VBlanks no cambian.
+    - `ps2xTest`: `sched_host_debt_tests.cpp` (4 tests); 555 en total.
+    - No cambia ninguna cabecera incluida por el EE generado (build incremental: 1 objeto) ni el formato de
+      checkpoint.
+    - Validación (exe `32b6e9a2`, construido desde `d21ad507`):
+      - sin variable y con L50: WAV idénticos a 40 parches en demo PSS, oficina, fundido, castillo y v4;
+      - la ráfaga de unos 180 fields/s tras el fundido de la oficina desaparece con L50;
+      - suite completa: 547/555, los mismos 8 fallos que con 40 parches.
+    - Limitaciones:
+      - **no corrige los 60 Hz del contenido PAL**: la demo PSS sigue recortando un 16,7 % en reproducción estable
+        (corrección PAL por separado);
+      - L50 medido en una sola máquina;
+      - las paradas del host ya no se recuperan acelerando el tiempo perdido.
+      Documentación: `SCHED_DEBT_host_lag_bound.md` (este directorio) y `analysis/notes/SCHED_DEBT_HOST_LAG.md`.

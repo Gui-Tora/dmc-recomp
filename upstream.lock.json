@@ -163,6 +163,10 @@
     {
       "path": "patches/AUDIO_002_5_pss_adma.patch",
       "sha256": "a98ac5189ad45052bcece39033a1a3c3d21c33273dea90ab888b1a698a5a50a4"
+    },
+    {
+      "path": "patches/SCHED_DEBT_host_lag_bound.patch",
+      "sha256": "8fae74ea5f3860e8b011df069248e46f95578202bad5bcc5339be7dab9692edb"
     }
   ],
   "patch_identity": {
@@ -171,5 +175,5 @@
     "timestamp": "1700000000 +0000",
     "message": "Apply DMC patchset (see upstream.lock.json: patches[])\n\nGenerated deterministically by scripts/pipeline.py bootstrap. Do not\nedit this commit directly -- edit the source patch file(s) in patches/\nand re-run bootstrap on a fresh vendor checkout instead."
   },
-  "patched_commit": "d21ad5075aea44d1a15704a88388ab691993c32f"
+  "patched_commit": "205151143b01769d58f3327f4dbbf73c6d182581"
 }

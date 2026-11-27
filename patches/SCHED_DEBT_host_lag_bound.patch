@@ -1,0 +1,340 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 35cabf5..96923e1 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2,8 +2,10 @@
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
++#include "sched_host_debt.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cassert>
+ #include <cstdlib>
+ #include <cstring>
+@@ -67,6 +69,56 @@ namespace
+     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
++}
++
++// Opt-in bound on the wall-clock debt of the VBlank chain (see sched_host_debt.h).
++namespace ps2x::sched
++{
++    namespace
++    {
++        constexpr int64_t kUnboundedHostLag = -1;
++
++        std::atomic<int64_t> &hostLagMicroseconds()
++        {
++            static std::atomic<int64_t> *lag = []
++            {
++                auto *value = new std::atomic<int64_t>(kUnboundedHostLag);
++                const char *env = std::getenv("PS2X_SCHED_MAX_HOST_LAG_MS");
++                if (env && *env)
++                {
++                    char *end = nullptr;
++                    const unsigned long ms = std::strtoul(env, &end, 10);
++                    if (!end || *end != '\0' || ms > 10000u)
++                        std::cerr << "[SCHED:debt] PS2X_SCHED_MAX_HOST_LAG_MS=" << env << " ignored (need 0..10000)"
++                                  << std::endl;
++                    else
++                    {
++                        value->store(static_cast<int64_t>(ms) * 1000);
++                        std::cerr << "[SCHED:debt] max host lag " << ms << " ms" << std::endl;
++                    }
++                }
++                return value;
++            }();
++            return *lag;
++        }
++    }
++
++    std::optional<std::chrono::microseconds> maxHostLag()
++    {
++        const int64_t us = hostLagMicroseconds().load(std::memory_order_acquire);
++        if (us < 0)
++            return std::nullopt;
++        return std::chrono::microseconds(us);
++    }
++
++    void setMaxHostLagForTest(std::optional<std::chrono::microseconds> lag)
++    {
++        hostLagMicroseconds().store(lag ? static_cast<int64_t>(lag->count()) : kUnboundedHostLag);
++    }
++}
++
++namespace
++{
+ 
+     template <typename Map>
+     int allocatePositiveId(int &nextId, const Map &objects)
+@@ -2805,8 +2857,11 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
++                // Only the wall-clock deadline is re-based; the EE-cycle deadline and the VBlank order are unchanged.
++                const auto hostBase =
++                    ps2x::sched::boundHostDebt(scheduled.hostDeadline, std::chrono::steady_clock::now());
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                              hostBase + kVBlankPeriod,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+diff --git a/ps2xRuntime/src/lib/Kernel/sched_host_debt.h b/ps2xRuntime/src/lib/Kernel/sched_host_debt.h
+new file mode 100644
+index 0000000..6c1e3b6
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/sched_host_debt.h
+@@ -0,0 +1,34 @@
++#pragma once
++// Opt-in bound on the wall-clock debt of the VBlank chain.
++// Private to ps2xRuntime (not included by generated code or by public runtime headers).
++//
++// The host (wall-clock) deadline of each VBlankStart is chained as "previous host deadline + period". After a slow
++// phase the chain lags behind the wall clock and the following VBlanks fire back to back until the debt is paid
++// (bursts of up to ~3x real time measured in Devil May Cry, SCHED_PAL_001). With a bound L the next host deadline is
++// based on max(previous host deadline, now - L): at most L of debt is caught up and the rest is dropped.
++// Only host deadlines change; EE-cycle deadlines, the number of VBlanks and their order in guest time are untouched,
++// and nothing is serialized (a checkpoint load already re-derives host deadlines from the remaining cycles).
++//   PS2X_SCHED_MAX_HOST_LAG_MS=L   unset: unbounded (historical behaviour); 0..10000 ms otherwise
++//                                  (50 is the value measured for Devil May Cry)
++
++#include <chrono>
++#include <optional>
++
++namespace ps2x::sched
++{
++    // nullopt = unbounded (historical).
++    std::optional<std::chrono::microseconds> maxHostLag();
++
++    template <typename TimePoint>
++    TimePoint boundHostDebt(TimePoint previousHostDeadline, TimePoint now)
++    {
++        const std::optional<std::chrono::microseconds> lag = maxHostLag();
++        if (!lag)
++            return previousHostDeadline;
++        const TimePoint floor = now - *lag;
++        return previousHostDeadline < floor ? floor : previousHostDeadline;
++    }
++
++    // Test hook: nullopt restores the unbounded behaviour.
++    void setMaxHostLagForTest(std::optional<std::chrono::microseconds> lag);
++}
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index ac02713..42f91f1 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -65,6 +65,7 @@ add_library(ps2_test_lib STATIC
+     src/audio_xag_checkpoint_tests.cpp
+     src/audio_pss_tests.cpp
+     src/pss_sif_libsd_tests.cpp
++    src/sched_host_debt_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 616b89f..ebd1960 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -24,6 +24,7 @@ void register_audio_xag_volume_tests();
+ void register_audio_xag_checkpoint_tests();
+ void register_audio_pss_tests();
+ void register_pss_sif_libsd_tests();
++void register_sched_host_debt_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -52,6 +53,7 @@ int main()
+     register_audio_xag_checkpoint_tests();
+     register_audio_pss_tests();
+     register_pss_sif_libsd_tests();
++    register_sched_host_debt_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/sched_host_debt_tests.cpp b/ps2xTest/src/sched_host_debt_tests.cpp
+new file mode 100644
+index 0000000..4fd744b
+--- /dev/null
++++ b/ps2xTest/src/sched_host_debt_tests.cpp
+@@ -0,0 +1,177 @@
++// Wall-clock debt bound of the VBlank chain (PS2X_SCHED_MAX_HOST_LAG_MS).
++// A guest loop waits for VBlank after VBlank and records, at each resume, the current tick, the EE-cycle deadline of
++// the single pending VBlankStart and its host delay. A 250 ms stall inside the guest at tick 3 leaves the chain
++// ~15 periods behind the wall clock.
++#include "MiniTest.h"
++#include "ps2_runtime.h"
++#include "runtime/ee_scheduler.h"
++#include "Kernel/sched_host_debt.h"
++
++#include <chrono>
++#include <cstdint>
++#include <functional>
++#include <thread>
++#include <vector>
++
++namespace
++{
++    constexpr uint32_t kLoopWaitPc = 0x00161000u;
++    constexpr uint32_t kLoopResumePc = 0x00161010u;
++
++    struct TestEnv
++    {
++        std::vector<uint8_t> rdram;
++        PS2Runtime runtime;
++        TestEnv() : rdram(PS2_RAM_SIZE, 0u) {}
++    };
++
++    struct Sample
++    {
++        uint64_t tick = 0;
++        uint64_t pendingVBlankStart = 0;
++        uint32_t pendingVBlankStarts = 0;
++        int64_t hostDelayNanos = 0;
++        std::chrono::steady_clock::time_point resumedAt{};
++    };
++
++    std::vector<Sample> g_samples;
++    uint32_t g_loops = 0;
++    std::function<void(uint64_t)> g_onResume;
++
++    void loopWait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        ctx->pc = kLoopResumePc;
++        scheduler.waitVSync(scheduler.currentVSyncTick());
++    }
++
++    void loopResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        Sample s;
++        s.resumedAt = std::chrono::steady_clock::now();
++        s.tick = scheduler.currentVSyncTick();
++        for (const EeScheduler::CheckpointDeadlineView &v : scheduler.checkpointDeadlineViews())
++        {
++            if (v.eventType == static_cast<uint8_t>(EeEventType::VBlankStart))
++            {
++                ++s.pendingVBlankStarts;
++                s.pendingVBlankStart = v.deadlineCycle;
++                s.hostDelayNanos = v.hostDelayNanos;
++            }
++        }
++        g_samples.push_back(s);
++        if (g_onResume)
++            g_onResume(s.tick);
++        if (g_samples.size() >= g_loops)
++        {
++            ctx->pc = 0u;
++            runtime->requestStop();
++            return;
++        }
++        ctx->pc = kLoopWaitPc;
++    }
++
++    std::vector<Sample> runLoop(uint32_t loops, std::function<void(uint64_t)> onResume)
++    {
++        g_samples.clear();
++        g_loops = loops;
++        g_onResume = std::move(onResume);
++        TestEnv env;
++        env.runtime.memory().initialize();
++        env.runtime.registerFunction(kLoopWaitPc, loopWait);
++        env.runtime.registerFunction(kLoopResumePc, loopResume);
++        R5900Context mainContext{};
++        mainContext.pc = kLoopWaitPc;
++        env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++        env.runtime.eeScheduler().run();
++        g_onResume = nullptr;
++        return g_samples;
++    }
++
++    uint64_t intervalAt(const std::vector<Sample> &s, size_t i)
++    {
++        return s[i].pendingVBlankStart - s[i - 1u].pendingVBlankStart;
++    }
++
++    // Ticks consecutive, one pending VBlankStart, EE-cycle deadlines spaced by one constant period.
++    void expectGuestChainUnchanged(TestCase &t, const std::vector<Sample> &s, uint32_t loops)
++    {
++        t.Equals(static_cast<uint32_t>(s.size()), loops, "every loop iteration should have resumed");
++        for (size_t i = 0; i < s.size(); ++i)
++        {
++            t.Equals(s[i].pendingVBlankStarts, 1u, "exactly one VBlankStart should be pending at every resume");
++            if (i > 0u)
++            {
++                t.Equals(s[i].tick, s[i - 1u].tick + 1u, "VBlank ticks should be consecutive (none lost or doubled)");
++                t.Equals(intervalAt(s, i), intervalAt(s, 1u), "EE-cycle deadlines keep the period");
++            }
++        }
++    }
++
++    void stallAt3(uint64_t tick)
++    {
++        if (tick == 3u)
++            std::this_thread::sleep_for(std::chrono::milliseconds(250));
++    }
++
++    uint32_t fastIntervalsAfterStall(const std::vector<Sample> &s)
++    {
++        uint32_t fast = 0u;
++        for (size_t i = 1; i < s.size(); ++i)
++            if (s[i].tick > 4u && s[i].resumedAt - s[i - 1u].resumedAt < std::chrono::milliseconds(5))
++                ++fast;
++        return fast;
++    }
++}
++
++void register_sched_host_debt_tests()
++{
++    MiniTest::Case("SchedHostDebt", [](TestCase &tc)
++    {
++        tc.Run("unbounded (historical): VBlanks after a stall fire back to back", [](TestCase &t)
++        {
++            ps2x::sched::setMaxHostLagForTest(std::nullopt);
++            const auto s = runLoop(14u, stallAt3);
++            expectGuestChainUnchanged(t, s, 14u);
++            t.IsTrue(fastIntervalsAfterStall(s) >= 5u, "the debt should be paid with a burst of VBlanks");
++        });
++
++        tc.Run("bound 0: no burst, EE-cycle deadlines and tick order unchanged", [](TestCase &t)
++        {
++            ps2x::sched::setMaxHostLagForTest(std::chrono::microseconds(0));
++            const auto s = runLoop(14u, stallAt3);
++            expectGuestChainUnchanged(t, s, 14u);
++            t.Equals(fastIntervalsAfterStall(s), 0u, "no VBlank should fire back to back after the stall");
++            ps2x::sched::setMaxHostLagForTest(std::nullopt);
++        });
++
++        tc.Run("bound 50 ms: at most the bound is caught up after the stall", [](TestCase &t)
++        {
++            ps2x::sched::setMaxHostLagForTest(std::chrono::milliseconds(50));
++            const auto s = runLoop(14u, stallAt3);
++            expectGuestChainUnchanged(t, s, 14u);
++            for (const Sample &x : s)
++                t.IsTrue(x.hostDelayNanos > -60000000ll,
++                         "the pending host deadline should never be more than the bound (plus slack) in the past");
++            t.IsTrue(fastIntervalsAfterStall(s) <= 4u, "the catch-up burst is limited by the bound");
++            ps2x::sched::setMaxHostLagForTest(std::nullopt);
++        });
++
++        tc.Run("the bound does not change the guest chain without a stall", [](TestCase &t)
++        {
++            ps2x::sched::setMaxHostLagForTest(std::nullopt);
++            const auto a = runLoop(6u, nullptr);
++            ps2x::sched::setMaxHostLagForTest(std::chrono::milliseconds(50));
++            const auto b = runLoop(6u, nullptr);
++            ps2x::sched::setMaxHostLagForTest(std::nullopt);
++            expectGuestChainUnchanged(t, a, 6u);
++            expectGuestChainUnchanged(t, b, 6u);
++            for (size_t i = 0; i < a.size() && i < b.size(); ++i)
++            {
++                t.Equals(a[i].tick, b[i].tick, "same ticks");
++                t.Equals(a[i].pendingVBlankStart, b[i].pendingVBlankStart, "same EE-cycle deadlines");
++            }
++        });
++    });
++}
